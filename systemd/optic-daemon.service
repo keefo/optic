@@ -1,0 +1,41 @@
+# Project Optic Phase 1 user service
+[Unit]
+Description=Project Optic camera control daemon
+Documentation=file:///home/liam/.local/src/optic-daemon/optic-daemon.md
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/optic-daemon
+Environment=OPTIC_BIND_ADDR=0.0.0.0:8000
+Environment=OPTIC_CAPTURE_DIR=/mnt/capture
+Environment=RUST_LOG=info
+Environment=LD_LIBRARY_PATH=%h/.local/optic-sysroot/usr/lib/aarch64-linux-gnu
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=10s
+UMask=0027
+
+NoNewPrivileges=true
+LockPersonality=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/mnt/capture /dev/shm
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+MemoryHigh=350M
+MemoryMax=500M
+TasksMax=32
+
+[Install]
+WantedBy=default.target
