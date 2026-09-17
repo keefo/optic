@@ -84,6 +84,9 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 
 ## Change principles
 
+- Whenever possible, use the local Git repository as the file-change tracking
+  system. Inspect `git status` and relevant diffs before and after changes; do not
+  commit, push, or publish branches unless the user explicitly requests it.
 - Make focused changes; avoid unrelated refactors and formatting churn.
 - Preserve established architecture, safety constraints, and compatibility
   unless the task explicitly changes them.
