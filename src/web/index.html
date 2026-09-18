@@ -5,14 +5,18 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Project Optic</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <header class="site-header">
-    <div>
-      <p class="eyebrow">PROJECT OPTIC</p>
-      <h1>HQ Camera Control</h1>
+    <div class="brand">
+      <img class="brand-icon" src="/icon.svg" alt="" width="48" height="48">
+      <div>
+        <p class="eyebrow">PROJECT OPTIC</p>
+        <h1>HQ Camera Control</h1>
+      </div>
     </div>
     <div class="status-row" aria-live="polite">
       <span id="daemon-status" class="pill neutral">Connecting</span>
@@ -37,7 +41,7 @@
           <small>Focus and aperture are adjusted manually on the 6 mm lens.</small>
         </div>
       </div>
-      <div class="responsiveness-panel" aria-labelledby="responsiveness-title">
+      <section class="responsiveness-panel" aria-labelledby="responsiveness-title">
         <div class="responsiveness-heading">
           <div>
             <p class="eyebrow">MEASUREMENT</p>
@@ -57,7 +61,7 @@
             <small id="median-sample-count">Last 0 measurements</small>
           </div>
         </dl>
-      </div>
+      </section>
       <div class="button-row">
         <button id="test-shot" type="button">Profile test shot</button>
         <button id="capture" class="accent" type="button">Capture &amp; transfer</button>

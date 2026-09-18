@@ -531,7 +531,7 @@ Proceed only when the Phase 8 checks pass and the transferred image has been vis
 
 The current `optic-daemon` Phase 1 is the camera control plane; scheduler and in-process sync workers are not yet implemented. Build it natively on the Pi so the release artifact matches the installed AArch64 system:
 
-Every change to daemon source or embedded web assets requires a package version bump and a new Pi deployment. Work is complete only after the restarted service reports that version from `/api/status` and the deployed web assets are verified over HTTP.
+Every change to daemon source or web assets (`src/web/index.html`, `app.js`, `styles.css`, now loaded from disk rather than compiled in) requires a package version bump and a new Pi deployment. Work is complete only after the restarted service reports that version from `/api/status` and the deployed web assets are verified over HTTP.
 
 The complete pinned environment, user-local native sysroot layout, known
 LLVM/Clippy conflicts, and recovery procedure are documented in

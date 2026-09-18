@@ -8,7 +8,7 @@ It organizes the operational lifecycle of a 365-day autonomous timelapse into **
 
 ## Deployed Phase 1
 
-The current source embeds the dashboard and implements:
+The current source serves the dashboard from disk (see [dynamic web asset loading](#web-asset-loading) below) and implements:
 
 * IMX477 probing and status telemetry.
 * Validated rotation, flip, AWB, metering, exposure, EV, gain, shutter, and denoise controls.
@@ -28,7 +28,7 @@ The canonical LAN URL is [http://optic.local:8000/](http://optic.local:8000/). P
 
 Instead of tight in-memory coupling (shared message buses or cross-thread actor channels), the daemon is partitioned into three independent workers:
 
-1. **Web Service (`optic_web`):** The operator control plane. Serves the embedded dashboard, provides direct-to-hardware optical calibration/focus streaming, and performs atomic mutations to `/mnt/capture/config.toml`.
+1. **Web Service (`optic_web`):** The operator control plane. Serves the dashboard from disk, provides direct-to-hardware optical calibration/focus streaming, and performs atomic mutations to `/mnt/capture/config.toml`.
 2. **Timelapse Scheduler (`optic_scheduler`):** The autonomous capture engine. Watches the configuration file for changes, calculates solar and interval cadences, claims the camera sensor, executes `rpicam-still`, and drops finished frames into `/mnt/capture/queue/`. It contains zero networking logic.
 3. **Data Sync Manager (`optic_sync`):** The offline-resilient transport pipeline. Watches `/mnt/capture/queue/` and `/mnt/capture/config.toml` using filesystem events (`inotify`). It drains files to the iMac host over SSH/rsync and pulls configuration updates on boot. It has zero awareness of camera state or exposure logic.
 
@@ -110,11 +110,11 @@ The Web Service acts as the interactive portal for operator configuration and op
                          │
         ┌────────────────┴────────────────┐
         │                                 │
-  GET / (Embedded UI)         POST /api/stream/start
+  GET / (Dashboard UI)        POST /api/stream/start
         │                                 │
         ▼                                 ▼
-   include_str!                Acquire Camera Hardware Mutex
-  Static Assets                           │
+  Read from Disk               Acquire Camera Hardware Mutex
+  (asset_dir sibling)                     │
                                           ▼
                               Queue optic_camera Actor
                                          │
@@ -125,7 +125,7 @@ The Web Service acts as the interactive portal for operator configuration and op
 
 ### Responsibilities
 
-* **Single-Page Web Application:** Serves HTML5, CSS, and Vanilla JavaScript embedded at compile time with `include_str!`.
+* **Single-Page Web Application:** Serves HTML5, CSS, and Vanilla JavaScript loaded from disk on every request (see below).
 * **Hardware Tuning & Calibration:**
 * Starts a live low-latency preview stream automatically when the dashboard opens (`POST /api/stream/start`) to align the 6mm CS-mount lens rings.
 * Applies camera-control changes to a running dashboard preview through a debounced `POST /api/stream/reconfigure`; the daemon transparently reconfigures the native camera pipeline and the browser reconnects after a brief frame gap.
@@ -133,6 +133,17 @@ The Web Service acts as the interactive portal for operator configuration and op
 * Keeps the preview active while the dashboard is open, restores it after still captures, and sends a best-effort stop request only when the page is left.
 * Provides an immediate single-shot JPEG test capture using the selected profile (`POST /api/test-shot`).
 * Publishes a manual profile-specific capture (`POST /api/capture`) to the RAM transfer stage with hidden temporary files and atomic renames.
+
+### Web Asset Loading
+
+Web assets are read from disk on every request instead of being embedded at compile time with `include_str!`. The route set is asset-agnostic: `GET /` always serves `index.html`, and `GET /{*asset}` serves whatever file exists at that relative path under the asset directory — no route needs to be registered per file. Dropping a new file (including inside a subdirectory, e.g. `icons/favicon.ico`) into the asset directory makes it servable immediately; editing an existing file takes effect on the next browser refresh, with no Rust rebuild.
+
+* **Resolution order:** `OPTIC_WEB_ASSETS_DIR` (explicit override) takes precedence; otherwise the daemon looks for a `web/` directory next to its own executable, resolved via `std::env::current_exe()`. If neither exists, it falls back to the workspace's `src/web` directory (compiled in via `CARGO_MANIFEST_DIR`) so `cargo run`/`cargo test` hot-reload during local development.
+* **Deployed layout:** `scripts/setup-optic-daemon-phase-01.sh` mirrors the entire `src/web/` directory into `~/.local/bin/web/`, alongside the `optic-daemon` binary at `~/.local/bin/optic-daemon`, rather than copying a fixed file list.
+* **Path containment:** the requested path is decomposed into path components and only plain (`Normal`) components are accepted — a leading `/`, a `..` segment, or a `.` segment anywhere in the request is rejected before the filesystem is touched (`400 Bad Request`, no path echoed back). The resolved file's canonical path (after symlinks are followed) is then re-checked to still be inside the canonical asset directory before it is read, so a symlink placed inside the asset directory cannot be used to read a file outside it either. Traversal attempts are logged with `tracing::warn!`.
+* **Content type:** inferred from the file extension (`html`, `js`/`mjs`, `css`, `json`/`map`, `svg`, `png`, `jpg`/`jpeg`, `ico`, `webp`, `woff`/`woff2`, `txt`), defaulting to `application/octet-stream` for anything else.
+* **Missing or unreadable assets:** each request-time read failure is logged with the resolved path and OS error via `tracing::error!`, and the route returns `500 Internal Server Error` with a short plain-text body instead of panicking; the Content-Security-Policy, `X-Content-Type-Options`, and `Cache-Control: no-store` headers are still applied to that error response.
+* **Headers unchanged:** successful responses keep the same `Content-Type`, CSP, `X-Content-Type-Options: nosniff`, and `Cache-Control: no-store` headers as the previous compile-time-embedded implementation.
 
 ### Web UI design
 
@@ -265,7 +276,8 @@ The dashboard does not expose a separate JPEG-quality override. Quality is part 
 
 ### Web API Endpoints
 
-* `GET /`: Serves the embedded single-page application.
+* `GET /`: Serves the single-page application, loaded from disk on each request (see [Web Asset Loading](#web-asset-loading)).
+* `GET /{*asset}`: Serves any other file under the resolved asset directory by its relative path (e.g. `/app.js`, `/styles.css`, `/icons/favicon.ico`), confined to that directory (see [Web Asset Loading](#web-asset-loading)).
 * `GET /healthz`: Returns `200 OK` while the HTTP service is available.
 * `GET /api/status`: Returns version, uptime, IMX477 detection, camera ownership, stream state, and RAM-stage queue usage.
 * `POST /api/stream/start`: Called automatically when the dashboard opens. Accepts camera `settings` plus `profile` and configures the persistent native camera for that profile's preview dimensions and sensor mode. Returns `409 Conflict` if the camera is in use.

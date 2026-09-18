@@ -10,6 +10,7 @@ export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BINARY="$PROJECT_ROOT/target/release/optic-daemon"
 UNIT_SOURCE="$PROJECT_ROOT/systemd/optic-daemon.service"
+WEB_ASSETS_DIR="$PROJECT_ROOT/src/web"
 INSTALL_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
 RUNTIME_LIBRARY_DIR="$HOME/.local/optic-sysroot/usr/lib/aarch64-linux-gnu"
@@ -42,6 +43,11 @@ done
 [[ -x $BINARY ]] || { printf 'Release binary is missing: %s\n' "$BINARY" >&2; exit 69; }
 [[ -r $UNIT_SOURCE ]] || { printf 'Service unit is missing: %s\n' "$UNIT_SOURCE" >&2; exit 69; }
 [[ -n $EXPECTED_VERSION ]] || { printf '%s\n' 'Could not determine the expected daemon version.' >&2; exit 69; }
+[[ -d $WEB_ASSETS_DIR ]] || { printf 'Web asset directory is missing: %s\n' "$WEB_ASSETS_DIR" >&2; exit 69; }
+[[ -r $WEB_ASSETS_DIR/index.html ]] || {
+    printf 'Web asset is missing: %s\n' "$WEB_ASSETS_DIR/index.html" >&2
+    exit 69
+}
 [[ -r $RUNTIME_LIBRARY_DIR/libturbojpeg.so.0 ]] || {
     printf 'Runtime library is missing: %s\n' "$RUNTIME_LIBRARY_DIR/libturbojpeg.so.0" >&2
     exit 69
@@ -59,6 +65,17 @@ done
 
 install -d -m 0755 "$INSTALL_DIR" "$UNIT_DIR"
 install -m 0755 "$BINARY" "$INSTALL_DIR/optic-daemon"
+
+# Mirror the whole asset directory (not a fixed file list) so any file
+# dropped into src/web/, including new subdirectories, is deployed without
+# editing this script. Removing the old copy first drops assets that were
+# deleted from the source tree since the last deployment.
+rm -rf "$INSTALL_DIR/web"
+install -d -m 0755 "$INSTALL_DIR/web"
+cp -r "$WEB_ASSETS_DIR/." "$INSTALL_DIR/web/"
+find "$INSTALL_DIR/web" -type d -exec chmod 0755 {} +
+find "$INSTALL_DIR/web" -type f -exec chmod 0644 {} +
+
 install -m 0644 "$UNIT_SOURCE" "$UNIT_DIR/optic-daemon.service"
 
 systemd-analyze --user verify "$UNIT_DIR/optic-daemon.service"

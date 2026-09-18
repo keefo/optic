@@ -1,5 +1,3 @@
-"use strict";
-
 const elements = {
   preview: document.querySelector("#preview"),
   previewFrame: document.querySelector(".preview-frame"),
@@ -36,18 +34,39 @@ const defaults = {
 };
 
 const profiles = {
-  master_archive: { label: "Master Archive", width: 4056, height: 3040, previewWidth: 4056, previewHeight: 3040, previewFps: 2 },
-  dci_4k: { label: "4K DCI Widescreen", width: 4056, height: 2160, previewWidth: 1352, previewHeight: 720, previewFps: 8 },
-  binning_2k: { label: "2K Binning", width: 2028, height: 1520, previewWidth: 1014, previewHeight: 760, previewFps: 8 },
+  master_archive: {
+    label: "Master Archive",
+    width: 4056,
+    height: 3040,
+    previewWidth: 4056,
+    previewHeight: 3040,
+    previewFps: 2,
+  },
+  dci_4k: {
+    label: "4K DCI Widescreen",
+    width: 4056,
+    height: 2160,
+    previewWidth: 1352,
+    previewHeight: 720,
+    previewFps: 8,
+  },
+  binning_2k: {
+    label: "2K Binning",
+    width: 2028,
+    height: 1520,
+    previewWidth: 1014,
+    previewHeight: 760,
+    previewFps: 8,
+  },
 };
 
 let objectUrl = null;
 let livePreview = false;
-  // Fill in default placeholders if we deleted elements to support pure manual focus
-  if (!document.querySelector("#ev")) {
-    const hiddenForm = document.createElement("div");
-    hiddenForm.style.display = "none";
-    hiddenForm.innerHTML = `
+// Fill in default placeholders if we deleted elements to support pure manual focus
+if (!document.querySelector("#ev")) {
+  const hiddenForm = document.createElement("div");
+  hiddenForm.style.display = "none";
+  hiddenForm.innerHTML = `
       <input id="ev" type="hidden" value="0.0">
       <input id="ev-value" type="hidden" value="0.0">
       <select id="metering">
@@ -57,14 +76,13 @@ let livePreview = false;
         <option value="normal" selected>Normal</option>
       </select>
     `;
-    document.body.appendChild(hiddenForm);
-  }
+  document.body.appendChild(hiddenForm);
+}
 
 let previewGeneration = 0;
 let reconfigureTimer = null;
 let reconfigureRunning = false;
 let reconfigurePending = false;
-let activePreviewProfile = null;
 let previewStarting = false;
 let captureRunning = false;
 let pageActive = true;
@@ -75,8 +93,6 @@ let measurementRevision = 0;
 let lastFrameMetadata = null;
 const controlChanges = new Map();
 let baselineSettings = { ...defaults };
-let activeSliderTimer = null;
-let sliderIsActiveDragging = false;
 const activeMeasurements = new Map();
 const firstVisibleSamples = [];
 const MAX_MEASUREMENT_SAMPLES = 10;
@@ -160,24 +176,29 @@ function updateOutputs() {
   const values = settings();
   document.querySelector("#ev-value").value = values.ev.toFixed(1);
   document.querySelector("#gain-value").value = values.gain === 0 ? "Auto" : values.gain.toFixed(1);
-  document.querySelector("#shutter-value").value = values.shutter_us === 0 ? "Auto" : values.shutter_us;
+  document.querySelector("#shutter-value").value =
+    values.shutter_us === 0 ? "Auto" : values.shutter_us;
 }
 
 function showNotice(message, kind = "normal") {
   elements.notice.textContent = message;
   elements.notice.dataset.kind = kind;
 }
-  checkSettingsModified();
+checkSettingsModified();
 
 function checkSettingsModified() {
   const current = settings();
-  const profileChanged = document.querySelector('input[name="capture-profile"]:checked').value !== baselineSettings.profile;
-  const isModified = profileChanged || Object.keys(defaults).some((key) => {
-    // metering, exposure, ev are bypassed in UI, skip them
-    if (key === "metering" || key === "exposure" || key === "ev") return false;
-    return current[key] !== baselineSettings.settings[key];
-  });
-  
+  const profileChanged =
+    document.querySelector('input[name="capture-profile"]:checked').value !==
+    baselineSettings.profile;
+  const isModified =
+    profileChanged ||
+    Object.keys(defaults).some((key) => {
+      // metering, exposure, ev are bypassed in UI, skip them
+      if (key === "metering" || key === "exposure" || key === "ev") return false;
+      return current[key] !== baselineSettings.settings[key];
+    });
+
   elements.discardConfig.disabled = !isModified;
   elements.saveConfig.disabled = !isModified;
 }
@@ -191,7 +212,7 @@ async function fnCommitConfig() {
     // Snapshot the new baseline
     baselineSettings = {
       profile: selectedProfile(),
-      settings: settings()
+      settings: settings(),
     };
     checkSettingsModified();
   } catch (error) {
@@ -309,7 +330,12 @@ async function consumeMjpeg(generation, signal) {
 
 function findHeaderEnd(buffer) {
   for (let index = 0; index <= buffer.length - 4; index += 1) {
-    if (buffer[index] === 13 && buffer[index + 1] === 10 && buffer[index + 2] === 13 && buffer[index + 3] === 10) {
+    if (
+      buffer[index] === 13 &&
+      buffer[index + 1] === 10 &&
+      buffer[index + 2] === 13 &&
+      buffer[index + 3] === 10
+    ) {
       return index;
     }
   }
@@ -385,7 +411,11 @@ function beginControlMeasurement(control) {
     vflip: "Vertical flip",
   };
   const aeControls = new Set(["metering", "exposure", "ev", "gain", "shutter"]);
-  beginMeasurement(labels[control.id] || "Camera control", aeControls.has(control.id), control.id === "awb");
+  beginMeasurement(
+    labels[control.id] || "Camera control",
+    aeControls.has(control.id),
+    control.id === "awb",
+  );
 }
 
 function markMeasurementSent(revision) {
@@ -428,12 +458,28 @@ function recordRenderedFrame(headers, paintedAt) {
 
     const metadataAvailable = relevantMetadataAvailable(metadata, measurement);
     if (metadataAvailable && !measurement.observedChange) {
-      measurement.observedChange = relevantMetadataChanged(measurement.baseline, metadata, measurement);
+      measurement.observedChange = relevantMetadataChanged(
+        measurement.baseline,
+        metadata,
+        measurement,
+      );
     }
-    const aeSettled = !measurement.needsAe || aeState === "converged" || aeState === "idle" || aeState === "unavailable";
-    const awbSettled = !measurement.needsAwb || awbState === "converged" || awbState === "locked" || awbState === "unavailable";
-    if (measurement.observedChange && aeSettled && awbSettled
-      && relevantMetadataStable(measurement.previous, metadata, measurement)) {
+    const aeSettled =
+      !measurement.needsAe ||
+      aeState === "converged" ||
+      aeState === "idle" ||
+      aeState === "unavailable";
+    const awbSettled =
+      !measurement.needsAwb ||
+      awbState === "converged" ||
+      awbState === "locked" ||
+      awbState === "unavailable";
+    if (
+      measurement.observedChange &&
+      aeSettled &&
+      awbSettled &&
+      relevantMetadataStable(measurement.previous, metadata, measurement)
+    ) {
       measurement.stableFrames += 1;
     } else {
       measurement.stableFrames = 0;
@@ -450,7 +496,9 @@ function recordRenderedFrame(headers, paintedAt) {
       activeMeasurements.delete(revision);
     } else if (paintedAt - measurement.startedAt >= SETTLE_TIMEOUT_MS) {
       if (revision === measurementRevision) {
-        elements.settledLatency.textContent = measurement.observedChange ? ">15000 ms" : "No metadata change";
+        elements.settledLatency.textContent = measurement.observedChange
+          ? ">15000 ms"
+          : "No metadata change";
       }
       activeMeasurements.delete(revision);
     }
@@ -479,38 +527,33 @@ function cloneMetadata(metadata) {
 
 function relevantMetadataAvailable(metadata, measurement) {
   if (!metadata) return false;
-  const aeAvailable = !measurement.needsAe || (metadata.exposureUs !== null && metadata.analogueGain !== null);
+  const aeAvailable =
+    !measurement.needsAe || (metadata.exposureUs !== null && metadata.analogueGain !== null);
   const awbAvailable = !measurement.needsAwb || metadata.colourGains !== null;
   return aeAvailable && awbAvailable;
 }
 
 function relevantMetadataChanged(baseline, current, measurement) {
   if (!baseline) return true;
-  const aeChanged = measurement.needsAe && (
-    !approximatelyEqual(baseline.exposureUs, current.exposureUs, 50, 0.005)
-    || !approximatelyEqual(baseline.analogueGain, current.analogueGain, 0.005, 0.005)
-  );
-  const awbChanged = measurement.needsAwb && !arraysApproximatelyEqual(
-    baseline.colourGains,
-    current.colourGains,
-    0.005,
-    0.005,
-  );
+  const aeChanged =
+    measurement.needsAe &&
+    (!approximatelyEqual(baseline.exposureUs, current.exposureUs, 50, 0.005) ||
+      !approximatelyEqual(baseline.analogueGain, current.analogueGain, 0.005, 0.005));
+  const awbChanged =
+    measurement.needsAwb &&
+    !arraysApproximatelyEqual(baseline.colourGains, current.colourGains, 0.005, 0.005);
   return aeChanged || awbChanged || (!measurement.needsAe && !measurement.needsAwb);
 }
 
 function relevantMetadataStable(previous, current, measurement) {
   if (!previous) return false;
-  const aeStable = !measurement.needsAe || (
-    approximatelyEqual(previous.exposureUs, current.exposureUs, 50, 0.005)
-    && approximatelyEqual(previous.analogueGain, current.analogueGain, 0.005, 0.005)
-  );
-  const awbStable = !measurement.needsAwb || arraysApproximatelyEqual(
-    previous.colourGains,
-    current.colourGains,
-    0.005,
-    0.005,
-  );
+  const aeStable =
+    !measurement.needsAe ||
+    (approximatelyEqual(previous.exposureUs, current.exposureUs, 50, 0.005) &&
+      approximatelyEqual(previous.analogueGain, current.analogueGain, 0.005, 0.005));
+  const awbStable =
+    !measurement.needsAwb ||
+    arraysApproximatelyEqual(previous.colourGains, current.colourGains, 0.005, 0.005);
   return aeStable && awbStable;
 }
 
@@ -521,7 +564,9 @@ function approximatelyEqual(left, right, absoluteTolerance, relativeTolerance) {
 
 function arraysApproximatelyEqual(left, right, absoluteTolerance, relativeTolerance) {
   if (!left || !right || left.length !== right.length) return false;
-  return left.every((value, index) => approximatelyEqual(value, right[index], absoluteTolerance, relativeTolerance));
+  return left.every((value, index) =>
+    approximatelyEqual(value, right[index], absoluteTolerance, relativeTolerance),
+  );
 }
 
 function median(values) {
@@ -572,7 +617,6 @@ async function updateLivePreview() {
     });
     const accepted = await response.json();
     if (livePreview && generation === previewGeneration) {
-      activePreviewProfile = accepted.profile;
       setPreviewAspect(accepted.profile);
       startMjpegPreview(previewLabel(accepted.profile, accepted.settings));
       showNotice(`${profile.label} preview updated.`, "success");
@@ -632,11 +676,14 @@ async function ensurePreview(streamAlreadyRunning = null, announce = true) {
       streamAlreadyRunning = status.camera.streaming;
     }
     if (!pageActive || generation !== previewGeneration) return;
-    const response = await api(streamAlreadyRunning ? "/api/stream/reconfigure" : "/api/stream/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(request),
-    });
+    const response = await api(
+      streamAlreadyRunning ? "/api/stream/reconfigure" : "/api/stream/start",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      },
+    );
     const accepted = await response.json();
     markMeasurementSent(requestedRevision);
     if (!pageActive || generation !== previewGeneration) {
@@ -644,13 +691,15 @@ async function ensurePreview(streamAlreadyRunning = null, announce = true) {
       return;
     }
     livePreview = true;
-    activePreviewProfile = accepted.profile;
     previewGeneration += 1;
     setPreviewAspect(accepted.profile);
     startMjpegPreview(previewLabel(accepted.profile, accepted.settings));
     if (controlRevision !== requestedRevision || reconfigurePending) schedulePreviewUpdate();
     if (announce) {
-      showNotice(`${profile.label} preview is live. Adjust focus and aperture on the lens.`, "success");
+      showNotice(
+        `${profile.label} preview is live. Adjust focus and aperture on the lens.`,
+        "success",
+      );
     }
   } catch (error) {
     hidePreview("Automatic preview unavailable");
@@ -683,7 +732,10 @@ async function nativeTestShot() {
     });
     objectUrl = URL.createObjectURL(await response.blob());
     showPreview(objectUrl, `Test shot · ${profile.width} × ${profile.height}`);
-    showNotice(`${profile.label} test shot complete. Inspect it at full size for focus.`, "success");
+    showNotice(
+      `${profile.label} test shot complete. Inspect it at full size for focus.`,
+      "success",
+    );
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
@@ -712,7 +764,10 @@ async function captureAndTransfer() {
       }),
     });
     const result = await response.json();
-    showNotice(`${result.files.length} file${result.files.length === 1 ? "" : "s"} queued for ${profile.label} (${formatBytes(result.bytes)}).`, "success");
+    showNotice(
+      `${result.files.length} file${result.files.length === 1 ? "" : "s"} queued for ${profile.label} (${formatBytes(result.bytes)}).`,
+      "success",
+    );
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
@@ -736,12 +791,17 @@ async function refreshStatus() {
     elements.daemonStatus.textContent = `Daemon ${status.version}`;
     elements.daemonStatus.className = "pill good";
     elements.cameraStatus.textContent = status.camera.detected
-      ? status.camera.streaming ? "Camera streaming" : status.camera.busy ? "Camera busy" : "Camera ready"
+      ? status.camera.streaming
+        ? "Camera streaming"
+        : status.camera.busy
+          ? "Camera busy"
+          : "Camera ready"
       : "Camera unavailable";
     elements.cameraStatus.className = status.camera.detected ? "pill good" : "pill bad";
     document.querySelector("#version").textContent = status.version;
     document.querySelector("#uptime").textContent = formatDuration(status.uptime_seconds);
-    document.querySelector("#queue").textContent = `${status.capture_stage.queued_files} files · ${formatBytes(status.capture_stage.queued_bytes)}`;
+    document.querySelector("#queue").textContent =
+      `${status.capture_stage.queued_files} files · ${formatBytes(status.capture_stage.queued_bytes)}`;
     document.querySelector("#sensor").textContent = status.camera.sensor || "Not detected";
     if (!pageActive || captureRunning || reconfigureRunning) return;
     if (!status.camera.streaming && livePreview) {
@@ -754,7 +814,7 @@ async function refreshStatus() {
     if (!livePreview && !previewStarting) {
       void ensurePreview(status.camera.streaming);
     }
-  } catch (error) {
+  } catch {
     elements.daemonStatus.textContent = "Daemon offline";
     elements.daemonStatus.className = "pill bad";
   }

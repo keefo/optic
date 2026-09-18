@@ -162,7 +162,7 @@ and waits until `/api/status` reports the version from `Cargo.toml`:
 ./scripts/setup-optic-daemon-phase-01.sh
 ```
 
-After installation, verify both the API and embedded web asset:
+After installation, verify both the API and the disk-served web asset:
 
 ```bash
 expected_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)

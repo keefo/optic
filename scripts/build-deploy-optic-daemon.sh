@@ -53,20 +53,11 @@ for command in ssh tar; do
         printf 'Required local command is missing: %s\n' "$command" >&2
         exit 69
     }
-# 4. Invoke high-performance Biome lint checks natively in macOS workspace before committing
-for command in npx; do
-    command -v "$command" >/dev/null || {
-        printf 'Required web validation command is missing: %s\n' "$command" >&2
-        exit 69
-    }
-done
-npx @biomejs/biome check src/web/app.js src/web/index.html || {
-    printf 'ERROR: Web assets syntax validation failed! Aborting deployment.\n' >&2
-    exit 1
-}
 done
 
-for path in Cargo.toml Cargo.lock src systemd scripts/setup-optic-daemon-phase-01.sh; do
+for path in Cargo.toml Cargo.lock README.md biome.json docs/optic-daemon-build-environment.md \
+    docs/optic-daemon-camera.md docs/optic-daemon.md setup.md src systemd \
+    scripts/setup-optic-daemon-phase-01.sh; do
     [[ -e $PROJECT_ROOT/$path ]] || {
         printf 'Required project path is missing: %s\n' "$PROJECT_ROOT/$path" >&2
         exit 69
@@ -81,9 +72,10 @@ COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" -C "$PROJECT_ROOT" \
     Cargo.toml \
     Cargo.lock \
     README.md \
-    optic-daemon-build-environment.md \
-    optic-daemon-camera.md \
-    optic-daemon.md \
+    biome.json \
+    docs/optic-daemon-build-environment.md \
+    docs/optic-daemon-camera.md \
+    docs/optic-daemon.md \
     setup.md \
     scripts \
     src \
@@ -257,8 +249,13 @@ unset SYSROOT LD_LIBRARY_PATH
 
 pkg-config --modversion libcamera libcamera-base libturbojpeg
 
-printf '%s\n' '==> Formatting and testing'
+printf '%s\n' '==> Linting web assets with Biome'
+[[ -x $HOME/biome ]] || fail "Biome binary is missing: $HOME/biome"
 cd "$SOURCE_DIR"
+"$HOME/biome" check src/web/app.js src/web/index.html || \
+    fail 'Web assets failed Biome validation'
+
+printf '%s\n' '==> Formatting and testing'
 rustup run "$RUST_TOOLCHAIN" cargo fmt --all -- --check
 LD_LIBRARY_PATH="$OPTIC_NATIVE_LIB" \
     rustup run "$RUST_TOOLCHAIN" cargo test --locked --all-targets
@@ -310,12 +307,12 @@ fi
 grep -q 'libcamera.so.0.7' /tmp/optic-daemon.ldd || fail 'release binary is not linked to libcamera.so.0.7'
 grep -q 'libturbojpeg.so.0' /tmp/optic-daemon.ldd || fail 'release binary is not linked to libturbojpeg.so.0'
 grep -aF "$VERSION" "$BINARY" >/dev/null || fail 'release binary does not contain the expected version'
-grep -aF '${profile.previewFps} FPS' "$BINARY" >/dev/null || fail 'release binary does not contain the FPS web asset'
 
 printf '%s\n' '==> Installing with rollback protection'
 backup_dir=$(mktemp -d "$HOME/.cache/optic-daemon-deploy.XXXXXX")
 had_binary=false
 had_unit=false
+had_web_assets=false
 if [[ -f $HOME/.local/bin/optic-daemon ]]; then
     cp -p "$HOME/.local/bin/optic-daemon" "$backup_dir/optic-daemon"
     had_binary=true
@@ -323,6 +320,10 @@ fi
 if [[ -f $HOME/.config/systemd/user/optic-daemon.service ]]; then
     cp -p "$HOME/.config/systemd/user/optic-daemon.service" "$backup_dir/optic-daemon.service"
     had_unit=true
+fi
+if [[ -d $HOME/.local/bin/web ]]; then
+    cp -pr "$HOME/.local/bin/web" "$backup_dir/web"
+    had_web_assets=true
 fi
 
 rollback() {
@@ -332,6 +333,10 @@ rollback() {
         install -m 0755 "$backup_dir/optic-daemon" "$HOME/.local/bin/optic-daemon"
     else
         rm -f "$HOME/.local/bin/optic-daemon"
+    fi
+    rm -rf "$HOME/.local/bin/web"
+    if [[ $had_web_assets == true ]]; then
+        cp -pr "$backup_dir/web" "$HOME/.local/bin/web"
     fi
     if [[ $had_unit == true ]]; then
         install -m 0644 "$backup_dir/optic-daemon.service" \
@@ -357,6 +362,14 @@ if ! cmp -s "$BINARY" "$HOME/.local/bin/optic-daemon"; then
     printf '%s\n' 'Installed binary does not match the release artifact.' >&2
     rollback
 fi
+web_asset_diff=$(mktemp)
+if ! diff -rq "$SOURCE_DIR/src/web" "$HOME/.local/bin/web" >"$web_asset_diff" 2>&1; then
+    printf 'Installed web assets do not match the release artifact:\n' >&2
+    cat "$web_asset_diff" >&2
+    rm -f "$web_asset_diff"
+    rollback
+fi
+rm -f "$web_asset_diff"
 if ! systemctl --user is-enabled --quiet optic-daemon.service; then
     printf '%s\n' 'optic-daemon.service is not enabled.' >&2
     rollback
