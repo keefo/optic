@@ -145,3 +145,21 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 - **Plan before implementation:** For any feature or non-trivial fix, initialize a dated worklog (`worklogs/YYYY-MM-DD-<topic>.md`) outlining acceptance criteria and a concrete test plan prior to modifying `src/`.
 - **Minimal footprint:** Keep changes tightly scoped to accepted criteria. Avoid sweeping refactors or formatting churn.
 - **Diff inspection:** Always run and review `git diff` prior to closing a task to ensure no secrets, unintended edits, or temporary debug logs are left behind.
+
+## Tooling & Command Preferences
+
+- **Prioritize Ripgrep (`rg`):** Always prefer `rg` over slow built-in search tools, `grep`, or `find`. It is installed and available in the environment.
+- **Code & String Search:** Use `rg -n --no-heading "<pattern>" [path]` to find function definitions, types, or references. Always restrict context with `-C <lines>` (e.g., `-C 3`) and avoid dumping massive outputs into the terminal.
+- **File Discovery:** Use `rg --files | grep "<pattern>"` (or `fd "<pattern>"` if available) to locate files across the project rather than recursively listing directories.
+- **Avoid Context Blowouts:** Never read an entire large file (>200 lines) with `read_file` just to inspect a small section. First locate the line numbers using `rg -n`, then read only the relevant target slice.
+- **Respect Ignored Paths:** Trust `rg`'s default `.gitignore` filtering; do not run searches with `--no-ignore` or `--hidden` unless explicitly searching hidden config files.
+
+## Self-Reflection & Environment Learning
+
+- **Failure Analysis:** If a terminal command fails due to a non-existent utility (`command not found`), invalid flags, or platform mismatches, do not blindly retry the command. Analyze the stderr output and identify the root cause immediately.
+- **Persist Fixes to `AGENTS.md`:** When you discover that a command or parameter fails and find the correct alternative, update `AGENTS.md` in the same turn under `## Environment and Tooling Constraints`:
+  - Add a single, concise bullet point detailing the invalid command, the reason for failure, and the validated replacement.
+  - Format: `- Do not use \`<failed-cmd>\` (<reason>); use \`<working-cmd>\` instead.`
+  - Append to the list cleanly; never overwrite, reorder, or delete existing project rules or structure definitions.
+- **Consult Prior Learnings:** Always inspect `## Environment and Tooling Constraints` in `AGENTS.md` before invoking unfamiliar CLI tools to prevent repeating previously logged errors.
+
