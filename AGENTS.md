@@ -115,3 +115,33 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 - A feature is complete only when its acceptance criteria pass, documentation is
   current, the worklog is closed, and remaining limitations are explicit.
 
+# Agent Rules & Execution Protocol
+
+## Autonomous Execution & Momentum
+- **Bias toward action:** When instructed to inspect, plan, or start a task, chain your tool calls continuously through the entire workflow (reading -> planning -> implementing -> testing) without stopping for intermediate conversational permission.
+- **No idle pauses:** Never conclude a turn with standalone text like "Shall we begin?", "Ready to start", or an outline of next steps without immediately triggering the next tool call.
+- **Tool chaining:** If a plan is formulated, proceed in the exact same turn to create the worklog and apply the first file edits.
+
+## Decision Handling & User Prompts
+- **Strict tool usage for questions:** Never ask open-ended permission questions in plain markdown text. When you genuinely need user direction or architectural input, you MUST use the `ask_followup_question` tool.
+- **Actionable options:** Whenever invoking `ask_followup_question`, always provide 2 to 3 distinct, ready-to-select choices. For example:
+  - Option 1: "Proceed with implementation immediately."
+  - Option 2: "Adjust the plan / modify scope first."
+  - Option 3: "Run verification checks on existing code before changing anything."
+- **Pre-approved actions:** Reading project files, creating worklogs, modifying code in `src/`, and running local read-only commands (`cargo check`, `cargo test`, `git status`, `git diff`) require no conversational confirmation. Proceed autonomously.
+- **Hard gates:** Only pause for confirmation on destructive actions: `git commit`, `git push`, branch deletion, file deletion, system-level modifications, or remote deployments.
+
+## Completion Gatekeeper
+- **Strict completion barrier:** Calling `attempt_completion` after merely reading documents, summarizing requirements, or writing plans is strictly prohibited.
+- **Required completion criteria:** `attempt_completion` may only be called when all of the following conditions are met:
+  1. Code or configuration files have actually been created or updated.
+  2. Local tests, builds, or scripts have executed in the terminal and reported passing results (do not assume success from code inspection alone).
+  3. Associated documentation in `docs/` has been aligned.
+  4. A dated worklog in `worklogs/` has been closed with observed test results and diff summaries.
+- If a task cannot be verified due to missing host dependencies or hardware, explicitly report the work as implemented but unverified, document the limitation in the worklog, and use `ask_followup_question` to determine next steps.
+
+## Workflow & Repository Discipline
+- **Source of truth:** Inspect `README.md`, relevant specs under `docs/`, and the latest file under `worklogs/` before altering functionality.
+- **Plan before implementation:** For any feature or non-trivial fix, initialize a dated worklog (`worklogs/YYYY-MM-DD-<topic>.md`) outlining acceptance criteria and a concrete test plan prior to modifying `src/`.
+- **Minimal footprint:** Keep changes tightly scoped to accepted criteria. Avoid sweeping refactors or formatting churn.
+- **Diff inspection:** Always run and review `git diff` prior to closing a task to ensure no secrets, unintended edits, or temporary debug logs are left behind.
