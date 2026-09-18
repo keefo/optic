@@ -18,11 +18,11 @@ const elements = {
   medianSampleCount: document.querySelector("#median-sample-count"),
   settledLatency: document.querySelector("#settled-latency"),
   measurementSample: document.querySelector("#measurement-sample"),
+  discardConfig: document.querySelector("#discard-config"),
+  saveConfig: document.querySelector("#save-config"),
 };
 
 const defaults = {
-  discardConfig: document.querySelector("#discard-config"),
-  saveConfig: document.querySelector("#save-config"),
   rotation: 0,
   horizontal_flip: false,
   vertical_flip: false,
