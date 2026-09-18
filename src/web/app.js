@@ -43,6 +43,23 @@ const profiles = {
 
 let objectUrl = null;
 let livePreview = false;
+  // Fill in default placeholders if we deleted elements to support pure manual focus
+  if (!document.querySelector("#ev")) {
+    const hiddenForm = document.createElement("div");
+    hiddenForm.style.display = "none";
+    hiddenForm.innerHTML = `
+      <input id="ev" type="hidden" value="0.0">
+      <input id="ev-value" type="hidden" value="0.0">
+      <select id="metering">
+        <option value="centre" selected>Centre</option>
+      </select>
+      <select id="exposure">
+        <option value="normal" selected>Normal</option>
+      </select>
+    `;
+    document.body.appendChild(hiddenForm);
+  }
+
 let previewGeneration = 0;
 let reconfigureTimer = null;
 let reconfigureRunning = false;

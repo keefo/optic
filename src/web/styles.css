@@ -30,6 +30,10 @@ button, select, input { font: inherit; }
   width: min(1180px, calc(100% - 32px));
   margin-inline: auto;
 }
+.margin-top-10 {
+  margin-top: 10px;
+}
+
 
 .site-header {
   display: flex;
