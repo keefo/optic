@@ -53,6 +53,17 @@ for command in ssh tar; do
         printf 'Required local command is missing: %s\n' "$command" >&2
         exit 69
     }
+# 4. Invoke high-performance Biome lint checks natively in macOS workspace before committing
+for command in npx; do
+    command -v "$command" >/dev/null || {
+        printf 'Required web validation command is missing: %s\n' "$command" >&2
+        exit 69
+    }
+done
+npx @biomejs/biome check src/web/app.js src/web/index.html || {
+    printf 'ERROR: Web assets syntax validation failed! Aborting deployment.\n' >&2
+    exit 1
+}
 done
 
 for path in Cargo.toml Cargo.lock src systemd scripts/setup-optic-daemon-phase-01.sh; do

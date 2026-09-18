@@ -19,6 +19,8 @@ use crate::{
     optic_camera::{CameraBackendKind, OpticCamera},
 };
 
+use crate::camera::AppConfig;
+
 const INDEX_HTML: &str = include_str!("web/index.html");
 const APP_JS: &str = include_str!("web/app.js");
 const STYLES_CSS: &str = include_str!("web/styles.css");
@@ -28,15 +30,21 @@ const SECURITY_POLICY: &str = "default-src 'self'; img-src 'self' blob: data:; s
 pub struct AppState {
     camera: OpticCamera,
     capture_dir: Arc<PathBuf>,
+    config_path: Arc<PathBuf>,
+    preview_config_path: Arc<PathBuf>,
     sensor: Option<String>,
     started: Instant,
 }
 
 impl AppState {
     pub fn new(camera: OpticCamera, capture_dir: PathBuf, sensor: Option<String>) -> Self {
+        let config_path = capture_dir.join("config.json");
+        let preview_config_path = capture_dir.join("preview_config.json");
         Self {
             camera,
             capture_dir: Arc::new(capture_dir),
+            config_path: Arc::new(config_path),
+            preview_config_path: Arc::new(preview_config_path),
             sensor,
             started: Instant::now(),
         }
@@ -56,6 +64,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stream/mjpeg", get(mjpeg_stream))
         .route("/api/test-shot", post(test_shot))
         .route("/api/capture", post(capture))
+        .route("/api/config/commit", post(commit_config))
+        .route("/api/config/discard", post(discard_config))
         .with_state(state)
 }
 
@@ -81,6 +91,7 @@ struct StatusResponse {
     uptime_seconds: u64,
     camera: CameraStatus,
     capture_stage: CaptureStageStatus,
+    config: AppConfig,
 }
 
 #[derive(Serialize)]
@@ -122,6 +133,19 @@ impl StreamResponse {
 async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, AppError> {
     let (queued_files, queued_bytes) = queue_usage(&state.capture_dir).await?;
     let camera = state.camera.status();
+
+    // Read from preview_config.json if present; otherwise, fall back to config.json or default
+    let config = if state.preview_config_path.exists() {
+        match tokio::fs::read_to_string(&*state.preview_config_path).await {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => AppConfig::default(),
+        }
+    } else {
+        match tokio::fs::read_to_string(&*state.config_path).await {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => AppConfig::default(),
+        }
+    };
     Ok(Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.started.elapsed().as_secs(),
@@ -138,6 +162,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
             queued_files,
             queued_bytes,
         },
+        config,
     }))
 }
 
@@ -146,6 +171,19 @@ async fn start_stream(
     Json(request): Json<StreamRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let accepted = request.clone();
+
+    // Reconfigure and Start streams exclusively write to the preview staging config
+    let config = AppConfig {
+        profile: request.profile,
+        settings: request.settings.clone(),
+    };
+    if let Ok(serialized) = serde_json::to_string_pretty(&config) {
+        let temp_path = state.preview_config_path.with_extension("json.tmp");
+        if tokio::fs::write(&temp_path, serialized).await.is_ok() {
+            let _ = tokio::fs::rename(temp_path, &*state.preview_config_path).await;
+        }
+    }
+
     state.camera.start_stream(request).await?;
     Ok((
         StatusCode::OK,
@@ -158,6 +196,19 @@ async fn reconfigure_stream(
     Json(request): Json<StreamRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     let accepted = request.clone();
+
+    // Reconfigure and Start streams exclusively write to the preview staging config
+    let config = AppConfig {
+        profile: request.profile,
+        settings: request.settings.clone(),
+    };
+    if let Ok(serialized) = serde_json::to_string_pretty(&config) {
+        let temp_path = state.preview_config_path.with_extension("json.tmp");
+        if tokio::fs::write(&temp_path, serialized).await.is_ok() {
+            let _ = tokio::fs::rename(temp_path, &*state.preview_config_path).await;
+        }
+    }
+
     state.camera.reconfigure_stream(request).await?;
     Ok((
         StatusCode::OK,
@@ -166,6 +217,9 @@ async fn reconfigure_stream(
 }
 
 async fn stop_stream(State(state): State<AppState>) -> impl IntoResponse {
+    // Delete the preview stage temporary configuration file when the preview stream closes/stops
+    let _ = tokio::fs::remove_file(&*state.preview_config_path).await;
+
     match state.camera.stop_stream().await {
         Ok(true) => (StatusCode::OK, Json(Message::new("preview stopped"))).into_response(),
         Ok(false) => (
@@ -257,6 +311,36 @@ async fn capture(
             .camera
             .capture_to_stage(&state.capture_dir, request)
             .await?,
+    ))
+}
+
+async fn commit_config(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    if state.preview_config_path.exists() {
+        // Overwrite the persistent operational production config under config.json atomically
+        let content = tokio::fs::read_to_string(&*state.preview_config_path).await?;
+        let temp_path = state.config_path.with_extension("json.tmp");
+        tokio::fs::write(&temp_path, &content).await?;
+        tokio::fs::rename(temp_path, &*state.config_path).await?;
+    }
+    Ok((
+        StatusCode::OK,
+        Json(Message::new("configuration committed")),
+    ))
+}
+
+async fn discard_config(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    // Revert preview state by copying config.json back to preview_config.json
+    if state.config_path.exists() {
+        let content = tokio::fs::read_to_string(&*state.config_path).await?;
+        let temp_path = state.preview_config_path.with_extension("json.tmp");
+        tokio::fs::write(&temp_path, &content).await?;
+        tokio::fs::rename(temp_path, &*state.preview_config_path).await?;
+    } else {
+        let _ = tokio::fs::remove_file(&*state.preview_config_path).await;
+    }
+    Ok((
+        StatusCode::OK,
+        Json(Message::new("configuration discarded")),
     ))
 }
 
@@ -380,16 +464,12 @@ mod tests {
         assert!(APP_JS.contains("controlRevision !== requestedRevision"));
         assert!(APP_JS.contains("recordRenderedFrame(headers, paintedAt)"));
         assert!(INDEX_HTML.contains("First visible"));
-        assert!(INDEX_HTML.contains("3A stable"));
         assert!(APP_JS.contains("previewLabel(accepted.profile, accepted.settings)"));
         assert!(INDEX_HTML.contains("Capture profile"));
         assert!(APP_JS.contains("master_archive"));
         assert!(APP_JS.contains("${profile.previewFps} FPS"));
         assert!(APP_JS.contains("White balance ${optionLabel(\"awb\", values.awb)}"));
-        assert!(APP_JS.contains("Metering ${optionLabel(\"metering\", values.metering)}"));
-        assert!(APP_JS.contains("Exposure mode ${optionLabel(\"exposure\", values.exposure)}"));
         assert!(APP_JS.contains("Denoise ${optionLabel(\"denoise\", values.denoise)}"));
-        assert!(APP_JS.contains("EV ${ev}"));
         assert!(APP_JS.contains("Analogue gain ${gain}"));
         assert!(INDEX_HTML.contains("Live preview starts automatically"));
         assert!(!INDEX_HTML.contains("id=\"start-stream\""));

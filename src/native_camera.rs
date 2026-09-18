@@ -635,21 +635,10 @@ mod imp {
         fps: Option<u8>,
     ) -> Result<(), CameraError> {
         let controls = request.controls_mut();
-        // Do not rely on pipeline defaults: the 3A algorithms must be active
-        // for exposure compensation and AWB mode changes to affect the image.
+
+        // Permanent AEC Bypass: Pure Manual open-loop
         controls
-            .set(controls::AeEnable(
-                settings.shutter_us == 0 || settings.gain == 0.0,
-            ))
-            .map_err(backend_error)?;
-        controls
-            .set(controls::AeMeteringMode::from_setting(&settings.metering))
-            .map_err(backend_error)?;
-        controls
-            .set(controls::AeExposureMode::from_setting(&settings.exposure))
-            .map_err(backend_error)?;
-        controls
-            .set(controls::ExposureValue(settings.ev))
+            .set(controls::AeEnable(false))
             .map_err(backend_error)?;
         controls
             .set(controls::AwbEnable(true))
@@ -661,33 +650,23 @@ mod imp {
             .set(noise_reduction_mode(&settings.denoise, fps.is_some()))
             .map_err(backend_error)?;
 
-        if settings.shutter_us == 0 {
-            controls
-                .set(controls::ExposureTimeMode::Auto)
-                .map_err(backend_error)?;
-        } else {
-            let exposure = i32::try_from(settings.shutter_us)
-                .map_err(|_| CameraError::Invalid("shutter exceeds libcamera range"))?;
-            controls
-                .set(controls::ExposureTimeMode::Manual)
-                .map_err(backend_error)?;
-            controls
-                .set(controls::ExposureTime(exposure))
-                .map_err(backend_error)?;
-        }
+        // Force Shutter Speed manually
+        let exposure = i32::try_from(settings.shutter_us)
+            .map_err(|_| CameraError::Invalid("shutter exceeds libcamera range"))?;
+        controls
+            .set(controls::ExposureTimeMode::Manual)
+            .map_err(backend_error)?;
+        controls
+            .set(controls::ExposureTime(exposure))
+            .map_err(backend_error)?;
 
-        if settings.gain == 0.0 {
-            controls
-                .set(controls::AnalogueGainMode::Auto)
-                .map_err(backend_error)?;
-        } else {
-            controls
-                .set(controls::AnalogueGainMode::Manual)
-                .map_err(backend_error)?;
-            controls
-                .set(controls::AnalogueGain(settings.gain))
-                .map_err(backend_error)?;
-        }
+        // Force Analogue Gain manually
+        controls
+            .set(controls::AnalogueGainMode::Manual)
+            .map_err(backend_error)?;
+        controls
+            .set(controls::AnalogueGain(settings.gain))
+            .map_err(backend_error)?;
 
         if let Some(fps) = fps {
             let frame_us = (1_000_000_i64 / i64::from(fps)).max(
@@ -705,37 +684,16 @@ mod imp {
         fn from_setting(value: &str) -> Self;
     }
 
-    impl FromSetting for controls::AeMeteringMode {
-        fn from_setting(value: &str) -> Self {
-            match value {
-                "centre" => Self::MeteringCentreWeighted,
-                "spot" => Self::MeteringSpot,
-                "average" => Self::MeteringMatrix,
-                _ => unreachable!("camera settings are validated before control mapping"),
-            }
-        }
-    }
-
-    impl FromSetting for controls::AeExposureMode {
-        fn from_setting(value: &str) -> Self {
-            match value {
-                "normal" => Self::ExposureNormal,
-                "sport" => Self::ExposureShort,
-                _ => unreachable!("camera settings are validated before control mapping"),
-            }
-        }
-    }
-
     impl FromSetting for controls::AwbMode {
         fn from_setting(value: &str) -> Self {
             match value {
                 "auto" => Self::AwbAuto,
-                "incandescent" => Self::AwbIncandescent,
+                "daylight" => Self::AwbDaylight,
+                "cloudy" => Self::AwbCloudy,
                 "tungsten" => Self::AwbTungsten,
                 "fluorescent" => Self::AwbFluorescent,
                 "indoor" => Self::AwbIndoor,
-                "daylight" => Self::AwbDaylight,
-                "cloudy" => Self::AwbCloudy,
+                "incandescent" => Self::AwbIncandescent,
                 _ => unreachable!("camera settings are validated before control mapping"),
             }
         }
@@ -1133,7 +1091,6 @@ mod imp {
             let current = CameraSettings::default();
             let requested = CameraSettings {
                 awb: "tungsten".to_owned(),
-                ev: 2.0,
                 gain: 4.0,
                 shutter_us: 20_000,
                 ..current.clone()

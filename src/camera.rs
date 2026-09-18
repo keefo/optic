@@ -88,6 +88,21 @@ pub enum CaptureProfile {
     Binning2k,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AppConfig {
+    pub profile: CaptureProfile,
+    pub settings: CameraSettings,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            profile: CaptureProfile::Binning2k,
+            settings: CameraSettings::default(),
+        }
+    }
+}
+
 impl CaptureProfile {
     pub(crate) fn spec(self) -> CaptureSpec {
         match self {

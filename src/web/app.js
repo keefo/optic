@@ -21,6 +21,8 @@ const elements = {
 };
 
 const defaults = {
+  discardConfig: document.querySelector("#discard-config"),
+  saveConfig: document.querySelector("#save-config"),
   rotation: 0,
   horizontal_flip: false,
   vertical_flip: false,
@@ -55,6 +57,9 @@ let mjpegGeneration = 0;
 let measurementRevision = 0;
 let lastFrameMetadata = null;
 const controlChanges = new Map();
+let baselineSettings = { ...defaults };
+let activeSliderTimer = null;
+let sliderIsActiveDragging = false;
 const activeMeasurements = new Map();
 const firstVisibleSamples = [];
 const MAX_MEASUREMENT_SAMPLES = 10;
@@ -144,6 +149,62 @@ function updateOutputs() {
 function showNotice(message, kind = "normal") {
   elements.notice.textContent = message;
   elements.notice.dataset.kind = kind;
+}
+  checkSettingsModified();
+
+function checkSettingsModified() {
+  const current = settings();
+  const profileChanged = document.querySelector('input[name="capture-profile"]:checked').value !== baselineSettings.profile;
+  const isModified = profileChanged || Object.keys(defaults).some((key) => {
+    // metering, exposure, ev are bypassed in UI, skip them
+    if (key === "metering" || key === "exposure" || key === "ev") return false;
+    return current[key] !== baselineSettings.settings[key];
+  });
+  
+  elements.discardConfig.disabled = !isModified;
+  elements.saveConfig.disabled = !isModified;
+}
+
+async function fnCommitConfig() {
+  setBusy(true);
+  try {
+    const response = await api("/api/config/commit", { method: "POST" });
+    const result = await response.json();
+    showNotice(result.message, "success");
+    // Snapshot the new baseline
+    baselineSettings = {
+      profile: selectedProfile(),
+      settings: settings()
+    };
+    checkSettingsModified();
+  } catch (error) {
+    showNotice(error.message, "error");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function fnDiscardConfig() {
+  setBusy(true);
+  try {
+    const response = await api("/api/config/discard", { method: "POST" });
+    const result = await response.json();
+    showNotice(result.message, "success");
+    // Roll back UI settings to the persistent baseline configuration state
+    applySettings(baselineSettings.settings);
+    const profileButtons = document.querySelectorAll('input[name="capture-profile"]');
+    for (const btn of profileButtons) {
+      if (btn.value === baselineSettings.profile) {
+        btn.checked = true;
+      }
+    }
+    updateProfile();
+    checkSettingsModified();
+  } catch (error) {
+    showNotice(error.message, "error");
+  } finally {
+    setBusy(false);
+  }
 }
 
 function showPreview(source, state) {
@@ -745,3 +806,5 @@ updateProfile();
 hidePreview();
 refreshStatus();
 setInterval(refreshStatus, 3000);
+elements.discardConfig.addEventListener("click", fnDiscardConfig);
+elements.saveConfig.addEventListener("click", fnCommitConfig);

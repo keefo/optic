@@ -142,6 +142,10 @@ button:disabled { opacity: 0.5; cursor: wait; }
 button.primary { color: #03110c; background: var(--green); border-color: var(--green); font-weight: 700; }
 button.accent { color: var(--orange); border-color: rgba(255, 174, 87, 0.45); }
 button.text-button { min-height: 0; border: 0; background: transparent; color: var(--muted); padding: 4px; }
+button.bad { color: var(--red) !important; }
+button.bad:hover:not(:disabled) { border-color: var(--red); }
+button.good { color: var(--green) !important; }
+button.good:hover:not(:disabled) { border-color: var(--green); }
 
 .notice { min-height: 1.5em; margin: 14px 0 0; color: var(--muted); font-size: 0.88rem; }
 .notice[data-kind="success"] { color: var(--green); }
