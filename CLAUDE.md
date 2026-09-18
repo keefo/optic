@@ -1,4 +1,7 @@
-# AI Agent Instructions
+# CLAUDE.md
+@AGENTS.md
+
+# Claude-specific notes
 
 ## Purpose
 
