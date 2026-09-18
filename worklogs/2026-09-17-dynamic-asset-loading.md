@@ -1,6 +1,6 @@
 # Dated Worklog: 2026-09-17 - Dynamic Filesystem Asset Loading
 
-Status: implemented, tested locally, and deployed to the Raspberry Pi (`optic.local`) as `optic-daemon` 0.1.7. Live-verified over the LAN — see Deployment.
+Status: implemented, tested locally, and deployed to the Raspberry Pi (`optic.local`) as `optic-daemon` 0.1.8. Live-verified over the LAN — see Deployment. A regression found live in 0.1.7 (see Follow-up: crash on control input) was fixed and shipped as 0.1.8.
 
 We transition the `optic-daemon` web resource delivery system away from compile-time macro embeds (`include_str!`) to dynamic filesystem loads. This allows rapid hot-reloading of UI modifications without triggering full compilations.
 
@@ -94,9 +94,38 @@ The user added `src/web/icon.svg` and asked to wire it into the page. Confirmed 
 
 Verified by rebuilding and running the daemon locally: `curl /icon.svg` returned `200` with `Content-Type: image/svg+xml` and the same CSP/`nosniff`/`no-store` headers as other assets; `curl /` showed both the `<link rel="icon">` and `<img class="brand-icon">` tags referencing it. `cargo test` (17/17) still passes. Later re-verified end-to-end on the deployed Pi (see Deployment below): `icon.svg` was mirrored to `~/.local/bin/web/` automatically (never explicitly listed in any deploy script) and served correctly in production.
 
+## Follow-up: crash on control input (0.1.7 → 0.1.8)
+
+User reported a live browser console error while using the deployed 0.1.7 dashboard:
+
+```
+app.js:396 Uncaught TypeError: Cannot set properties of null (setting 'textContent')
+    at beginMeasurement (app.js:396:39)
+    at beginControlMeasurement (app.js:414:3)
+    at HTMLSelectElement.<anonymous> (app.js:850:5)
+```
+
+Root cause: pre-existing, unrelated to this session's dynamic-asset-loading work. `git bisect`-by-hand (`git log -p -- src/web/index.html`, then checking each commit for the removed markup) traced it to commit `629c65a` ("Introduce persistent staged sandbox, AEC-Free manual exposure, and unified Biome build constraints", 2026-09-17), which deliberately removed the "3A stable" `<dd id="settled-latency">` metric row from `index.html`'s responsiveness panel but never cleaned up the corresponding `app.js` references. `elements.settledLatency` (`document.querySelector("#settled-latency")`) has been permanently `null` ever since; every call to `beginMeasurement` — triggered by any control input (select, slider, checkbox) — crashed trying to write `.textContent` on it, breaking live-measurement tracking for every control change.
+
+Fix (`src/web/app.js`): removed the dead `elements.settledLatency` field and all 5 write sites (`beginMeasurement`, three branches in `recordRenderedFrame`, one in `updateLivePreview`'s catch handler). Where the removed writes lived inside `recordRenderedFrame`'s stale/settled-detection branching, collapsed the three duplicate `activeMeasurements.delete(revision)` calls (previously one per branch, each gated only by which text they used to display) into a single `settled` boolean condition — the settling computation itself (`stableFrames`, `aeSettled`/`awbSettled`, `SETTLE_TIMEOUT_MS`) is still needed to decide when to stop tracking a measurement, it just no longer drives a display that doesn't exist. Verified via `rg -n "settledLatency|settled-latency"` across `app.js`/`index.html` that no references remain, `node --check app.js` for syntax, and a re-run of the Pi's Biome binary (clean, `exit=0`) before redeploying.
+
+Bumped `Cargo.toml`/`Cargo.lock` to `0.1.8` and re-ran `./scripts/build-deploy-optic-daemon.sh` in full (chosen over a partial/manual fix specifically because a Rust-independent asset-only fix still deserves a reproducible, versioned deploy when it's going out as "the" fix for a reported bug, rather than an ad hoc live patch). Deploy succeeded: Biome clean, 29/29 `cargo test` on the Pi's native target, Clippy clean, release build linked correctly, installed, service healthy.
+
+## Follow-up: direct asset sync for a same-session UI tweak
+
+While 0.1.8 was mid-deploy, the user made two further, purely cosmetic edits directly in the editor: `src/web/index.html` header `<h1>` text ("HQ Camera Control" → "Camera Control") and `src/web/styles.css` `h1` font-size (`clamp(2rem, 5vw, 3.8rem)` → `clamp(2rem, 5vw, 2rem)`, i.e. now a fixed 2rem regardless of viewport width — flagged to the user as possibly unintentional since min/max are now equal, but left as-is since it's a deliberate on-disk edit and renders correctly).
+
+The `styles.css` edit happened to land before that deploy's `tar` packaging step and made it into 0.1.8. The `index.html` title edit landed after packaging (confirmed by diffing `curl http://optic.local:8000/` against the local file post-deploy), so it was still serving the old title.
+
+User asked whether an asset-only change like this needs a version bump and full daemon rebuild. Answer given and acted on: **no** — that's the point of this feature. `/api/status`'s `version` field is compiled in and only changes with a real rebuild, but the served page content is read from disk on every request, independent of that. Synced just the one changed file directly: `scp src/web/index.html liam@optic.local:~/.local/bin/web/index.html`, then verified live (`curl http://optic.local:8000/` shows the new `<h1>`). No version bump, no rebuild, no service restart.
+
+Traded off knowingly: this makes `~/.local/bin/web/` (what's actually served) diverge from the versioned source tree at `~/.local/src/optic-daemon-0.1.8/` (what the last full deploy recorded) until the next full `./scripts/build-deploy-optic-daemon.sh` run, which always repackages fresh from the working directory and will reconcile the two. Told to the user explicitly before doing it.
+
 ## User Verification Steps
 
-Deployment and the checks above are done; user has confirmed the deployed dashboard at `http://optic.local:8000/` works well. Remaining optional acceptance steps, if wanted:
+Deployment and the checks above are done; user has confirmed the deployed dashboard at `http://optic.local:8000/` works well, including after the 0.1.8 crash fix and the direct-sync title change. Remaining optional acceptance steps, if wanted:
 
-1. Open `http://optic.local:8000/` in a browser and visually confirm the favicon and header icon render as expected (only verified via `curl`/content-type in this session, not visually in a browser).
-2. Decide on the open `404` question noted under Remaining Limitations (unmatched paths currently return `500`, not `404`) — no action taken pending that decision.
+1. Open `http://optic.local:8000/` in a browser and visually confirm the favicon, header icon, and updated title render as expected (only verified via `curl`/content-type/grep in this session, not visually in a browser).
+2. Exercise a control input (e.g. change white balance or rotation) in the live dashboard and confirm no console error and that "First visible"/"Median" measurements still update — the crash path (`beginMeasurement` → `beginControlMeasurement`) is exactly what's exercised by any control change.
+3. Decide on the open `404` question noted under Remaining Limitations (unmatched paths currently return `500`, not `404`) — no action taken pending that decision.
+4. Confirm the `h1` font-size change (now fixed at `2rem` instead of scaling up to `3.8rem` on wide viewports) is the intended final sizing.

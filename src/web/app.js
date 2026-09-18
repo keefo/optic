@@ -14,7 +14,6 @@ const elements = {
   firstVisibleLatency: document.querySelector("#first-visible-latency"),
   medianVisibleLatency: document.querySelector("#median-visible-latency"),
   medianSampleCount: document.querySelector("#median-sample-count"),
-  settledLatency: document.querySelector("#settled-latency"),
   measurementSample: document.querySelector("#measurement-sample"),
   discardConfig: document.querySelector("#discard-config"),
   saveConfig: document.querySelector("#save-config"),
@@ -393,7 +392,6 @@ function beginMeasurement(label, needsAe, needsAwb) {
   });
   measurementRevision = revision;
   elements.firstVisibleLatency.textContent = "Measuring…";
-  elements.settledLatency.textContent = needsAe || needsAwb ? "Measuring…" : "N/A";
   elements.measurementSample.textContent = `${label} · revision ${revision}`;
 }
 
@@ -486,22 +484,11 @@ function recordRenderedFrame(headers, paintedAt) {
     }
     measurement.previous = cloneMetadata(metadata);
 
-    if (measurement.stableFrames >= 3) {
-      if (revision === measurementRevision) {
-        elements.settledLatency.textContent = formatLatency(paintedAt - measurement.startedAt);
-      }
-      activeMeasurements.delete(revision);
-    } else if (!metadataAvailable) {
-      if (revision === measurementRevision) elements.settledLatency.textContent = "Unavailable";
-      activeMeasurements.delete(revision);
-    } else if (paintedAt - measurement.startedAt >= SETTLE_TIMEOUT_MS) {
-      if (revision === measurementRevision) {
-        elements.settledLatency.textContent = measurement.observedChange
-          ? ">15000 ms"
-          : "No metadata change";
-      }
-      activeMeasurements.delete(revision);
-    }
+    const settled =
+      measurement.stableFrames >= 3 ||
+      !metadataAvailable ||
+      paintedAt - measurement.startedAt >= SETTLE_TIMEOUT_MS;
+    if (settled) activeMeasurements.delete(revision);
   }
 }
 
@@ -628,7 +615,6 @@ async function updateLivePreview() {
       elements.streamState.textContent = "Live · update failed";
       if (requestedRevision === measurementRevision) {
         elements.firstVisibleLatency.textContent = "Failed";
-        elements.settledLatency.textContent = "Failed";
       }
       showNotice(`Could not update preview: ${error.message}`, "error");
     }
