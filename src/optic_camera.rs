@@ -6,15 +6,12 @@ use std::{
     },
 };
 
-use bytes::Bytes;
 use serde::Serialize;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, warn};
 
 use crate::{
-    camera::{
-        CameraError, CaptureRequest, CaptureResult, PreviewFrame, StreamRequest, TestShotRequest,
-    },
+    camera::{CameraError, CaptureRequest, CaptureResult, PreviewFrame, StreamRequest},
     native_camera::NativeCameraBackend,
 };
 
@@ -71,10 +68,6 @@ enum CameraCommand {
     },
     Subscribe {
         reply: oneshot::Sender<Result<broadcast::Receiver<PreviewFrame>, CameraError>>,
-    },
-    CaptureTestShot {
-        request: TestShotRequest,
-        reply: oneshot::Sender<Result<Bytes, CameraError>>,
     },
     CaptureToStage {
         capture_dir: PathBuf,
@@ -153,13 +146,6 @@ impl OpticCamera {
     pub async fn subscribe(&self) -> Result<broadcast::Receiver<PreviewFrame>, CameraError> {
         let (reply, response) = oneshot::channel();
         self.enqueue(CameraCommand::Subscribe { reply }).await?;
-        receive(response).await?
-    }
-
-    pub async fn capture_test_shot(&self, request: TestShotRequest) -> Result<Bytes, CameraError> {
-        let (reply, response) = oneshot::channel();
-        self.enqueue(CameraCommand::CaptureTestShot { request, reply })
-            .await?;
         receive(response).await?
     }
 
@@ -246,10 +232,6 @@ async fn run_actor(
             }
             CameraCommand::Subscribe { reply } => {
                 let _ = reply.send(backend.subscribe().await);
-                false
-            }
-            CameraCommand::CaptureTestShot { request, reply } => {
-                let _ = reply.send(backend.capture_test_shot(request).await);
                 false
             }
             CameraCommand::CaptureToStage {

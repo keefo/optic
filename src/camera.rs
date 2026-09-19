@@ -197,19 +197,6 @@ impl CaptureRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TestShotRequest {
-    pub settings: CameraSettings,
-    pub profile: CaptureProfile,
-}
-
-impl TestShotRequest {
-    pub(crate) fn validate(&self) -> Result<(), CameraError> {
-        self.settings.validate()
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StreamRequest {
@@ -237,7 +224,7 @@ pub struct PreviewFrame {
     pub colour_gains: Option<[f32; 2]>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CaptureFile {
     pub filename: String,
     pub bytes: u64,

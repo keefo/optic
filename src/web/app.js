@@ -6,7 +6,6 @@ const elements = {
   streamState: document.querySelector("#stream-state"),
   daemonStatus: document.querySelector("#daemon-status"),
   cameraStatus: document.querySelector("#camera-status"),
-  testShot: document.querySelector("#test-shot"),
   capture: document.querySelector("#capture"),
   reset: document.querySelector("#reset"),
   saveDng: document.querySelector("#save-dng"),
@@ -17,6 +16,29 @@ const elements = {
   measurementSample: document.querySelector("#measurement-sample"),
   discardConfig: document.querySelector("#discard-config"),
   saveConfig: document.querySelector("#save-config"),
+  syncConnectivity: document.querySelector("#sync-connectivity"),
+  syncQueued: document.querySelector("#sync-queued"),
+  syncTransferred: document.querySelector("#sync-transferred"),
+  syncConnectivityRaw: document.querySelector("#sync-connectivity-raw"),
+  syncBackoff: document.querySelector("#sync-backoff"),
+  syncNextRetry: document.querySelector("#sync-next-retry"),
+  syncNextScan: document.querySelector("#sync-next-scan"),
+  syncLastError: document.querySelector("#sync-last-error"),
+  syncPause: document.querySelector("#sync-pause"),
+  syncResume: document.querySelector("#sync-resume"),
+  syncRetryNow: document.querySelector("#sync-retry-now"),
+  systemMemoryBar: document.querySelector("#system-memory-bar"),
+  systemMemoryLabel: document.querySelector("#system-memory-label"),
+  systemDiskRootBar: document.querySelector("#system-disk-root-bar"),
+  systemDiskRootLabel: document.querySelector("#system-disk-root-label"),
+  systemDiskCaptureBar: document.querySelector("#system-disk-capture-bar"),
+  systemDiskCaptureLabel: document.querySelector("#system-disk-capture-label"),
+  systemTemp: document.querySelector("#system-temp"),
+  systemUptime: document.querySelector("#system-uptime"),
+  systemNetwork: document.querySelector("#system-network"),
+  systemCaptureHealth: document.querySelector("#system-capture-health"),
+  systemRestartDaemon: document.querySelector("#system-restart-daemon"),
+  systemReboot: document.querySelector("#system-reboot"),
 };
 
 const defaults = {
@@ -96,6 +118,7 @@ const activeMeasurements = new Map();
 const firstVisibleSamples = [];
 const MAX_MEASUREMENT_SAMPLES = 10;
 const SETTLE_TIMEOUT_MS = 15000;
+const POST_CAPTURE_FREEZE_MS = 3000;
 
 function settings() {
   return {
@@ -244,18 +267,6 @@ async function fnDiscardConfig() {
   }
 }
 
-function showPreview(source, state) {
-  stopMjpegPreview();
-  if (objectUrl && objectUrl !== source) {
-    URL.revokeObjectURL(objectUrl);
-    objectUrl = null;
-  }
-  elements.preview.src = source;
-  elements.preview.hidden = false;
-  elements.placeholder.hidden = true;
-  elements.streamState.textContent = state;
-}
-
 function hidePreview(state = "Starting automatically") {
   stopMjpegPreview();
   if (objectUrl) {
@@ -274,6 +285,14 @@ function stopMjpegPreview() {
     mjpegAbortController.abort();
     mjpegAbortController = null;
   }
+}
+
+// Stops the live stream but leaves the last rendered frame on screen
+// (rather than blanking to the placeholder) so a still capture reads as
+// "the view froze for a moment" instead of "the preview went black".
+function freezePreviewForCapture(state) {
+  stopMjpegPreview();
+  elements.streamState.textContent = state;
 }
 
 function startMjpegPreview(state) {
@@ -701,35 +720,7 @@ function prepareForStillCapture() {
   livePreview = false;
   previewGeneration += 1;
   cancelPreviewUpdate();
-  hidePreview("Still capture · preview resumes automatically");
-}
-
-async function nativeTestShot() {
-  const profileName = selectedProfile();
-  const profile = profiles[profileName];
-  setBusy(true);
-  prepareForStillCapture();
-  showNotice(`Capturing a ${profile.width} × ${profile.height} ${profile.label} test image…`);
-  try {
-    const response = await api("/api/test-shot", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ settings: settings(), profile: profileName }),
-    });
-    objectUrl = URL.createObjectURL(await response.blob());
-    showPreview(objectUrl, `Test shot · ${profile.width} × ${profile.height}`);
-    showNotice(
-      `${profile.label} test shot complete. Inspect it at full size for focus.`,
-      "success",
-    );
-  } catch (error) {
-    showNotice(error.message, "error");
-  } finally {
-    captureRunning = false;
-    await ensurePreview(null, false);
-    setBusy(false);
-    refreshStatus();
-  }
+  freezePreviewForCapture("Still capture · preview resumes automatically");
 }
 
 async function captureAndTransfer() {
@@ -757,6 +748,11 @@ async function captureAndTransfer() {
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
+    // Hold the frozen frame for a moment so the capture reads as a
+    // deliberate still, rather than flickering straight back to live the
+    // instant the request completes. captureRunning stays true through the
+    // wait so refreshStatus()'s own auto-resume logic doesn't race this.
+    await new Promise((resolve) => setTimeout(resolve, POST_CAPTURE_FREEZE_MS));
     captureRunning = false;
     await ensurePreview(null, false);
     setBusy(false);
@@ -765,9 +761,7 @@ async function captureAndTransfer() {
 }
 
 function setBusy(busy) {
-  for (const button of [elements.testShot, elements.capture]) {
-    button.disabled = busy;
-  }
+  elements.capture.disabled = busy;
 }
 
 async function refreshStatus() {
@@ -789,6 +783,7 @@ async function refreshStatus() {
     document.querySelector("#queue").textContent =
       `${status.capture_stage.queued_files} files · ${formatBytes(status.capture_stage.queued_bytes)}`;
     document.querySelector("#sensor").textContent = status.camera.sensor || "Not detected";
+    renderSync(status.sync);
     if (!pageActive || captureRunning || reconfigureRunning) return;
     if (!status.camera.streaming && livePreview) {
       livePreview = false;
@@ -806,10 +801,137 @@ async function refreshStatus() {
   }
 }
 
+function renderSync(sync) {
+  const label = !sync.enabled
+    ? "Disabled"
+    : sync.paused
+      ? "Paused"
+      : sync.connectivity === "syncing"
+        ? "Syncing"
+        : sync.connectivity === "backoff"
+          ? "Retrying"
+          : "Idle";
+  const tone =
+    !sync.enabled || sync.paused ? "neutral" : sync.connectivity === "backoff" ? "bad" : "good";
+  elements.syncConnectivity.textContent = label;
+  elements.syncConnectivity.className = `pill ${tone}`;
+
+  elements.syncQueued.textContent = `${sync.queued_files} file${sync.queued_files === 1 ? "" : "s"} · ${formatBytes(sync.queued_bytes)}`;
+  elements.syncTransferred.textContent = `${sync.transferred_files} file${sync.transferred_files === 1 ? "" : "s"} · ${formatBytes(sync.transferred_bytes)}`;
+  elements.syncConnectivityRaw.textContent = sync.connectivity;
+  elements.syncBackoff.textContent = sync.backoff_secs != null ? `${sync.backoff_secs}s` : "—";
+  elements.syncNextRetry.textContent =
+    sync.next_retry_in_secs != null ? `${sync.next_retry_in_secs}s` : "—";
+  elements.syncNextScan.textContent =
+    sync.next_scan_in_secs != null ? `${sync.next_scan_in_secs}s` : "—";
+  elements.syncLastError.textContent = sync.last_error || "—";
+
+  elements.syncPause.disabled = !sync.enabled || sync.paused;
+  elements.syncResume.disabled = !sync.enabled || !sync.paused;
+  elements.syncRetryNow.disabled = !sync.enabled || sync.connectivity !== "backoff";
+}
+
+async function syncAction(path) {
+  try {
+    await api(path, { method: "POST" });
+  } catch (error) {
+    showNotice(`Sync action failed: ${error.message}`, "error");
+  } finally {
+    refreshStatus();
+  }
+}
+
+async function refreshSystemStatus() {
+  try {
+    const response = await api("/api/system/status");
+    const data = await response.json();
+    renderSystemStatus(data);
+  } catch {
+    resetUsageBar(elements.systemMemoryBar, elements.systemMemoryLabel);
+    resetUsageBar(elements.systemDiskRootBar, elements.systemDiskRootLabel);
+    resetUsageBar(elements.systemDiskCaptureBar, elements.systemDiskCaptureLabel);
+    elements.systemTemp.textContent = "—";
+    elements.systemUptime.textContent = "—";
+    elements.systemNetwork.textContent = "—";
+    elements.systemCaptureHealth.textContent = "—";
+  }
+}
+
+// Sets the bar width via the `style` DOM property rather than an HTML
+// `style="..."` attribute (e.g. via innerHTML) — the dashboard's CSP is
+// `style-src 'self'` with no `unsafe-inline`, which silently drops inline
+// style attributes parsed from markup. Assigning `.style.width` in JS is
+// exempt (it's CSSOM manipulation, governed by script-src, not style-src).
+function setUsageBar(barEl, labelEl, usedBytes, totalBytes) {
+  const pct = totalBytes > 0 ? Math.min(100, (usedBytes / totalBytes) * 100) : 0;
+  barEl.style.width = `${pct.toFixed(1)}%`;
+  barEl.classList.toggle("warn", pct >= 70 && pct < 90);
+  barEl.classList.toggle("danger", pct >= 90);
+  labelEl.textContent = `${formatBytes(usedBytes)} / ${formatBytes(totalBytes)} (${pct.toFixed(0)}%)`;
+}
+
+function resetUsageBar(barEl, labelEl) {
+  barEl.style.width = "0%";
+  barEl.classList.remove("warn", "danger");
+  labelEl.textContent = "—";
+}
+
+function renderSystemStatus(data) {
+  const { system, capture_health: health } = data;
+
+  setUsageBar(
+    elements.systemMemoryBar,
+    elements.systemMemoryLabel,
+    system.memory.total_bytes - system.memory.available_bytes,
+    system.memory.total_bytes,
+  );
+
+  const setDiskBar = (label, barEl, labelEl) => {
+    const entry = system.disks.find((disk) => disk.label === label);
+    if (!entry) {
+      resetUsageBar(barEl, labelEl);
+      return;
+    }
+    setUsageBar(barEl, labelEl, entry.total_bytes - entry.available_bytes, entry.total_bytes);
+  };
+  setDiskBar("root", elements.systemDiskRootBar, elements.systemDiskRootLabel);
+  setDiskBar("capture", elements.systemDiskCaptureBar, elements.systemDiskCaptureLabel);
+
+  elements.systemTemp.textContent =
+    system.cpu_temp_celsius != null ? `${system.cpu_temp_celsius.toFixed(1)}°C` : "—";
+  elements.systemUptime.textContent = formatDuration(system.uptime_seconds);
+  elements.systemNetwork.textContent =
+    system.network_interfaces.length > 0
+      ? system.network_interfaces
+          .map((iface) => `${iface.name}: ${iface.addresses.join(", ")}`)
+          .join(" · ")
+      : "No network interfaces";
+
+  elements.systemCaptureHealth.textContent =
+    health.total > 0
+      ? `${health.successful}/${health.total} succeeded` +
+        (health.average_duration_ms != null
+          ? ` · avg ${(health.average_duration_ms / 1000).toFixed(1)}s`
+          : "") +
+        (health.last_capture_success === false ? " · last capture failed" : "")
+      : "No captures in the last 24h";
+}
+
+async function systemAction(path, confirmMessage) {
+  if (!window.confirm(confirmMessage)) return;
+  try {
+    await api(path, { method: "POST" });
+    showNotice("Command sent.");
+  } catch (error) {
+    showNotice(`System action failed: ${error.message}`, "error");
+  }
+}
+
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
-  return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`;
+  return `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
 }
 
 function formatDuration(seconds) {
@@ -818,7 +940,6 @@ function formatDuration(seconds) {
   return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
 
-elements.testShot.addEventListener("click", nativeTestShot);
 elements.capture.addEventListener("click", captureAndTransfer);
 elements.reset.addEventListener("click", () => {
   applySettings(defaults);
@@ -863,11 +984,28 @@ window.addEventListener("pageshow", (event) => {
   hidePreview();
   void ensurePreview();
 });
+elements.systemRestartDaemon.addEventListener("click", () =>
+  systemAction(
+    "/api/system/restart-daemon",
+    "Restart the optic-daemon service? The dashboard will briefly disconnect.",
+  ),
+);
+elements.systemReboot.addEventListener("click", () =>
+  systemAction(
+    "/api/system/reboot",
+    "Reboot the Raspberry Pi? This takes it offline for about a minute.",
+  ),
+);
 
 applySettings(defaults);
 updateProfile();
 hidePreview();
 refreshStatus();
+refreshSystemStatus();
 setInterval(refreshStatus, 3000);
+setInterval(refreshSystemStatus, 15000);
 elements.discardConfig.addEventListener("click", fnDiscardConfig);
 elements.saveConfig.addEventListener("click", fnCommitConfig);
+elements.syncPause.addEventListener("click", () => syncAction("/api/sync/pause"));
+elements.syncResume.addEventListener("click", () => syncAction("/api/sync/resume"));
+elements.syncRetryNow.addEventListener("click", () => syncAction("/api/sync/retry-now"));

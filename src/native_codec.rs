@@ -4,7 +4,7 @@ use std::{
 };
 
 use tiff::{
-    encoder::{Rational, SRational, TiffEncoder, colortype::Gray16},
+    encoder::{Rational, SRational, TiffEncoder, colortype::Gray8},
     tags::Tag,
 };
 use turbojpeg_sys as tj;
@@ -301,6 +301,17 @@ fn dequantize(value: u16, mode: u16) -> u16 {
     expanded.min(u32::from(u16::MAX)) as u16
 }
 
+/// Writes a DNG as the two-IFD tree real raw converters (and, notably,
+/// macOS's raw decoder) actually require: a tiny placeholder "preview" as
+/// IFD0 (the file's main/discoverable image, `NewSubfileType = 1`) whose
+/// `SubIFDs` tag points at a second, otherwise-unlinked IFD holding the
+/// full-resolution CFA sensor data (`NewSubfileType = 0`). A single flat
+/// IFD containing the raw data directly — what this function used to
+/// write — parses fine under a generic TIFF reader (tags are all
+/// individually valid) but Apple's raw pipeline silently refuses to decode
+/// it ("Cannot extract image from file"); see
+/// `docs/optic-daemon-dng-compatibility.md` for the investigation that
+/// found this.
 pub(crate) fn encode_bayer16_dng(
     pixels: &[u16],
     width: u32,
@@ -353,14 +364,95 @@ pub(crate) fn encode_bayer16_dng(
         .round()
         .clamp(1.0, f32::from(u16::MAX)) as u16;
 
+    let strip_bytes = pixels
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNG strip size overflow"))?;
+    let strip_bytes = u32::try_from(strip_bytes).map_err(integer_error)?;
+
     let mut cursor = Cursor::new(Vec::new());
     {
         let mut encoder = TiffEncoder::new(&mut cursor).map_err(io::Error::other)?;
-        let mut image = encoder
-            .new_image::<Gray16>(width, height)
+
+        // --- Raw sub-IFD: the actual full-resolution CFA sensor data.
+        // Written first (so its file offset is known), but not chained
+        // into the main IFD sequence — only IFD0's SubIFDs tag below
+        // references it, exactly as `extra_directory` is documented to be
+        // used for ("encode Exif directories or SubIfd directories").
+        let mut raw = encoder.extra_directory().map_err(io::Error::other)?;
+        raw.write_tag(Tag::NewSubfileType, 0_u32)
             .map_err(io::Error::other)?;
-        let tags = image.encoder();
-        tags.write_tag(Tag::PhotometricInterpretation, PHOTOMETRIC_CFA)
+        raw.write_tag(Tag::ImageWidth, width)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::ImageLength, height)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::BitsPerSample, 16_u16)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Compression, 1_u16)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::PhotometricInterpretation, PHOTOMETRIC_CFA)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::SamplesPerPixel, 1_u16)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::PlanarConfiguration, 1_u16)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::SampleFormat, 1_u16)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::RowsPerStrip, height)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_CFA_REPEAT_PATTERN_DIM), &[2_u16, 2][..])
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_CFA_PATTERN), &metadata.cfa_pattern[..])
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_CFA_PLANE_COLOR), &[0_u8, 1, 2][..])
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_CFA_LAYOUT), 1_u16)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_BLACK_LEVEL_REPEAT_DIM), &[2_u16, 2][..])
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_BLACK_LEVEL), &black_levels[..])
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_WHITE_LEVEL), u32::from(u16::MAX))
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_DEFAULT_CROP_ORIGIN), &[0_u32, 0][..])
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::Unknown(TAG_DEFAULT_CROP_SIZE), &[width, height][..])
+            .map_err(io::Error::other)?;
+        raw.write_tag(
+            Tag::Unknown(TAG_ACTIVE_AREA),
+            &[0_u32, 0, height, width][..],
+        )
+        .map_err(io::Error::other)?;
+        let strip_offset = raw.write_data(pixels).map_err(io::Error::other)?;
+        let strip_offset = u32::try_from(strip_offset).map_err(integer_error)?;
+        raw.write_tag(Tag::StripOffsets, strip_offset)
+            .map_err(io::Error::other)?;
+        raw.write_tag(Tag::StripByteCounts, strip_bytes)
+            .map_err(io::Error::other)?;
+        let raw_ifd = raw.finish_with_offsets().map_err(io::Error::other)?;
+
+        // --- IFD0: a tiny placeholder "preview" — the file's main,
+        // normally-discoverable image — carrying the camera/DNG
+        // identification and as-shot color profile tags, plus the
+        // `SubIFDs` pointer to the raw IFD above. DNG readers (including
+        // macOS's) load the real pixel data via that pointer, not from
+        // IFD0 itself.
+        //
+        // Deliberately *not* 1x1: macOS's QuickLook/Preview thumbnail
+        // pipeline hangs indefinitely (0% CPU — genuinely stuck, not slow)
+        // trying to scale a 1-pixel embedded preview for an icon/thumbnail,
+        // even though the raw image itself decodes fine (`sips -s format
+        // png` succeeds). A small-but-real aspect-preserving downscale
+        // avoids whatever degenerate-size edge case that trips. See
+        // `docs/optic-daemon-dng-compatibility.md` §5.
+        let thumb_width = (width / 32).max(2);
+        let thumb_height = (height / 32).max(2);
+        let thumb_pixels = vec![128_u8; (thumb_width as usize) * (thumb_height as usize)];
+        let mut thumbnail = encoder
+            .new_image::<Gray8>(thumb_width, thumb_height)
+            .map_err(io::Error::other)?;
+        let tags = thumbnail.encoder();
+        tags.write_tag(Tag::NewSubfileType, 1_u32)
             .map_err(io::Error::other)?;
         tags.write_tag(Tag::Make, "Raspberry Pi")
             .map_err(io::Error::other)?;
@@ -382,29 +474,6 @@ pub(crate) fn encode_bayer16_dng(
             metadata.model.as_str(),
         )
         .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_CFA_REPEAT_PATTERN_DIM), &[2_u16, 2][..])
-            .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_CFA_PATTERN), &metadata.cfa_pattern[..])
-            .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_CFA_PLANE_COLOR), &[0_u8, 1, 2][..])
-            .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_CFA_LAYOUT), 1_u16)
-            .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_BLACK_LEVEL_REPEAT_DIM), &[2_u16, 2][..])
-            .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_BLACK_LEVEL), &black_levels[..])
-            .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_WHITE_LEVEL), u32::from(u16::MAX))
-            .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_DEFAULT_CROP_ORIGIN), &[0_u32, 0][..])
-            .map_err(io::Error::other)?;
-        tags.write_tag(Tag::Unknown(TAG_DEFAULT_CROP_SIZE), &[width, height][..])
-            .map_err(io::Error::other)?;
-        tags.write_tag(
-            Tag::Unknown(TAG_ACTIVE_AREA),
-            &[0_u32, 0, height, width][..],
-        )
-        .map_err(io::Error::other)?;
         tags.write_tag(Tag::Unknown(TAG_COLOR_MATRIX_1), &color_matrix[..])
             .map_err(io::Error::other)?;
         tags.write_tag(Tag::Unknown(TAG_AS_SHOT_NEUTRAL), &neutral[..])
@@ -415,7 +484,11 @@ pub(crate) fn encode_bayer16_dng(
             .map_err(io::Error::other)?;
         tags.write_tag(Tag::Unknown(TAG_ISO_SPEED_RATINGS), iso)
             .map_err(io::Error::other)?;
-        image.write_data(pixels).map_err(io::Error::other)?;
+        tags.write_tag(Tag::SubIfd, raw_ifd.offset)
+            .map_err(io::Error::other)?;
+        thumbnail
+            .write_data(&thumb_pixels)
+            .map_err(io::Error::other)?;
     }
     Ok(cursor.into_inner())
 }
@@ -494,9 +567,10 @@ mod tests {
 
     use super::*;
 
-    fn little_endian_ifd(data: &[u8]) -> HashMap<u16, (u16, u32, [u8; 4])> {
-        assert_eq!(&data[..4], b"II*\0");
-        let offset = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+    /// Parses one IFD at `offset` into (field_type, count, inline-value-or-offset-bytes) by tag.
+    /// Only handles fields whose value fits inline (<=4 bytes), which covers every scalar tag
+    /// this module's tests inspect.
+    fn read_ifd_at(data: &[u8], offset: usize) -> HashMap<u16, (u16, u32, [u8; 4])> {
         let count = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap()) as usize;
         (0..count)
             .map(|index| {
@@ -511,6 +585,13 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Parses IFD0, the one the TIFF header's first-IFD offset points to.
+    fn little_endian_ifd(data: &[u8]) -> HashMap<u16, (u16, u32, [u8; 4])> {
+        assert_eq!(&data[..4], b"II*\0");
+        let offset = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
+        read_ifd_at(data, offset)
     }
 
     fn inline_unsigned(entry: &(u16, u32, [u8; 4])) -> u32 {
@@ -536,15 +617,48 @@ mod tests {
 
     #[test]
     fn dng_contains_required_cfa_metadata() {
+        const TAG_NEW_SUBFILE_TYPE: u16 = 254;
+        const TAG_SUB_IFD: u16 = 330;
+
         let dng =
             encode_bayer16_dng(&[PISP_COMPRESS_OFFSET; 64], 8, 8, &DngMetadata::default()).unwrap();
-        let tags = little_endian_ifd(&dng);
-        assert_eq!(inline_unsigned(&tags[&256]), 8);
-        assert_eq!(inline_unsigned(&tags[&257]), 8);
-        assert_eq!(inline_unsigned(&tags[&262]), u32::from(PHOTOMETRIC_CFA));
-        assert!(tags.contains_key(&TAG_DNG_VERSION));
-        assert!(tags.contains_key(&TAG_CFA_PATTERN));
-        assert!(tags.contains_key(&TAG_COLOR_MATRIX_1));
+
+        // IFD0 is the tiny placeholder "preview" macOS/Apple's raw decoder
+        // (and, per Adobe's own guidance, any DNG-compliant reader) expects
+        // to find first — it must NOT be the raw CFA data directly.
+        let ifd0 = little_endian_ifd(&dng);
+        assert_eq!(
+            inline_unsigned(&ifd0[&TAG_NEW_SUBFILE_TYPE]),
+            1,
+            "IFD0 must be marked as a reduced-resolution/preview image"
+        );
+        assert!(ifd0.contains_key(&TAG_DNG_VERSION));
+        assert!(ifd0.contains_key(&TAG_COLOR_MATRIX_1));
+        assert!(ifd0.contains_key(&TAG_AS_SHOT_NEUTRAL));
+        assert!(
+            !ifd0.contains_key(&TAG_CFA_PATTERN),
+            "raw CFA tags belong in the sub-IFD, not IFD0"
+        );
+
+        // Follow IFD0's SubIfd pointer to the real raw image and confirm
+        // the actual sensor data lives there.
+        let sub_ifd_offset = inline_unsigned(&ifd0[&TAG_SUB_IFD]) as usize;
+        let raw = read_ifd_at(&dng, sub_ifd_offset);
+        assert_eq!(
+            inline_unsigned(&raw[&TAG_NEW_SUBFILE_TYPE]),
+            0,
+            "the raw sub-IFD must be marked as the main/full-resolution image"
+        );
+        assert_eq!(inline_unsigned(&raw[&256]), 8); // ImageWidth
+        assert_eq!(inline_unsigned(&raw[&257]), 8); // ImageLength
+        assert_eq!(inline_unsigned(&raw[&262]), u32::from(PHOTOMETRIC_CFA));
+        assert!(raw.contains_key(&TAG_CFA_PATTERN));
+        assert!(raw.contains_key(&TAG_BLACK_LEVEL));
+        assert!(raw.contains_key(&TAG_WHITE_LEVEL));
+        assert!(
+            !raw.contains_key(&TAG_COLOR_MATRIX_1),
+            "as-shot color profile tags belong in IFD0, not the raw sub-IFD"
+        );
     }
 
     #[test]

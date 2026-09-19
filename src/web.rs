@@ -2,7 +2,7 @@ use std::{
     convert::Infallible,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 use axum::{
@@ -19,9 +19,12 @@ use serde::Serialize;
 use crate::{
     camera::{
         CameraError, CameraSettings, CaptureProfile, CaptureRequest, CaptureResult, PreviewFrame,
-        StreamRequest, TestShotRequest,
+        StreamRequest,
     },
     optic_camera::{CameraBackendKind, OpticCamera},
+    optic_capture_log::{CaptureHealthStatus, CaptureLog, CaptureLogEntry},
+    optic_sync::{DataSyncManager, SyncStatus, SyncUnavailable},
+    system_status::{self, SystemStatus, SystemStatusReader},
 };
 
 use crate::camera::AppConfig;
@@ -31,6 +34,9 @@ const SECURITY_POLICY: &str = "default-src 'self'; img-src 'self' blob: data:; s
 #[derive(Clone)]
 pub struct AppState {
     camera: OpticCamera,
+    sync: DataSyncManager,
+    capture_log: Option<CaptureLog>,
+    system_status: SystemStatusReader,
     capture_dir: Arc<PathBuf>,
     config_path: Arc<PathBuf>,
     preview_config_path: Arc<PathBuf>,
@@ -42,6 +48,9 @@ pub struct AppState {
 impl AppState {
     pub fn new(
         camera: OpticCamera,
+        sync: DataSyncManager,
+        capture_log: Option<CaptureLog>,
+        system_status: SystemStatusReader,
         capture_dir: PathBuf,
         asset_dir: PathBuf,
         sensor: Option<String>,
@@ -50,6 +59,9 @@ impl AppState {
         let preview_config_path = capture_dir.join("preview_config.json");
         Self {
             camera,
+            sync,
+            capture_log,
+            system_status,
             capture_dir: Arc::new(capture_dir),
             config_path: Arc::new(config_path),
             preview_config_path: Arc::new(preview_config_path),
@@ -70,10 +82,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stream/reconfigure", post(reconfigure_stream))
         .route("/api/stream/stop", post(stop_stream))
         .route("/api/stream/mjpeg", get(mjpeg_stream))
-        .route("/api/test-shot", post(test_shot))
         .route("/api/capture", post(capture))
         .route("/api/config/commit", post(commit_config))
         .route("/api/config/discard", post(discard_config))
+        .route("/api/sync/pause", post(sync_pause))
+        .route("/api/sync/resume", post(sync_resume))
+        .route("/api/sync/retry-now", post(sync_retry_now))
+        .route("/api/system/status", get(system_status_handler))
+        .route("/api/system/reboot", post(system_reboot))
+        .route("/api/system/restart-daemon", post(system_restart_daemon))
         .with_state(state)
 }
 
@@ -203,6 +220,7 @@ struct StatusResponse {
     uptime_seconds: u64,
     camera: CameraStatus,
     capture_stage: CaptureStageStatus,
+    sync: SyncStatus,
     config: AppConfig,
 }
 
@@ -274,8 +292,57 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
             queued_files,
             queued_bytes,
         },
+        sync: state.sync.status(),
         config,
     }))
+}
+
+async fn sync_pause(State(state): State<AppState>) -> Result<Json<SyncStatus>, AppError> {
+    state.sync.pause().await?;
+    Ok(Json(state.sync.status()))
+}
+
+async fn sync_resume(State(state): State<AppState>) -> Result<Json<SyncStatus>, AppError> {
+    state.sync.resume().await?;
+    Ok(Json(state.sync.status()))
+}
+
+async fn sync_retry_now(State(state): State<AppState>) -> Result<Json<SyncStatus>, AppError> {
+    state.sync.retry_now().await?;
+    Ok(Json(state.sync.status()))
+}
+
+/// Rollup window for the capture-health portion of the system panel. Fixed
+/// rather than configurable for v1 — see
+/// `worklogs/2026-09-18-system-control-panel.md`.
+const CAPTURE_HEALTH_WINDOW_HOURS: u32 = 24;
+
+#[derive(Serialize)]
+struct SystemStatusResponse {
+    system: SystemStatus,
+    capture_health: CaptureHealthStatus,
+}
+
+async fn system_status_handler(State(state): State<AppState>) -> Json<SystemStatusResponse> {
+    let system = state.system_status.snapshot().await;
+    let capture_health = match &state.capture_log {
+        Some(log) => log.recent_health(CAPTURE_HEALTH_WINDOW_HOURS).await,
+        None => CaptureHealthStatus::empty(CAPTURE_HEALTH_WINDOW_HOURS),
+    };
+    Json(SystemStatusResponse {
+        system,
+        capture_health,
+    })
+}
+
+async fn system_reboot() -> Result<impl IntoResponse, AppError> {
+    system_status::reboot_host().await?;
+    Ok((StatusCode::OK, Json(Message::new("rebooting"))))
+}
+
+async fn system_restart_daemon() -> impl IntoResponse {
+    system_status::restart_daemon_detached();
+    (StatusCode::OK, Json(Message::new("restarting")))
 }
 
 async fn start_stream(
@@ -396,34 +463,37 @@ fn optional_header(value: Option<impl std::fmt::Display>) -> String {
         .unwrap_or_else(|| "unavailable".to_owned())
 }
 
-async fn test_shot(
-    State(state): State<AppState>,
-    Json(request): Json<TestShotRequest>,
-) -> Result<Response, AppError> {
-    let jpeg = state.camera.capture_test_shot(request).await?;
-    let mut response = Response::new(Body::from(jpeg));
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static("image/jpeg"),
-    );
-    response.headers_mut().insert(
-        header::CONTENT_DISPOSITION,
-        header::HeaderValue::from_static("inline; filename=optic-test-shot.jpg"),
-    );
-    add_no_store_headers(&mut response);
-    Ok(response)
-}
-
 async fn capture(
     State(state): State<AppState>,
     Json(request): Json<CaptureRequest>,
 ) -> Result<Json<CaptureResult>, AppError> {
-    Ok(Json(
-        state
-            .camera
-            .capture_to_stage(&state.capture_dir, request)
-            .await?,
-    ))
+    let started = Instant::now();
+    let requested_at = SystemTime::now();
+    let profile = request.profile;
+    let settings = request.settings.clone();
+    let save_dng = request.save_dng;
+
+    let result = state
+        .camera
+        .capture_to_stage(&state.capture_dir, request)
+        .await;
+    let elapsed_ms = started.elapsed().as_millis();
+    tracing::info!(stage = "http_handler_total", elapsed_ms, "capture perf");
+
+    if let Some(capture_log) = &state.capture_log {
+        let entry = CaptureLogEntry::new(
+            requested_at,
+            SystemTime::now(),
+            elapsed_ms,
+            profile,
+            settings,
+            save_dng,
+            &result,
+        );
+        capture_log.record(entry).await;
+    }
+
+    Ok(Json(result?))
 }
 
 async fn commit_config(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
@@ -496,6 +566,15 @@ impl From<std::io::Error> for AppError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: error.to_string(),
+        }
+    }
+}
+
+impl From<SyncUnavailable> for AppError {
+    fn from(_: SyncUnavailable) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "optic_sync is unavailable".to_owned(),
         }
     }
 }

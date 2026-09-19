@@ -1,0 +1,342 @@
+//! Read-only Pi/host health snapshot for the dashboard's system panel —
+//! memory, disk usage, uptime, CPU temperature, and network interfaces.
+//! See `worklogs/2026-09-18-system-control-panel.md` for the design
+//! decisions (in particular: served from a dedicated, independently-polled
+//! endpoint rather than folded into the existing hot `/api/status` path,
+//! since CPU temperature requires spawning `vcgencmd`).
+//!
+//! Deliberately *not* platform-gated like `native_camera`/`native_codec` —
+//! `sysinfo`/`if-addrs` are cross-platform, so this module builds and is
+//! unit-tested on the macOS dev target too. Only CPU temperature
+//! (`vcgencmd` is Raspberry-Pi-specific) is Linux-only, returning `None`
+//! elsewhere.
+//!
+//! `sysinfo`'s `linux-tmpfs` Cargo feature (enabled in `Cargo.toml`) is
+//! required for `/mnt/capture` to show up in disk listings at all —
+//! `sysinfo` excludes tmpfs mounts by default on Linux, and this project's
+//! capture staging directory is specifically a tmpfs. Found live
+//! (2026-09-18): without it, the "capture" disk entry silently fell back
+//! to reporting root's figures instead, which is actively misleading for
+//! the tmpfs-fill risk this panel exists to surface.
+
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
+
+use serde::Serialize;
+use sysinfo::Disks;
+use tokio::process::Command;
+
+#[derive(Debug, Serialize)]
+pub struct SystemStatus {
+    pub memory: MemoryStatus,
+    pub disks: Vec<DiskStatus>,
+    pub uptime_seconds: u64,
+    pub cpu_temp_celsius: Option<f32>,
+    pub network_interfaces: Vec<NetworkInterfaceStatus>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MemoryStatus {
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiskStatus {
+    pub label: &'static str,
+    pub path: String,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NetworkInterfaceStatus {
+    pub name: String,
+    pub addresses: Vec<String>,
+}
+
+/// The paths whose filesystem usage the dashboard cares about: the root
+/// filesystem, the capture staging tmpfs, and the capture-history state
+/// directory (each can fill up independently and each matters for a
+/// year-long unattended deployment).
+#[derive(Clone)]
+pub struct WatchedPaths {
+    pub capture_dir: PathBuf,
+    pub state_dir: PathBuf,
+}
+
+#[derive(Clone)]
+pub struct SystemStatusReader {
+    inner: Arc<Mutex<Disks>>,
+    watched: WatchedPaths,
+}
+
+impl SystemStatusReader {
+    pub fn new(watched: WatchedPaths) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Disks::new())),
+            watched,
+        }
+    }
+
+    pub async fn snapshot(&self) -> SystemStatus {
+        let disks = self.inner.clone();
+        let watched = self.watched.clone();
+        let (memory, disk_statuses, uptime_seconds) =
+            tokio::task::spawn_blocking(move || Self::blocking_snapshot(&disks, &watched))
+                .await
+                .unwrap_or_else(|_| (MemoryStatus::default(), Vec::new(), 0));
+
+        SystemStatus {
+            memory,
+            disks: disk_statuses,
+            uptime_seconds,
+            cpu_temp_celsius: cpu_temp_celsius().await,
+            network_interfaces: tokio::task::spawn_blocking(network_interfaces)
+                .await
+                .unwrap_or_default(),
+        }
+    }
+
+    fn blocking_snapshot(
+        disks: &Mutex<Disks>,
+        watched: &WatchedPaths,
+    ) -> (MemoryStatus, Vec<DiskStatus>, u64) {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        let memory = MemoryStatus {
+            total_bytes: system.total_memory(),
+            available_bytes: system.available_memory(),
+        };
+
+        let mut disks = disks.lock().expect("system status disks mutex poisoned");
+        // `refresh()` only updates already-tracked entries and does
+        // nothing on an empty list (per its own docs); `refresh_list()`
+        // is the one that actually (re-)enumerates mounted filesystems.
+        // Confirmed live on the Pi (2026-09-18): using `refresh()` here
+        // silently produced an empty disk list on every request.
+        disks.refresh_list();
+        let candidates: Vec<(&Path, u64, u64)> = disks
+            .list()
+            .iter()
+            .map(|disk| {
+                (
+                    disk.mount_point(),
+                    disk.total_space(),
+                    disk.available_space(),
+                )
+            })
+            .collect();
+
+        let targets: [(&'static str, &Path); 3] = [
+            ("root", Path::new("/")),
+            ("capture", &watched.capture_dir),
+            ("state", &watched.state_dir),
+        ];
+        let disk_statuses = targets
+            .into_iter()
+            .filter_map(|(label, path)| {
+                best_matching_disk(candidates.iter().copied(), path).map(|(total, available)| {
+                    DiskStatus {
+                        label,
+                        path: path.display().to_string(),
+                        total_bytes: total,
+                        available_bytes: available,
+                    }
+                })
+            })
+            .collect();
+
+        (memory, disk_statuses, sysinfo::System::uptime())
+    }
+}
+
+/// Picks the candidate mount point that is the longest matching prefix of
+/// `target` — the standard "which filesystem is this path actually on"
+/// resolution, needed because e.g. both `/` and `/mnt/capture` are always
+/// candidates and a naive "any prefix match" would pick arbitrarily.
+fn best_matching_disk<'a>(
+    candidates: impl Iterator<Item = (&'a Path, u64, u64)>,
+    target: &Path,
+) -> Option<(u64, u64)> {
+    candidates
+        .filter(|(mount_point, _, _)| target.starts_with(mount_point))
+        .max_by_key(|(mount_point, _, _)| mount_point.as_os_str().len())
+        .map(|(_, total, available)| (total, available))
+}
+
+fn network_interfaces() -> Vec<NetworkInterfaceStatus> {
+    let mut by_name: Vec<(String, Vec<String>)> = Vec::new();
+    let Ok(interfaces) = if_addrs::get_if_addrs() else {
+        return Vec::new();
+    };
+    for interface in interfaces {
+        if interface.is_loopback() {
+            continue;
+        }
+        let address = interface.ip().to_string();
+        match by_name.iter_mut().find(|(name, _)| *name == interface.name) {
+            Some((_, addresses)) => addresses.push(address),
+            None => by_name.push((interface.name, vec![address])),
+        }
+    }
+    by_name
+        .into_iter()
+        .map(|(name, addresses)| NetworkInterfaceStatus { name, addresses })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+async fn cpu_temp_celsius() -> Option<f32> {
+    let output = Command::new("vcgencmd")
+        .arg("measure_temp")
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_vcgencmd_temp(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn cpu_temp_celsius() -> Option<f32> {
+    None
+}
+
+/// Parses `vcgencmd measure_temp`'s `temp=42.2'C\n` output.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_vcgencmd_temp(text: &str) -> Option<f32> {
+    text.trim()
+        .strip_prefix("temp=")?
+        .split('\'')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Reboots the host (`sudo systemctl reboot`). Requires the narrow sudoers
+/// grant for exactly this command — see the worklog's "Sudo scoping" note.
+pub async fn reboot_host() -> std::io::Result<()> {
+    let status = Command::new("sudo")
+        .arg("systemctl")
+        .arg("reboot")
+        .status()
+        .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "reboot command exited with {status}"
+        )))
+    }
+}
+
+/// Restarts `optic-daemon.service` (no sudo needed — it's the invoking
+/// user's own systemd user service). The restart is spawned detached with
+/// a short delay so the HTTP response triggering it can be flushed to the
+/// client before this process is killed by its own restart.
+pub fn restart_daemon_detached() {
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = Command::new("systemctl")
+            .arg("--user")
+            .arg("restart")
+            .arg("optic-daemon.service")
+            .status()
+            .await;
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn best_matching_disk_picks_longest_prefix_match() {
+        let candidates = vec![
+            (Path::new("/"), 100_u64, 50_u64),
+            (Path::new("/mnt/capture"), 200_u64, 190_u64),
+        ];
+        let result = best_matching_disk(candidates.into_iter(), Path::new("/mnt/capture"));
+        assert_eq!(result, Some((200, 190)));
+    }
+
+    #[test]
+    fn best_matching_disk_falls_back_to_root_for_unrelated_paths() {
+        let candidates = vec![
+            (Path::new("/"), 100_u64, 50_u64),
+            (Path::new("/mnt/capture"), 200_u64, 190_u64),
+        ];
+        let result = best_matching_disk(
+            candidates.into_iter(),
+            Path::new("/home/liam/.local/state/optic-daemon"),
+        );
+        assert_eq!(result, Some((100, 50)));
+    }
+
+    #[test]
+    fn best_matching_disk_returns_none_when_nothing_matches() {
+        let candidates = vec![(Path::new("/mnt/capture"), 200_u64, 190_u64)];
+        let result = best_matching_disk(candidates.into_iter(), Path::new("/var/log"));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn vcgencmd_temp_parses_real_output_format() {
+        assert_eq!(parse_vcgencmd_temp("temp=42.2'C\n"), Some(42.2));
+        assert_eq!(parse_vcgencmd_temp("garbage"), None);
+    }
+
+    #[tokio::test]
+    async fn cpu_temp_is_none_on_non_linux_dev_targets() {
+        // This test only asserts the behavior actually exercised on the
+        // macOS dev machine this runs on; the Linux/vcgencmd path is
+        // validated on the Pi-native target instead (see the worklog).
+        if !cfg!(target_os = "linux") {
+            assert_eq!(cpu_temp_celsius().await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_returns_sane_memory_and_disk_figures() {
+        let reader = SystemStatusReader::new(WatchedPaths {
+            capture_dir: std::env::temp_dir(),
+            state_dir: std::env::temp_dir(),
+        });
+        let status = reader.snapshot().await;
+        assert!(status.memory.total_bytes > 0);
+        assert!(status.memory.available_bytes <= status.memory.total_bytes);
+        // Regression check: `Disks::refresh()` silently no-ops on an empty
+        // list (only `refresh_list()` actually enumerates filesystems) —
+        // a bug that shipped past this test once already because the loop
+        // below asserted properties *of* each disk without first asserting
+        // any disks were found at all, so it passed vacuously against an
+        // always-empty list. `/` must exist on every Unix machine this
+        // runs on, dev or Pi.
+        assert!(
+            !status.disks.is_empty(),
+            "expected at least the root filesystem to be listed"
+        );
+        for disk in &status.disks {
+            assert!(disk.total_bytes > 0, "disk {} has zero total", disk.label);
+            assert!(
+                disk.available_bytes <= disk.total_bytes,
+                "disk {} available exceeds total",
+                disk.label
+            );
+        }
+        // Sanity check on this dev machine (unsandboxed): some real,
+        // non-loopback interface should be found. Doesn't cover the Pi's
+        // systemd `RestrictAddressFamilies` sandboxing (AF_NETLINK is
+        // needed there for `getifaddrs()`/`if-addrs` to work at all) —
+        // that needs its own empirical check against the deployed daemon,
+        // this only guards the enumeration logic itself.
+        assert!(
+            !status.network_interfaces.is_empty(),
+            "expected at least one non-loopback network interface on the dev machine"
+        );
+    }
+}

@@ -4,7 +4,7 @@
 
 It organizes the operational lifecycle of a 365-day autonomous timelapse into **three strictly decoupled subsystems** that communicate primarily via the persistent filesystem (`/mnt/capture`) and a single shared hardware mutex.
 
-> **Implementation status:** The three-subsystem design below is the target architecture. The deployment validated on 2026-09-16 implements **Phase 1 (`optic_web`) only**. Scheduler and in-process sync behavior described in later sections is not yet implemented. Capture transfer currently remains the independent Phase 6 systemd timer.
+> **Implementation status:** The three-subsystem design below is the target architecture. The deployment validated on 2026-09-16 implements **Phase 1 (`optic_web`) only**. `optic_scheduler` is not yet implemented. `optic_sync` (Data Sync Manager) **is now implemented in-process** (see [section 6](#6-subsystem-3-data-sync-manager-optic_sync)) — but its actual protocol and configuration differ from the target design below: it reuses the existing restricted-SSH `ping`/`put` transport (`scripts/optic-capture-receiver.sh`, unchanged) rather than `scp`/`rsync` to `imac.local`, and is configured via `OPTIC_SYNC_*` environment variables rather than `config.toml` (which does not exist — see `worklogs/2026-09-18-data-sync-manager.md` for the full rationale). The independent Phase 6 systemd timer (`scripts/optic-capture-transfer.sh`) still runs in parallel pending a separate, explicit cutover decision; both are safe to run concurrently since `optic_sync` only ever touches `optic-web-*.jpg`/`.dng` files.
 
 ## Deployed Phase 1
 
@@ -14,8 +14,7 @@ The current source serves the dashboard from disk (see [dynamic web asset loadin
 * Validated rotation, flip, AWB, metering, exposure, EV, gain, shutter, and denoise controls.
 * A bounded FIFO `optic_camera` actor that is the sole camera entry point for `optic_web`; it owns a persistent native `libcamera` backend and serializes preview and still pipeline transitions.
 * A full-resolution `4056 × 3040` Master Archive MJPEG preview at 2 FPS, plus lower-bandwidth profile-correct 4K DCI and 2K previews at up to 8 FPS.
-* Test shots rendered with the selected capture profile and returned directly from `/dev/shm`.
-* Profile-specific JPEG and optional DNG captures published as `optic-web-<profile>-*` in `/mnt/capture` for the existing verified transfer timer.
+* Profile-specific JPEG and optional DNG captures published as `testshot-<profile>-*` in `/mnt/capture` for `optic_sync`/the existing verified transfer timer. (Named `testshot-` — not `optic-web-` — to make manually-triggered captures from the dashboard easy to distinguish from real timelapse frames once `optic_scheduler` exists; see `worklogs/2026-09-18-data-sync-manager.md`. The dedicated "Profile test shot" preview-only button/`POST /api/test-shot` endpoint was removed as unused — "Capture & transfer" is now the only capture control.)
 
 The installed service remains on the previously validated CLI backend until the
 native source completes soak testing and deployment.
@@ -26,47 +25,50 @@ The canonical LAN URL is [http://optic.local:8000/](http://optic.local:8000/). P
 
 ## 1. High-Level Architectural Vision
 
-Instead of tight in-memory coupling (shared message buses or cross-thread actor channels), the daemon is partitioned into three independent workers:
+Instead of tight in-memory coupling (shared message buses or cross-thread actor channels), the daemon is partitioned into four independent workers:
 
 1. **Web Service (`optic_web`):** The operator control plane. Serves the dashboard from disk, provides direct-to-hardware optical calibration/focus streaming, and performs atomic mutations to `/mnt/capture/config.toml`.
 2. **Timelapse Scheduler (`optic_scheduler`):** The autonomous capture engine. Watches the configuration file for changes, calculates solar and interval cadences, claims the camera sensor, executes `rpicam-still`, and drops finished frames into `/mnt/capture/queue/`. It contains zero networking logic.
-3. **Data Sync Manager (`optic_sync`):** The offline-resilient transport pipeline. Watches `/mnt/capture/queue/` and `/mnt/capture/config.toml` using filesystem events (`inotify`). It drains files to the iMac host over SSH/rsync and pulls configuration updates on boot. It has zero awareness of camera state or exposure logic.
+3. **Data Sync Manager (`optic_sync`):** The offline-resilient transport pipeline. Periodically scans `/mnt/capture` for capture files and drains them to the configured receiver over SSH. It has zero awareness of camera state or exposure logic. (Implemented; see section 6 for how this differs from the design below.)
+4. **Capture History Log (`optic_capture_log`):** A passive observer of every capture request (from `optic_web` today, `optic_scheduler` once implemented) — settings, total duration, outcome, and output artifact metadata. Writes a small per-capture log file alongside the JPEG/DNG (synced to the receiver by `optic_sync` like any other capture file) and a row in a local SQLite database for fast dashboard queries. It never touches the camera or the network itself. (Implemented, unit-tested, deployed as part of `optic-daemon` 0.1.16, and hardware-validated on the Pi (success and failure captures, `optic_sync` transfer, restart-survives persistence). Per-stage timing breakdown is deferred, not yet persisted — see `docs/optic-daemon-capture-log.md` and `worklogs/2026-09-18-capture-history-module.md`.)
+
+> The box diagram below shows all four subsystems as distinct boxes and how
+> they relate (redrawn top-to-bottom for clarity, with 1 and 2 side-by-side
+> since they're independent capture triggers that both feed the same shared
+> `optic_camera` actor). It shows the *logical* relationships between
+> subsystems, not literal current-vs-original-design implementation detail —
+> see sections 4-6 below and each subsystem's own doc for that.
 
 ```
-                              [ iMac Host (Master Archive) ]
-                                      ▲              │
-                      Push frames &   │              │ Boot config pull
-                      config updates  │              │ (scp / rsync)
-                                      │              ▼
-┌─────────────────────────────────────┼─────────────────────────────────────────────┐
-│ optic-daemon                        │                                             │
-│                                     │                                             │
-│  ┌───────────────────────────────┐  │   ┌──────────────────────────────────────┐  │
-│  │ 1. Web Service (Axum)         │  │   │ 3. Data Sync Manager                 │  │
-│  │  • UI Dashboard & Tuning      │  │   │  • inotify directory watcher         │  │
-│  │  • Focus Video Stream         │  │   │  • Sequential FIFO offload           │  │
-│  │  • Hardware Mutex Arbiter     │  │   │  • Offline retry & backoff           │  │
-│  └──────────────┬────────────────┘  │   └──────────────────▲───────────────────┘  │
-│                 │                   │                      │                      │
-│                 │ Atomic rewrite    │                      │ Watches queue/ via   │
-│                 │ on UI Save        │                      │ inotify              │
-│                 ▼                   │                      │                      │
-│       ┌───────────────────┐         │            ┌─────────┴──────────┐           │
-│       │    config.toml    ├─────────┘            │  /mnt/capture/     │           │
-│       │   (SSD Storage)   │                      │        queue/      │           │
-│       └─────────┬─────────┘                      └─────────▲──────────┘           │
-│                 │                                          │                      │
-│                 │ Reloads on mtime change                  │ Drops captured       │
-│                 ▼                                          │ frames (JPEG/DNG)    │
-│  ┌───────────────────────────────┐                         │                      │
-│  │ 2. Timelapse Scheduler        ├─────────────────────────┘                      │
-│  │  • Solar ephemeris engine     │                                                │
-│  │  • Autonomous interval timer  │                                                │
-│  │  • Executes rpicam-still      │                                                │
-│  └───────────────────────────────┘                                                │
-│                                                                                   │
-└───────────────────────────────────────────────────────────────────────────────────┘
-
+┌────────────────────────────┐        ┌──────────────────────────────────────────┐
+│ 1. Web Service (optic_web) │        │ 2. Timelapse Scheduler (optic_scheduler) │
+│   Dashboard UI + manual    │        │   Autonomous interval /                  │
+│   "Capture & transfer"     │        │   solar-cadence shots                    │
+└────────────────────────────┘        └──────────────────────────────────────────┘
+              │                                            │
+              ┬─────────────────────┴──────────────────────┬
+                      capture request (from 1 or 2)
+                                    ▼
+                ┌──────────────────────────────────────┐
+                │ optic_camera (actor)                 │
+                │   Shared hardware owner (not one of  │
+                │   the 4 subsystems); used by 1 and 2 │
+                └──────────────────────────────────────┘
+                  capture completed (incl. failures)
+                                   ▼
+          ┌─────────────────────────────────────────────────┐
+          │ 4. Capture History Log (optic_capture_log)      │
+          │   • writes <name>.log.json next to the JPEG/DNG │
+          │   • writes a row into local history.db (SQLite) │
+          └─────────────────────────────────────────────────┘
+                     .log.json joins the JPEG/DNG
+                                   ▼
+        ┌─────────────────────────────────────────────────────┐
+        │ 3. Data Sync Manager (optic_sync)                   │
+        │   Drains /mnt/capture over SSH to the receiving Mac │
+        └─────────────────────────────────────────────────────┘
+                                   ▼
+                        [ Receiving Mac Host ]
 ```
 
 ---
@@ -75,7 +77,7 @@ Instead of tight in-memory coupling (shared message buses or cross-thread actor 
 
 * **Hardware Mutual Exclusion:** The Sony IMX477 CSI-2 bus cannot be opened concurrently. A shared `Arc<Mutex<()>>` (or lockfile `/run/optic/camera.lock`) arbitrates access between the Web Service (interactive calibration) and the Scheduler (automated shots).
 * **Crash & Network Isolation:** If the iMac goes offline or local Wi-Fi stalls, `optic_sync` backs off. The `optic_scheduler` continues firing captures without blocking.
-* **OverlayFS Boundary:** The Phase 1 binary lives at `/home/liam/.local/bin/optic-daemon`. Captures use the bounded `/mnt/capture` tmpfs and temporary test shots use `/dev/shm`.
+* **OverlayFS Boundary:** The Phase 1 binary lives at `/home/liam/.local/bin/optic-daemon`. Captures use the bounded `/mnt/capture` tmpfs.
 * **Resource Limits:** The user unit enforces `MemoryHigh=350M`, `MemoryMax=500M`, and `TasksMax=32`. Idle RSS measured 4.0 MiB during deployment validation; long-duration memory behavior is not yet established.
 
 ---
@@ -131,7 +133,6 @@ The Web Service acts as the interactive portal for operator configuration and op
 * Applies camera-control changes to a running dashboard preview through a debounced `POST /api/stream/reconfigure`; the daemon transparently reconfigures the native camera pipeline and the browser reconnects after a brief frame gap.
 * Reports control-to-painted-frame latency, a rolling ten-sample median, and AE/AWB metadata stability in the live dashboard for before/after responsiveness comparisons.
 * Keeps the preview active while the dashboard is open, restores it after still captures, and sends a best-effort stop request only when the page is left.
-* Provides an immediate single-shot JPEG test capture using the selected profile (`POST /api/test-shot`).
 * Publishes a manual profile-specific capture (`POST /api/capture`) to the RAM transfer stage with hidden temporary files and atomic renames.
 
 ### Web Asset Loading
@@ -163,7 +164,7 @@ Web assets are read from disk on every request instead of being embedded at comp
 │ │                                             │ │ [ Normal        ▾] [ Auto                    ▾] │
 │ └─────────────────────────────────────────────┘ │ Analogue gain                              7.3  │
 │                                                 │ ───────●─────────────────────────────────────── │
-│ [ Profile test shot ] [ Capture & transfer ]     │ Shutter (µs)                               Auto │
+│ [ Capture & transfer ]                           │ Shutter (µs)                               Auto │
 │                                                 │ [ 0                                           ] │
 │                                                 ├─────────────────────────────────────────────────┤
 │                                                 │ SYSTEM & RUNTIME TELEMETRY                      │
@@ -285,7 +286,9 @@ The dashboard does not expose a separate JPEG-quality override. Quality is part 
 * `POST /api/stream/stop`: Used by dashboard page teardown to stop the native request loop and leave the acquired camera ready for reconfiguration; it is not exposed as a manual UI control.
 * `GET /api/stream/mjpeg`: Multipart MJPEG video feed for direct browser `<img>` rendering during lens tuning.
 * `POST /api/capture`: Accepts camera settings plus `profile` (`master_archive`, `dci_4k`, or `binning_2k`) and `save_dng`. It captures to hidden files under `/mnt/capture`, applies mode `0640`, and atomically renames the JPEG and any DNG for the transfer timer. The response lists every queued file and the aggregate byte count.
-* `POST /api/test-shot`: Accepts camera settings plus `profile`, claims the camera lock, captures a JPEG test frame with that profile to `/dev/shm`, and returns it directly without queuing it for sync.
+* `POST /api/sync/pause`: Pauses `optic_sync`'s drain loop (it keeps scanning and reporting queue depth, but stops attempting transfers) and returns the fresh sync status.
+* `POST /api/sync/resume`: Un-pauses `optic_sync` and returns the fresh sync status.
+* `POST /api/sync/retry-now`: Clears any active backoff so the next scan attempts a transfer immediately, and returns the fresh sync status.
 
 ---
 
@@ -342,6 +345,64 @@ The Scheduler is a completely autonomous loop whose only mission is to take pict
 
 ## 6. Subsystem 3: Data Sync Manager (`optic_sync`)
 
+### As Implemented
+
+`optic_sync` (`src/optic_sync.rs`) runs in-process as a bounded-actor task,
+following the same shape as `optic_camera`: one owning `tokio::task`, a
+command channel for control, and a `watch` channel publishing a status
+snapshot. It replaces the Phase 6 shell script's *logic* (not, yet, its
+deployment — the systemd timer still runs too; see the implementation-status
+note above) while deliberately reusing the Phase 6 script's already-deployed
+*wire protocol*, so `scripts/optic-capture-receiver.sh` on the receiving Mac
+needs no changes:
+
+* **Scanning, not `inotify`:** every 5 seconds it lists `/mnt/capture` and
+  filters to files matching the daemon's own capture naming pattern
+  (`optic-web-*.jpg` / `optic-web-*.dng`) — an explicit allowlist, not "every
+  non-dotfile" like the shell script, which could otherwise sweep up and
+  delete `config.json`/`preview_config.json`. Chosen over real `inotify`
+  watching for lower implementation risk; still faster than the shell
+  timer's 15s interval. Files are drained oldest-first (by mtime).
+* **Transport:** for each file, shells out to the system `ssh` binary with
+  the same options the shell script uses (`BatchMode`, `IdentitiesOnly`,
+  `StrictHostKeyChecking`, a pinned `UserKnownHostsFile`, a dedicated
+  identity file, `ConnectTimeout=5`), sends `put <base64-name> <size>
+  <sha256>` as the forced command, streams the file over stdin, and requires
+  the exact `OK stored ...`/`OK existing ...` response the receiver already
+  returns. SHA-256 is computed with the `sha2` crate; the base64 encoder is
+  a small inline implementation (RFC 4648, standard alphabet) rather than a
+  new dependency. Only deletes the local file after re-checking its size and
+  mtime haven't changed since the upload started.
+* **Backoff:** any transport failure halts the drain for that cycle and
+  doubles the retry interval (30s → 60s → 120s → 240s → 480s → capped at
+  15m), matching the numbers in the original design below. A successful
+  drain (or an operator-triggered retry) resets it.
+* **Configuration:** `OPTIC_SYNC_REMOTE_HOST` (the only required variable —
+  its absence leaves the manager permanently `disabled`, which is expected
+  and harmless for local development), `OPTIC_SYNC_REMOTE_PORT`,
+  `OPTIC_SYNC_REMOTE_USER`, `OPTIC_SYNC_IDENTITY_FILE`,
+  `OPTIC_SYNC_KNOWN_HOSTS_FILE`, and `OPTIC_SYNC_ENABLED=false` as an
+  operator escape hatch. Defaults match the values the Phase 6 shell script
+  already uses on the Pi, so pointing both at the same key/known_hosts file
+  requires no new provisioning. There is no `config.toml`, no boot-time
+  config pull, and no config-mirroring-to-remote — those depend on
+  `optic_scheduler`'s remote-authoritative config concept, which doesn't
+  exist yet (see the "As Originally Designed" section below).
+* **API and UI:** `GET /api/status` includes a `sync` object (connectivity,
+  paused, queued/transferred file counts and bytes, last error, backoff
+  seconds, seconds until next retry). `POST /api/sync/pause`,
+  `POST /api/sync/resume`, and `POST /api/sync/retry-now` provide operator
+  control, each returning the fresh status. The dashboard's "Data Sync"
+  panel (next to Runtime telemetry) renders this and wires the three
+  buttons.
+
+### As Originally Designed (not implemented)
+
+The rest of this section is kept as the original target design for the
+parts that remain unimplemented — a boot-time config pull/mirror tied to a
+remote-authoritative `config.toml`, which depends on `optic_scheduler`
+existing first.
+
 The Data Sync Manager is a dedicated file-transport loop that bridges the local SSD queue to the remote iMac.
 
 ```
@@ -366,7 +427,7 @@ The Data Sync Manager is a dedicated file-transport loop that bridges the local 
 
 ```
 
-### Responsibilities
+### Responsibilities (original design)
 
 * **Boot-Time Master Pull:**
 * When `optic-daemon` launches, `optic_sync` runs a pre-flight network fetch:

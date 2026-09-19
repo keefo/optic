@@ -13,6 +13,7 @@ UNIT_SOURCE="$PROJECT_ROOT/systemd/optic-daemon.service"
 WEB_ASSETS_DIR="$PROJECT_ROOT/src/web"
 INSTALL_DIR="$HOME/.local/bin"
 UNIT_DIR="$HOME/.config/systemd/user"
+STATE_DIR="$HOME/.local/state/optic-daemon"
 RUNTIME_LIBRARY_DIR="$HOME/.local/optic-sysroot/usr/lib/aarch64-linux-gnu"
 EXPECTED_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$PROJECT_ROOT/Cargo.toml" | head -n 1)
 
@@ -64,6 +65,11 @@ for group in video render; do
 done
 
 install -d -m 0755 "$INSTALL_DIR" "$UNIT_DIR"
+# optic_capture_log's history.db lives here; systemd's ReadWritePaths=
+# in the unit requires the path to already exist before the service
+# starts, so it must be created here rather than left for the daemon
+# itself to create on first write.
+install -d -m 0700 "$STATE_DIR"
 install -m 0755 "$BINARY" "$INSTALL_DIR/optic-daemon"
 
 # Mirror the whole asset directory (not a fixed file list) so any file

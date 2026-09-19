@@ -11,7 +11,7 @@ mod imp {
             mpsc as std_mpsc,
         },
         thread,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use bytes::Bytes;
@@ -35,7 +35,7 @@ mod imp {
     use crate::{
         camera::{
             CameraError, CameraSettings, CaptureFile, CaptureProfile, CaptureRequest,
-            CaptureResult, PreviewFrame, StreamRequest, TestShotRequest,
+            CaptureResult, PreviewFrame, StreamRequest,
         },
         native_codec::{DngMetadata, decode_pisp_comp1, encode_bayer16_dng, encode_yuv420_jpeg},
     };
@@ -57,7 +57,6 @@ mod imp {
         StartStream(StreamRequest, oneshot::Sender<Result<(), CameraError>>),
         ReconfigureStream(StreamRequest, oneshot::Sender<Result<(), CameraError>>),
         StopStream(oneshot::Sender<bool>),
-        TestShot(TestShotRequest, oneshot::Sender<Result<Bytes, CameraError>>),
         Capture(
             PathBuf,
             CaptureRequest,
@@ -165,16 +164,6 @@ mod imp {
                 return Err(CameraError::NotStreaming);
             }
             Ok(self.frames.subscribe())
-        }
-
-        pub(crate) async fn capture_test_shot(
-            &self,
-            request: TestShotRequest,
-        ) -> Result<Bytes, CameraError> {
-            request.validate()?;
-            let (reply, response) = oneshot::channel();
-            self.send(NativeCommand::TestShot(request, reply))?;
-            response.await.map_err(|_| CameraError::Unavailable)?
         }
 
         pub(crate) async fn capture_to_stage(
@@ -370,22 +359,46 @@ mod imp {
                 }
                 let _ = reply.send(was_streaming);
             }
-            NativeCommand::TestShot(request, reply) => {
-                let profile = request.profile;
-                let quality = profile.spec().jpeg_quality;
-                let result = stop_pipeline(camera, pipeline, streaming_state).and_then(|_| {
-                    capture_frame(camera, profile, request.settings, false, model)
-                        .and_then(|frame| encode_jpeg(&frame, quality))
-                });
-                let _ = reply.send(result);
-            }
             NativeCommand::Capture(capture_dir, request, reply) => {
                 let profile = request.profile;
                 let settings = request.settings.clone();
-                let result = stop_pipeline(camera, pipeline, streaming_state).and_then(|_| {
-                    capture_frame(camera, profile, settings, request.save_dng, model)
-                        .and_then(|frame| publish_capture(&capture_dir, request, frame))
+                let save_dng = request.save_dng;
+                let total_started = Instant::now();
+
+                let stop_started = Instant::now();
+                let stop_result = stop_pipeline(camera, pipeline, streaming_state);
+                info!(
+                    stage = "stop_existing_preview",
+                    elapsed_ms = stop_started.elapsed().as_millis(),
+                    "capture perf"
+                );
+
+                let result = stop_result.and_then(|_| {
+                    let frame_started = Instant::now();
+                    let frame_result = capture_frame(camera, profile, settings, save_dng, model);
+                    info!(
+                        stage = "capture_frame_total",
+                        elapsed_ms = frame_started.elapsed().as_millis(),
+                        "capture perf"
+                    );
+                    frame_result.and_then(|frame| {
+                        let publish_started = Instant::now();
+                        let publish_result = publish_capture(&capture_dir, request, frame);
+                        info!(
+                            stage = "publish_capture",
+                            elapsed_ms = publish_started.elapsed().as_millis(),
+                            "capture perf"
+                        );
+                        publish_result
+                    })
                 });
+                info!(
+                    ?profile,
+                    save_dng,
+                    stage = "total",
+                    elapsed_ms = total_started.elapsed().as_millis(),
+                    "capture perf"
+                );
                 let _ = reply.send(result);
             }
             NativeCommand::Shutdown(reply) => {
@@ -718,7 +731,16 @@ mod imp {
         save_dng: bool,
         model: &str,
     ) -> Result<CapturedFrame, CameraError> {
+        let pipeline_started = Instant::now();
         let mut pipeline = start_pipeline(camera, profile, settings, 0, false, save_dng)?;
+        info!(
+            stage = "pipeline_start",
+            elapsed_ms = pipeline_started.elapsed().as_millis(),
+            "capture perf"
+        );
+
+        let warmup_started = Instant::now();
+        let mut last_frame_at = warmup_started;
         let result = (|| {
             let target = pipeline.request_count + CAPTURE_WARMUP_FRAMES;
             let mut captured = None;
@@ -734,6 +756,29 @@ mod imp {
                     )));
                 }
                 pipeline.frame_count += 1;
+
+                // Distinguishes "libcamera/sensor is slow to deliver frames"
+                // (large since_previous_ms, small exposure_us) from "the
+                // requested exposure itself is long" (exposure_us tracks
+                // since_previous_ms). exposure_us is read back from the
+                // completed request's own metadata — the value libcamera
+                // actually used, not just what we asked for.
+                let now = Instant::now();
+                let since_previous_ms = now.duration_since(last_frame_at).as_millis();
+                last_frame_at = now;
+                let exposure_us = request
+                    .metadata()
+                    .get::<controls::ExposureTime>()
+                    .ok()
+                    .map(|value| value.0);
+                info!(
+                    stage = "warmup_frame",
+                    frame_index = pipeline.frame_count,
+                    exposure_us,
+                    since_previous_ms,
+                    "capture perf"
+                );
+
                 if pipeline.frame_count == target {
                     let yuv = copy_buffer(
                         request
@@ -765,7 +810,20 @@ mod imp {
             }
             captured.ok_or_else(|| backend_error("capture completed without an output frame"))
         })();
+        info!(
+            stage = "warmup_and_capture",
+            frames = CAPTURE_WARMUP_FRAMES + 1,
+            elapsed_ms = warmup_started.elapsed().as_millis(),
+            "capture perf"
+        );
+
+        let stop_started = Instant::now();
         let stop_result = camera.stop().map_err(CameraError::from);
+        info!(
+            stage = "camera_stop",
+            elapsed_ms = stop_started.elapsed().as_millis(),
+            "capture perf"
+        );
         match (result, stop_result) {
             (Ok(frame), Ok(())) => Ok(frame),
             (Err(error), Ok(())) => Err(error),
@@ -994,8 +1052,18 @@ mod imp {
         frame: CapturedFrame,
     ) -> Result<CaptureResult, CameraError> {
         let spec = request.profile.spec();
+
+        let jpeg_started = Instant::now();
         let jpeg = encode_jpeg(&frame, spec.jpeg_quality)?;
+        info!(
+            stage = "jpeg_encode",
+            bytes = jpeg.len(),
+            elapsed_ms = jpeg_started.elapsed().as_millis(),
+            "capture perf"
+        );
+
         let dng = if request.save_dng {
+            let dng_started = Instant::now();
             let raw = frame
                 .raw
                 .as_ref()
@@ -1005,17 +1073,20 @@ mod imp {
                 .as_ref()
                 .ok_or_else(|| backend_error("DNG capture has no raw stream information"))?;
             let pixels = decode_pisp_comp1(raw, raw_info.width, raw_info.height, raw_info.stride)?;
-            Some(encode_bayer16_dng(
-                &pixels,
-                raw_info.width,
-                raw_info.height,
-                &frame.metadata,
-            )?)
+            let encoded =
+                encode_bayer16_dng(&pixels, raw_info.width, raw_info.height, &frame.metadata)?;
+            info!(
+                stage = "dng_decode_and_encode",
+                bytes = encoded.len(),
+                elapsed_ms = dng_started.elapsed().as_millis(),
+                "capture perf"
+            );
+            Some(encoded)
         } else {
             None
         };
 
-        let basename = format!("optic-web-{}-{}", spec.slug, unique_suffix());
+        let basename = format!("testshot-{}-{}", spec.slug, unique_suffix());
         let jpeg_filename = format!("{basename}.jpg");
         let jpeg_part = capture_dir.join(format!(".{jpeg_filename}.part"));
         let jpeg_final = capture_dir.join(&jpeg_filename);
@@ -1023,6 +1094,7 @@ mod imp {
         let dng_part = capture_dir.join(format!(".{dng_filename}.part"));
         let dng_final = capture_dir.join(&dng_filename);
 
+        let disk_started = Instant::now();
         let publication = (|| -> io::Result<()> {
             fs::write(&jpeg_part, &jpeg)?;
             set_capture_permissions(&jpeg_part)?;
@@ -1034,6 +1106,11 @@ mod imp {
             fs::rename(&jpeg_part, &jpeg_final)?;
             Ok(())
         })();
+        info!(
+            stage = "disk_write",
+            elapsed_ms = disk_started.elapsed().as_millis(),
+            "capture perf"
+        );
         if let Err(error) = publication {
             let _ = fs::remove_file(&jpeg_part);
             let _ = fs::remove_file(&dng_part);
@@ -1147,12 +1224,9 @@ pub(crate) use imp::NativeCameraBackend;
 mod imp_stub {
     use std::path::Path;
 
-    use bytes::Bytes;
     use tokio::sync::{broadcast, watch};
 
-    use crate::camera::{
-        CameraError, CaptureRequest, CaptureResult, PreviewFrame, StreamRequest, TestShotRequest,
-    };
+    use crate::camera::{CameraError, CaptureRequest, CaptureResult, PreviewFrame, StreamRequest};
 
     pub(crate) struct NativeCameraBackend {
         frames: broadcast::Sender<PreviewFrame>,
@@ -1200,14 +1274,6 @@ mod imp_stub {
         ) -> Result<broadcast::Receiver<PreviewFrame>, CameraError> {
             let _ = &self.frames;
             Err(CameraError::NotStreaming)
-        }
-
-        pub(crate) async fn capture_test_shot(
-            &self,
-            request: TestShotRequest,
-        ) -> Result<Bytes, CameraError> {
-            request.validate()?;
-            Err(CameraError::Unavailable)
         }
 
         pub(crate) async fn capture_to_stage(

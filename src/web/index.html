@@ -41,6 +41,9 @@
           <small>Focus and aperture are adjusted manually on the 6 mm lens.</small>
         </div>
       </div>
+      <div class="button-row">
+        <button id="capture" class="accent" type="button">Capture &amp; transfer</button>
+      </div>
       <section class="responsiveness-panel" aria-labelledby="responsiveness-title">
         <div class="responsiveness-heading">
           <div>
@@ -62,126 +65,188 @@
           </div>
         </dl>
       </section>
-      <div class="button-row">
-        <button id="test-shot" type="button">Profile test shot</button>
-        <button id="capture" class="accent" type="button">Capture &amp; transfer</button>
-      </div>
+      <section class="telemetry-card" aria-labelledby="telemetry-title">
+        <p class="eyebrow">DAEMON</p>
+        <h3 id="telemetry-title">Runtime telemetry</h3>
+        <dl>
+          <div><dt>Version</dt><dd id="version">—</dd></div>
+          <div><dt>Uptime</dt><dd id="uptime">—</dd></div>
+          <div><dt>RAM queue</dt><dd id="queue">—</dd></div>
+          <div><dt>Sensor</dt><dd id="sensor">—</dd></div>
+        </dl>
+      </section>
+      <p id="notice" class="notice" role="status">Ready.</p>
+    </section>
+
+    <section class="controls-card">
+      <section class="profile-card" aria-labelledby="profile-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">STILL CAPTURE</p>
+            <h2 id="profile-title">Capture profile</h2>
+          </div>
+          <span class="muted">Profile-aware preview framing</span>
+        </div>
+
+        <div class="profile-options">
+          <label class="profile-option">
+            <input type="radio" name="capture-profile" value="master_archive" checked>
+            <span>
+              <strong>Master Archive</strong>
+              <small>4056 × 3040 · 12-bit full readout · JPEG Q100 + DNG</small>
+            </span>
+          </label>
+          <label class="profile-option">
+            <input type="radio" name="capture-profile" value="dci_4k">
+            <span>
+              <strong>4K DCI Widescreen</strong>
+              <small>4056 × 2160 · 12-bit vertical crop · JPEG Q95</small>
+            </span>
+          </label>
+          <label class="profile-option">
+            <input type="radio" name="capture-profile" value="binning_2k">
+            <span>
+              <strong>2K Binning</strong>
+              <small>2028 × 1520 · 10-bit full FOV · JPEG Q85</small>
+            </span>
+          </label>
+        </div>
+        <label id="dng-option" class="check profile-raw">
+          <input id="save-dng" type="checkbox" checked disabled>
+          <span>Save companion DNG <small id="dng-help">Required for Master Archive</small></span>
+        </label>
+      </section>
+
+      <section class="controls-panel" aria-labelledby="controls-title">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">LIVE + STILL</p>
+            <h2 id="controls-title">Camera controls</h2>
+          </div>
+          <button id="reset" class="text-button" type="button">Reset defaults</button>
+        </div>
+
+        <p class="controls-help">Changes apply automatically while preview is live. The image may pause briefly while the camera pipeline reloads.</p>
+
+        <div class="control-grid">
+          <label>
+            <span>White balance</span>
+            <select id="awb">
+              <option value="auto" selected>Auto</option>
+              <option value="daylight">Daylight</option>
+              <option value="cloudy">Cloudy</option>
+              <option value="tungsten">Tungsten</option>
+              <option value="fluorescent">Fluorescent</option>
+              <option value="indoor">Indoor</option>
+              <option value="incandescent">Incandescent</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Denoise</span>
+            <select id="denoise">
+              <option value="auto">Auto</option>
+              <option value="cdn_hq">High quality</option>
+              <option value="cdn_fast">Fast</option>
+              <option value="off">Off</option>
+              <option value="cdn_off">Colour denoise off</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Rotation</span>
+            <select id="rotation">
+              <option value="0">0°</option>
+              <option value="180">180°</option>
+            </select>
+          </label>
+
+          <label>
+            <span>Analogue gain <output id="gain-value">1.0</output></span>
+            <input id="gain" type="range" min="1" max="16" step="0.1" value="1">
+          </label>
+
+          <label>
+            <span>Shutter (µs) <output id="shutter-value">10000</output></span>
+            <input id="shutter" type="number" min="100" max="5000000" step="100" value="10000" inputmode="numeric">
+          </label>
+
+          <fieldset>
+            <legend>Transform</legend>
+            <label class="check"><input id="hflip" type="checkbox"> Horizontal flip</label>
+            <label class="check"><input id="vflip" type="checkbox"> Vertical flip</label>
+          </fieldset>
+        </div>
+      </section>
+
       <div class="button-row margin-top-10">
         <button id="discard-config" class="text-button bad" type="button" disabled>Discard Changes</button>
         <button id="save-config" class="accent good" type="button" disabled>Save Settings</button>
       </div>
-      <p id="notice" class="notice" role="status">Ready.</p>
     </section>
 
-    <section class="profile-card" aria-labelledby="profile-title">
+    <section class="sync-card" aria-labelledby="sync-title">
       <div class="section-heading">
         <div>
-          <p class="eyebrow">STILL CAPTURE</p>
-          <h2 id="profile-title">Capture profile</h2>
+          <p class="eyebrow">DATA SYNC</p>
+          <h2 id="sync-title">Capture transfer</h2>
         </div>
-        <span class="muted">Profile-aware preview framing</span>
+        <span id="sync-connectivity" class="pill neutral">Checking</span>
       </div>
-
-      <div class="profile-options">
-        <label class="profile-option">
-          <input type="radio" name="capture-profile" value="master_archive" checked>
-          <span>
-            <strong>Master Archive</strong>
-            <small>4056 × 3040 · 12-bit full readout · JPEG Q100 + DNG</small>
-          </span>
-        </label>
-        <label class="profile-option">
-          <input type="radio" name="capture-profile" value="dci_4k">
-          <span>
-            <strong>4K DCI Widescreen</strong>
-            <small>4056 × 2160 · 12-bit vertical crop · JPEG Q95</small>
-          </span>
-        </label>
-        <label class="profile-option">
-          <input type="radio" name="capture-profile" value="binning_2k">
-          <span>
-            <strong>2K Binning</strong>
-            <small>2028 × 1520 · 10-bit full FOV · JPEG Q85</small>
-          </span>
-        </label>
-      </div>
-      <label id="dng-option" class="check profile-raw">
-        <input id="save-dng" type="checkbox" checked disabled>
-        <span>Save companion DNG <small id="dng-help">Required for Master Archive</small></span>
-      </label>
-    </section>
-
-    <section class="controls-card" aria-labelledby="controls-title">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">LIVE + STILL</p>
-          <h2 id="controls-title">Camera controls</h2>
-        </div>
-        <button id="reset" class="text-button" type="button">Reset defaults</button>
-      </div>
-
-      <p class="controls-help">Changes apply automatically while preview is live. The image may pause briefly while the camera pipeline reloads.</p>
-
-      <div class="control-grid">
-        <label>
-          <span>White balance</span>
-          <select id="awb">
-            <option value="auto" selected>Auto</option>
-            <option value="daylight">Daylight</option>
-            <option value="cloudy">Cloudy</option>
-            <option value="tungsten">Tungsten</option>
-            <option value="fluorescent">Fluorescent</option>
-            <option value="indoor">Indoor</option>
-            <option value="incandescent">Incandescent</option>
-          </select>
-        </label>
-
-        <label>
-          <span>Denoise</span>
-          <select id="denoise">
-            <option value="auto">Auto</option>
-            <option value="cdn_hq">High quality</option>
-            <option value="cdn_fast">Fast</option>
-            <option value="off">Off</option>
-            <option value="cdn_off">Colour denoise off</option>
-          </select>
-        </label>
-
-        <label>
-          <span>Rotation</span>
-          <select id="rotation">
-            <option value="0">0°</option>
-            <option value="180">180°</option>
-          </select>
-        </label>
-
-        <label>
-          <span>Analogue gain <output id="gain-value">1.0</output></span>
-          <input id="gain" type="range" min="1" max="16" step="0.1" value="1">
-        </label>
-
-        <label>
-          <span>Shutter (µs) <output id="shutter-value">10000</output></span>
-          <input id="shutter" type="number" min="100" max="5000000" step="100" value="10000" inputmode="numeric">
-        </label>
-
-        <fieldset>
-          <legend>Transform</legend>
-          <label class="check"><input id="hflip" type="checkbox"> Horizontal flip</label>
-          <label class="check"><input id="vflip" type="checkbox"> Vertical flip</label>
-        </fieldset>
-      </div>
-    </section>
-
-    <section class="telemetry-card" aria-labelledby="telemetry-title">
-      <p class="eyebrow">DAEMON</p>
-      <h2 id="telemetry-title">Runtime telemetry</h2>
       <dl>
-        <div><dt>Version</dt><dd id="version">—</dd></div>
-        <div><dt>Uptime</dt><dd id="uptime">—</dd></div>
-        <div><dt>RAM queue</dt><dd id="queue">—</dd></div>
-        <div><dt>Sensor</dt><dd id="sensor">—</dd></div>
+        <div><dt>Queued</dt><dd id="sync-queued">—</dd></div>
+        <div><dt>Transferred</dt><dd id="sync-transferred">—</dd></div>
+        <div><dt>Connectivity</dt><dd id="sync-connectivity-raw">—</dd></div>
+        <div><dt>Backoff</dt><dd id="sync-backoff">—</dd></div>
+        <div><dt>Next retry</dt><dd id="sync-next-retry">—</dd></div>
+        <div><dt>Next scan</dt><dd id="sync-next-scan">—</dd></div>
+        <div><dt>Last error</dt><dd id="sync-last-error">—</dd></div>
       </dl>
+      <div class="button-row">
+        <button id="sync-pause" type="button">Pause</button>
+        <button id="sync-resume" type="button">Resume</button>
+        <button id="sync-retry-now" type="button">Retry now</button>
+      </div>
+    </section>
+
+    <section class="system-card" aria-labelledby="system-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SYSTEM</p>
+          <h2 id="system-title">Pi health &amp; control</h2>
+        </div>
+      </div>
+      <dl>
+        <div>
+          <dt>Memory</dt>
+          <dd>
+            <div class="usage-bar"><div id="system-memory-bar" class="usage-bar-fill"></div></div>
+            <span id="system-memory-label" class="usage-bar-label">—</span>
+          </dd>
+        </div>
+        <div>
+          <dt>Root disk</dt>
+          <dd>
+            <div class="usage-bar"><div id="system-disk-root-bar" class="usage-bar-fill"></div></div>
+            <span id="system-disk-root-label" class="usage-bar-label">—</span>
+          </dd>
+        </div>
+        <div>
+          <dt>Capture disk</dt>
+          <dd>
+            <div class="usage-bar"><div id="system-disk-capture-bar" class="usage-bar-fill"></div></div>
+            <span id="system-disk-capture-label" class="usage-bar-label">—</span>
+          </dd>
+        </div>
+        <div><dt>CPU temp</dt><dd id="system-temp">—</dd></div>
+        <div><dt>Uptime</dt><dd id="system-uptime">—</dd></div>
+        <div><dt>Network</dt><dd id="system-network">—</dd></div>
+        <div><dt>Captures (24h)</dt><dd id="system-capture-health">—</dd></div>
+      </dl>
+      <div class="button-row">
+        <button id="system-restart-daemon" type="button">Restart daemon</button>
+        <button id="system-reboot" class="bad" type="button">Reboot Pi</button>
+      </div>
     </section>
   </main>
 

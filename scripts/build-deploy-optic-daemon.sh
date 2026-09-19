@@ -247,6 +247,14 @@ GCC_INCLUDE=$(gcc -print-file-name=include)
 export BINDGEN_EXTRA_CLANG_ARGS="-I$GCC_INCLUDE"
 unset SYSROOT LD_LIBRARY_PATH
 
+# Cargo suppresses its crate-count progress bar when stdout isn't a TTY,
+# which this script's piped/logged SSH output never is — leaving a bare
+# scroll of "Compiling X" lines with no sense of how far along a build is.
+# Forcing it on prints periodic "Building [===>] N/Total: crate" snapshot
+# lines instead, even over a non-interactive pipe.
+export CARGO_TERM_PROGRESS_WHEN=always
+export CARGO_TERM_PROGRESS_WIDTH=80
+
 pkg-config --modversion libcamera libcamera-base libturbojpeg
 
 printf '%s\n' '==> Linting web assets with Biome'
