@@ -1,9 +1,11 @@
 mod camera;
+mod durable_state;
 mod native_camera;
 #[cfg(target_os = "linux")]
 mod native_codec;
 mod optic_camera;
 mod optic_capture_log;
+mod optic_scheduler;
 mod optic_sync;
 mod system_status;
 mod web;
@@ -100,15 +102,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| capture_log_db_path.clone());
     let system_status = SystemStatusReader::new(WatchedPaths {
         capture_dir: capture_dir.clone(),
-        state_dir,
+        state_dir: state_dir.clone(),
     });
+
+    // Durable config lives on the real, persistent state dir (survives a
+    // reboot), not the /mnt/capture tmpfs it used to — design doc §2.1.
+    // A fast tmpfs cache mirrors it for every frequent/polled read.
+    let cache_dir = resolve_scheduler_cache_dir();
+    let config_path = state_dir.join("config.json");
+    let config_cache_path = cache_dir.join("config.json");
+    if let Err(error) = durable_state::hydrate_cache(&config_path, &config_cache_path).await {
+        warn!(%error, path = %config_path.display(), "failed to hydrate the config cache from its durable copy at startup");
+    }
+
+    // Scheduler run state is a separate durable file from config.json on
+    // purpose — see design doc §2.1's commit-clobbers-a-pause race note.
+    let run_state_path = state_dir.join("schedule_run_state.json");
+    let run_state_cache_path = cache_dir.join("schedule_run_state.json");
+    if let Err(error) = durable_state::hydrate_cache(&run_state_path, &run_state_cache_path).await {
+        warn!(%error, path = %run_state_path.display(), "failed to hydrate the scheduler run-state cache from its durable copy at startup");
+    }
+    let initial_run_state = match durable_state::read_cached(&run_state_cache_path).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => optic_scheduler::ScheduleRunState::default(),
+    };
+    info!(?initial_run_state, "scheduler starting");
+    let scheduler = optic_scheduler::SchedulerHandle::spawn(
+        camera.clone(),
+        capture_log.clone(),
+        capture_dir.clone(),
+        config_cache_path.clone(),
+        run_state_path,
+        run_state_cache_path,
+        initial_run_state,
+    );
 
     let state = AppState::new(
         camera.clone(),
         sync.clone(),
         capture_log,
         system_status,
+        scheduler.clone(),
         capture_dir,
+        config_path,
+        config_cache_path,
         asset_dir,
         sensor,
     );
@@ -116,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(address = %bind, "optic_web listening");
 
     axum::serve(listener, web::router(state))
-        .with_graceful_shutdown(shutdown_signal(camera, sync))
+        .with_graceful_shutdown(shutdown_signal(camera, sync, scheduler))
         .await?;
 
     Ok(())
@@ -178,6 +215,29 @@ fn resolve_capture_log_db_path() -> PathBuf {
         .join("history.db")
 }
 
+/// Resolves the tmpfs directory used as a fast read-through cache mirror
+/// of durably-stored config (design doc §2.1). `OPTIC_CACHE_DIR` overrides
+/// it explicitly; otherwise defaults to `/dev/shm/optic-daemon` on Linux —
+/// a separate tmpfs from the bounded 256 MiB `/mnt/capture` capture queue,
+/// so this cache never competes with capture-file storage for space.
+/// `/dev/shm` isn't a real, writable path on macOS, so local `cargo run`
+/// dev sessions fall back to the system temp dir instead (same rationale
+/// as `DEV_ASSET_DIR` above: this project's dev target is macOS, but
+/// nothing here should require a Linux-only path to even start).
+fn resolve_scheduler_cache_dir() -> PathBuf {
+    if let Ok(configured) = env::var("OPTIC_CACHE_DIR") {
+        return PathBuf::from(configured);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        PathBuf::from("/dev/shm/optic-daemon")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::temp_dir().join("optic-daemon-cache")
+    }
+}
+
 /// Resolves the directory `index.html`, `app.js`, and `styles.css` are read
 /// from on every request. `OPTIC_WEB_ASSETS_DIR` overrides it explicitly;
 /// otherwise the daemon looks for a `web` directory installed as a sibling of
@@ -210,7 +270,11 @@ async fn validate_capture_dir(path: &PathBuf) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-async fn shutdown_signal(camera: OpticCamera, sync: DataSyncManager) {
+async fn shutdown_signal(
+    camera: OpticCamera,
+    sync: DataSyncManager,
+    scheduler: optic_scheduler::SchedulerHandle,
+) {
     #[cfg(unix)]
     {
         let mut terminate =
@@ -237,5 +301,8 @@ async fn shutdown_signal(camera: OpticCamera, sync: DataSyncManager) {
     }
     if sync.shutdown().await.is_err() {
         warn!("failed to shut down optic_sync cleanly");
+    }
+    if scheduler.shutdown().await.is_err() {
+        warn!("failed to shut down optic_scheduler cleanly");
     }
 }

@@ -34,9 +34,9 @@ Optic is an ultra-reliable, long-term timelapse system engineered around the Ras
 
 ## Monitoring Baseline: Beszel
 
-Beszel `0.19.0` runs with the Hub on the always-on iMac and the native ARM64 Agent on the Pi. Open the LAN-only dashboard at [http://tests-iMac-Pro.local:8090](http://tests-iMac-Pro.local:8090). The login is stored locally on the iMac in `~/.local/share/beszel/admin-credentials` with owner-only permissions.
+Beszel `0.19.0` runs with the Hub on the always-on iMac and the native ARM64 Agent on the Pi. Open the LAN-only dashboard at [http://imacpro.local:8090](http://imacpro.local:8090). The login is stored locally on the iMac in `~/.local/share/beszel/admin-credentials` with owner-only permissions.
 
-The iMac Hub runs as the `dev.beszel.hub` LaunchAgent. Its data is in `~/.local/share/beszel/data`, and its logs are in `~/Library/Logs/Beszel`. The wrapper uses `caffeinate -s` to prevent system sleep while the iMac is on AC power. Because it is a per-user LaunchAgent, the `admin` account must be logged in after an iMac restart. Reserve `192.168.0.231` for the iMac in the router's DHCP settings; the statically linked Pi Agent does not resolve `.local` names reliably.
+The iMac Hub runs as the `dev.beszel.hub` LaunchAgent. Its data is in `~/.local/share/beszel/data`, and its logs are in `~/Library/Logs/Beszel`. The wrapper uses `caffeinate -s` to prevent system sleep while the iMac is on AC power. Because it is a per-user LaunchAgent, the `admin` account must be logged in after an iMac restart. Reserve a fixed IP address for the iMac in the router's DHCP settings (by its MAC address — a hostname reservation doesn't help here) and keep `beszel-agent.service`'s `HUB_URL` pointed at that IP: confirmed directly (2026-09-20) that the statically linked Pi Agent's Go resolver only ever queries the router's regular unicast DNS server, never mDNS multicast, so `imacpro.local` fails outright (`no such host`) regardless of network state — this is not a transient issue that "usually resolves," it structurally cannot work for this binary. `optic_sync`'s `OPTIC_SYNC_REMOTE_HOST` is different — it shells out to the real `ssh` binary, which resolves `.local` names fine via the Pi's normal system resolver.
 
 The Pi Agent runs as the persistent `liam` user service `beszel-agent.service`. Agent-initiated WebSocket mode avoids exposing the Agent's SSH port to the LAN. Beszel records CPU, load, memory, CPU and RP1 temperatures, Active Cooler RPM, root-disk usage and I/O, and network traffic. Check service health with:
 
@@ -378,7 +378,7 @@ An RPM of `0` is normal while the cooling state and PWM are both `0`. If PWM is 
 
 ## 6. RAM Capture Stage & Verified iMac Transfer
 
-Never store captured frames on the boot/OS root partition. `/mnt/capture` is a bounded 256 MiB `tmpfs`; a systemd timer transfers completed files to `/Users/admin/Pictures/Optic` on the iMac at `192.168.0.231`.
+Never store captured frames on the boot/OS root partition. `/mnt/capture` is a bounded 256 MiB `tmpfs`; a systemd timer transfers completed files to `/Users/admin/Pictures/Optic` on the iMac at `imacpro.local`.
 
 > **Durability tradeoff:** queued captures exist only in RAM until transfer succeeds. An iMac/network outage eventually fills the bounded queue and causes new captures to fail rather than write to microSD. A Pi power loss loses any queued files. The iMac must remain available for unattended operation.
 

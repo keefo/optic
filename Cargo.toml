@@ -1,6 +1,6 @@
 [package]
 name = "optic-daemon"
-version = "0.1.24"
+version = "0.1.29"
 edition = "2024"
 license = "MIT"
 description = "Project Optic camera control daemon"
@@ -9,6 +9,8 @@ description = "Project Optic camera control daemon"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["json"] }
 bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
 if-addrs = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

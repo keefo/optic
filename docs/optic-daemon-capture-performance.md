@@ -71,7 +71,7 @@ a plain file:
 systemctl --user stop optic-daemon.service
 OPTIC_BIND_ADDR=0.0.0.0:8000 \
 OPTIC_CAPTURE_DIR=/mnt/capture \
-OPTIC_SYNC_REMOTE_HOST=192.168.0.231 \
+OPTIC_SYNC_REMOTE_HOST=imacpro.local \
 RUST_LOG=info \
 LD_LIBRARY_PATH=/home/liam/.local/optic-sysroot/usr/lib/aarch64-linux-gnu \
 nohup /home/liam/.local/bin/optic-daemon > /tmp/optic-perf.log 2>&1 &
@@ -86,6 +86,19 @@ debugging this daemon live will hit the same wall. Worth fixing
 independently of the capture-latency work (e.g. enabling persistent
 journal storage, or an explicit log file with rotation), but out of scope
 here.
+
+**Update 2026-09-19:** persistent journal storage was enabled (see
+`worklogs/2026-09-19-persistent-journal-crash-evidence.md`) — journald now
+uses bounded persistent storage (`Storage=persistent`, 16 MiB cap) instead
+of pure RAM-only volatile storage, so logs survive a reboot. This closes
+the "logs disappear" half of this gap: the same lines that used to vanish
+are now durably queryable via `journalctl -u user@1000.service` (the
+system-scoped view of the user manager) or an unscoped `journalctl | grep
+optic-daemon`. However, the exact invocation form documented above,
+`journalctl --user -u optic-daemon.service`, **still** returns nothing —
+that specific quirk is unrelated to volatile-vs-persistent storage and
+remains unresolved. Use the system-scoped query form instead until that's
+separately investigated.
 
 ## 3. Findings
 

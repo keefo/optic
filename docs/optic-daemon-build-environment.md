@@ -75,6 +75,21 @@ cd /Users/admin/Documents/projects/optic
 Set `OPTIC_DEPLOY_TARGET=user@host` only when the Pi cannot be reached as
 `liam@optic.local`. The manual commands below remain available for diagnosis.
 
+For a change touching only `src/web/*` (HTML/CSS/JS), use the fast path
+instead — it skips the entire Rust bootstrap/test/clippy/build and never
+stops or restarts `optic-daemon.service` (the daemon serves these files
+straight from disk on every request, so nothing needs to be told a file
+changed). It still lints with Biome, installs through the same
+backup-and-rollback path, and verifies the served content over real HTTP
+requests — just without the multi-minute build in between:
+
+```bash
+./scripts/build-deploy-optic-daemon.sh --assets
+```
+
+Use the full (no-flag) path for anything touching `src/*.rs`, `Cargo.toml`,
+or `systemd/`.
+
 Set the source directory to the versioned release staged on the Pi:
 
 ```bash

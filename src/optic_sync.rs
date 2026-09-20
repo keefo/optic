@@ -329,15 +329,22 @@ struct QueuedFile {
     modified: SystemTime,
 }
 
-/// True for exactly the filenames `native_camera.rs` writes captures as
-/// (`testshot-<profile-slug>-<suffix>.{jpg,dng}`) plus the paired
-/// `optic_capture_log` record (`<same-basename>.log.json`, or
-/// `testshot-<profile-slug>-failed-<suffix>.log.json` for a capture that
-/// produced no output file) — and nothing else. Deliberately narrower than
-/// the shell script's "any non-dotfile" sweep, which could catch and delete
-/// `config.json`/`preview_config.json`.
+/// True for exactly the filenames `native_camera.rs` writes captures as —
+/// `testshot-<profile-slug>-<suffix>.{jpg,dng}` for a manual/web UI
+/// capture, or `scheduler-<profile-slug>[-<rule-tags>]-<suffix>.{jpg,dng}`
+/// for a scheduler-triggered one (design doc §3.1/§14) — plus each's
+/// paired `optic_capture_log` record (`<same-basename>.log.json`, or
+/// `testshot-<profile-slug>-failed-<suffix>.log.json` for a *failed*
+/// capture, which is always `testshot-`-prefixed regardless of source —
+/// see `optic_capture_log.rs::failure_capture_id`) — and nothing else.
+/// Deliberately narrower than the shell script's "any non-dotfile" sweep,
+/// which could catch and delete `config.json`/`preview_config.json`.
+/// Both prefixes must keep matching here — widening from `testshot-`-only
+/// was the one required change flagged alongside introducing the
+/// `scheduler-` prefix; forgetting it would silently stop scheduled
+/// captures from ever being synced.
 fn is_capture_filename(name: &str) -> bool {
-    name.starts_with("testshot-")
+    (name.starts_with("testshot-") || name.starts_with("scheduler-"))
         && (name.ends_with(".jpg") || name.ends_with(".dng") || name.ends_with(".log.json"))
 }
 
@@ -642,6 +649,24 @@ mod tests {
         assert!(!is_capture_filename("testshot-123.png"));
         assert!(!is_capture_filename("random.jpg"));
         assert!(!is_capture_filename("random.log.json"));
+    }
+
+    /// Scheduler-triggered captures use a distinct `scheduler-` prefix
+    /// (design doc §3.1/§14, resolved 2026-09-20) — this is the one
+    /// change required alongside that: both prefixes must keep matching,
+    /// not just `testshot-`.
+    #[test]
+    fn is_capture_filename_also_allowlists_scheduler_triggered_captures() {
+        assert!(is_capture_filename("scheduler-master_archive-123.jpg"));
+        assert!(is_capture_filename("scheduler-dci_4k-456.dng"));
+        assert!(is_capture_filename(
+            "scheduler-master-archive-weekday-daytime-1789753359227.log.json"
+        ));
+        assert!(is_capture_filename(
+            "scheduler-master-archive-a-b-c+2-1789753359227.jpg"
+        ));
+        assert!(!is_capture_filename(".hidden-scheduler-123.jpg"));
+        assert!(!is_capture_filename("scheduler-123.png"));
     }
 
     #[test]

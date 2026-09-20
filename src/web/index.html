@@ -14,8 +14,8 @@
     <div class="brand">
       <img class="brand-icon" src="/icon.svg" alt="" width="48" height="48">
       <div>
-        <p class="eyebrow">PROJECT OPTIC</p>
-        <h1>Camera Control</h1>
+        <h1 class="eyebrow">PROJECT OPTIC</h1>
+        <h2>One Revolution Through Time</h2>
       </div>
     </div>
     <div class="status-row" aria-live="polite">
@@ -185,6 +185,23 @@
       </div>
     </section>
 
+    <section class="scheduler-summary-card" aria-labelledby="scheduler-summary-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">TIMELAPSE</p>
+          <h2 id="scheduler-summary-title">Scheduler</h2>
+        </div>
+        <span id="scheduler-run-state" class="pill neutral">—</span>
+      </div>
+      <dl>
+        <div><dt>Next shot</dt><dd id="scheduler-next-capture">—</dd></div>
+        <div><dt>Rules</dt><dd id="scheduler-rule-count">—</dd></div>
+      </dl>
+      <div class="button-row">
+        <a class="nav-link" href="/scheduler.html">Manage rules &amp; forecast &rarr;</a>
+      </div>
+    </section>
+
     <section class="sync-card" aria-labelledby="sync-title">
       <div class="section-heading">
         <div>
@@ -203,8 +220,7 @@
         <div><dt>Last error</dt><dd id="sync-last-error">—</dd></div>
       </dl>
       <div class="button-row">
-        <button id="sync-pause" type="button">Pause</button>
-        <button id="sync-resume" type="button">Resume</button>
+        <button id="sync-toggle-btn" type="button">Pause</button>
         <button id="sync-retry-now" type="button">Retry now</button>
       </div>
     </section>

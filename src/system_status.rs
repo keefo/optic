@@ -217,14 +217,19 @@ fn parse_vcgencmd_temp(text: &str) -> Option<f32> {
         .ok()
 }
 
-/// Reboots the host (`sudo systemctl reboot`). Requires the narrow sudoers
-/// grant for exactly this command — see the worklog's "Sudo scoping" note.
+/// Reboots the host via `systemctl reboot`, which talks to systemd/logind
+/// over D-Bus (no sudo, no setuid). Requires the scoped PolicyKit rule
+/// granting the invoking user `org.freedesktop.login1.reboot` without
+/// interactive auth — see `worklogs/2026-09-19-reboot-nonewprivileges-fix.md`.
+/// (An earlier `sudo systemctl reboot` version could never work from this
+/// sandboxed service: `ProtectSystem=strict`/`ProtectHome=read-only` force a
+/// private user namespace that only maps this service's own UID, so `sudo`
+/// sees `/usr/bin/sudo` as owned by the unmapped-UID placeholder instead of
+/// root and refuses to run. D-Bus authorization uses real kernel-level
+/// credentials instead of a namespace-relative file-ownership check, so it
+/// isn't affected.)
 pub async fn reboot_host() -> std::io::Result<()> {
-    let status = Command::new("sudo")
-        .arg("systemctl")
-        .arg("reboot")
-        .status()
-        .await?;
+    let status = Command::new("systemctl").arg("reboot").status().await?;
     if status.success() {
         Ok(())
     } else {

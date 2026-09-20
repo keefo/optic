@@ -35,7 +35,7 @@ mod imp {
     use crate::{
         camera::{
             CameraError, CameraSettings, CaptureFile, CaptureProfile, CaptureRequest,
-            CaptureResult, PreviewFrame, StreamRequest,
+            CaptureResult, CaptureSource, PreviewFrame, StreamRequest, format_rule_tags,
         },
         native_codec::{DngMetadata, decode_pisp_comp1, encode_bayer16_dng, encode_yuv420_jpeg},
     };
@@ -1086,7 +1086,19 @@ mod imp {
             None
         };
 
-        let basename = format!("testshot-{}-{}", spec.slug, unique_suffix());
+        let basename = match &request.source {
+            CaptureSource::WebUi => format!("testshot-{}-{}", spec.slug, unique_suffix()),
+            CaptureSource::Scheduler { rule_slugs } => match format_rule_tags(rule_slugs) {
+                Some(tags) => format!("scheduler-{}-{tags}-{}", spec.slug, unique_suffix()),
+                None => {
+                    // Unreachable in practice: a scheduler-fired shot
+                    // always has >=1 contributing rule slug. Handled
+                    // rather than unwrapped so this can't panic if that
+                    // invariant is ever violated.
+                    format!("scheduler-{}-{}", spec.slug, unique_suffix())
+                }
+            },
+        };
         let jpeg_filename = format!("{basename}.jpg");
         let jpeg_part = capture_dir.join(format!(".{jpeg_filename}.part"));
         let jpeg_final = capture_dir.join(&jpeg_filename);

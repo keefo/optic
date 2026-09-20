@@ -294,6 +294,15 @@ The dashboard does not expose a separate JPEG-quality override. Quality is part 
 
 ## 5. Subsystem 2: Timelapse Scheduler (`optic_scheduler`)
 
+> **Not implemented.** The section below is the original single-mode
+> target design (fixed interval *or* solar-adaptive bands, a
+> `config.toml`/`spa`-crate design that doesn't match this codebase's
+> real config storage). It's superseded by a composable-rules
+> architecture proposed in `docs/optic-daemon-scheduler.md` — see that
+> doc for the current design and its own list of open decisions before
+> implementation starts. Kept here for historical/motivational context
+> only.
+
 The Scheduler is a completely autonomous loop whose only mission is to take pictures according to the rules in `config.toml` and write them to the storage queue.
 
 ```

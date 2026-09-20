@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Timelapse Scheduler — Project Optic</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/scheduler.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand">
+      <img class="brand-icon" src="/icon.svg" alt="" width="48" height="48">
+      <div>
+        <p class="eyebrow">PROJECT OPTIC</p>
+        <h2>Timelapse Scheduler</h2>
+      </div>
+    </div>
+    <div class="status-row" aria-live="polite">
+      <a class="nav-link" href="/">&larr; Back to dashboard</a>
+      <span id="run-state" class="pill neutral">Loading</span>
+    </div>
+  </header>
+
+  <main class="scheduler-main">
+    <section class="rules-card" aria-labelledby="rules-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">RULES</p>
+          <h2 id="rules-title">Scheduling rules</h2>
+        </div>
+        <button id="add-rule-btn" class="accent" type="button">Add rule</button>
+      </div>
+      <div id="rule-list" class="rule-list">
+        <p class="empty-state">No rules yet — add one below.</p>
+      </div>
+      <div class="button-row margin-top-10">
+        <button id="save-rules" class="accent good" type="button" disabled>Save rules</button>
+        <button id="discard-rules" class="text-button bad" type="button" hidden>Discard changes</button>
+      </div>
+      <p id="notice" class="notice" role="status">Loading current schedule…</p>
+    </section>
+
+    <section id="rule-editor-section" class="rule-editor-card" aria-labelledby="rule-editor-title" hidden>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">EDITOR</p>
+          <h2 id="rule-editor-title">Rule editor</h2>
+        </div>
+      </div>
+      <form id="rule-form" class="rule-form">
+        <h3 id="rule-form-title">Add rule</h3>
+        <label>
+          <span>Label</span>
+          <input id="rule-label" type="text" placeholder="e.g. Weekday daytime interval" required>
+        </label>
+        <label>
+          <span>Slug (unique, lowercase, letters/numbers/hyphens)</span>
+          <input id="rule-slug" type="text" placeholder="e.g. weekday-daytime" pattern="[a-z0-9][a-z0-9-]*" required>
+        </label>
+
+        <div class="trigger-box">
+          <label>
+            <span>Trigger type</span>
+            <select id="rule-trigger-kind">
+              <option value="Interval">Fixed interval</option>
+              <option value="RecurringTime">Recurring time of day</option>
+            </select>
+          </label>
+
+          <div id="interval-fields" class="trigger-fields">
+            <label>
+              <span>Every (seconds)</span>
+              <input id="rule-interval-secs" type="number" min="1" step="1" value="300">
+            </label>
+            <label class="check" style="align-self: end;">
+              <input id="rule-interval-align" type="checkbox" checked>
+              <span>Align to wall-clock boundaries</span>
+            </label>
+          </div>
+
+          <div id="recurring-time-fields" class="trigger-fields" hidden>
+            <label>
+              <span>Time of day</span>
+              <input id="rule-recurring-time" type="time" value="09:00">
+            </label>
+            <label>
+              <span>Days</span>
+              <select id="rule-recurring-days">
+                <option value="Every">Every day</option>
+                <option value="Weekdays">Specific weekdays</option>
+              </select>
+            </label>
+            <fieldset id="weekday-picker" class="full-width" hidden>
+              <legend>Weekdays</legend>
+              <label class="check"><input type="checkbox" value="Mon"> Mon</label>
+              <label class="check"><input type="checkbox" value="Tue"> Tue</label>
+              <label class="check"><input type="checkbox" value="Wed"> Wed</label>
+              <label class="check"><input type="checkbox" value="Thu"> Thu</label>
+              <label class="check"><input type="checkbox" value="Fri"> Fri</label>
+              <label class="check"><input type="checkbox" value="Sat"> Sat</label>
+              <label class="check"><input type="checkbox" value="Sun"> Sun</label>
+            </fieldset>
+          </div>
+        </div>
+
+        <!-- One `.constraint-box` per Constraint in rule.constraints. Only
+             `TimeWindow` exists today (Phase 1), so there is exactly one —
+             a future Phase 2+ constraint (SunElevationWindow etc.) gets its
+             own sibling `.constraint-box`, not fields added to this one. -->
+        <div class="constraint-box">
+          <label class="check">
+            <input id="rule-window-enabled" type="checkbox">
+            <span>Restrict to a daily time window</span>
+          </label>
+
+          <div id="window-fields" class="constraint-fields" hidden>
+            <label>
+              <span>Window start</span>
+              <input id="rule-window-start" type="time" value="08:00">
+            </label>
+            <label>
+              <span>Window end</span>
+              <input id="rule-window-end" type="time" value="18:00">
+            </label>
+            <label>
+              <span>Window applies on</span>
+              <select id="rule-window-days">
+                <option value="Every">Every day</option>
+                <option value="Weekdays">Specific weekdays</option>
+              </select>
+            </label>
+            <fieldset id="window-weekday-picker" class="full-width" hidden>
+              <legend>Window weekdays (applies to any trigger type, including fixed interval)</legend>
+              <label class="check"><input type="checkbox" value="Mon"> Mon</label>
+              <label class="check"><input type="checkbox" value="Tue"> Tue</label>
+              <label class="check"><input type="checkbox" value="Wed"> Wed</label>
+              <label class="check"><input type="checkbox" value="Thu"> Thu</label>
+              <label class="check"><input type="checkbox" value="Fri"> Fri</label>
+              <label class="check"><input type="checkbox" value="Sat"> Sat</label>
+              <label class="check"><input type="checkbox" value="Sun"> Sun</label>
+            </fieldset>
+          </div>
+        </div>
+        <p id="rule-form-notice" class="notice" role="status"></p>
+        <div class="button-row">
+          <button id="rule-form-cancel" class="text-button" type="button">Cancel</button>
+          <button id="rule-form-save" class="primary" type="submit">Add to list</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="run-control-card" aria-labelledby="control-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SCHEDULER</p>
+          <h2 id="control-title">Run control</h2>
+        </div>
+      </div>
+      <dl>
+        <div><dt>State</dt><dd id="run-state-detail">—</dd></div>
+        <div><dt>Next capture</dt><dd id="next-capture">—</dd></div>
+        <div><dt>Next capture rules</dt><dd id="next-capture-rules">—</dd></div>
+        <div><dt>Last capture</dt><dd id="last-capture">—</dd></div>
+      </dl>
+      <div class="button-row margin-top-10">
+        <button id="run-toggle-btn" type="button">Pause</button>
+      </div>
+    </section>
+
+    <section class="forecast-card" aria-labelledby="forecast-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">FORECAST</p>
+          <h2 id="forecast-title">Shot forecaster</h2>
+        </div>
+        <span class="muted">Reflects unsaved edits above</span>
+      </div>
+      <dl class="forecast-stats">
+        <div><dt>Frames (48h)</dt><dd id="forecast-count">—</dd></div>
+        <div><dt>Avg. interval</dt><dd id="forecast-avg-interval">—</dd></div>
+        <div><dt>Next 48h window</dt><dd id="forecast-window">—</dd></div>
+      </dl>
+      <table class="forecast-table">
+        <thead>
+          <tr><th>When</th><th>Rules</th></tr>
+        </thead>
+        <tbody id="forecast-body">
+          <tr><td colspan="2" class="empty-state">No upcoming shots in the next 48 hours.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>Local network control plane</footer>
+</body>
+</html>

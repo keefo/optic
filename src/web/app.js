@@ -24,9 +24,11 @@ const elements = {
   syncNextRetry: document.querySelector("#sync-next-retry"),
   syncNextScan: document.querySelector("#sync-next-scan"),
   syncLastError: document.querySelector("#sync-last-error"),
-  syncPause: document.querySelector("#sync-pause"),
-  syncResume: document.querySelector("#sync-resume"),
+  syncToggle: document.querySelector("#sync-toggle-btn"),
   syncRetryNow: document.querySelector("#sync-retry-now"),
+  schedulerRunState: document.querySelector("#scheduler-run-state"),
+  schedulerNextCapture: document.querySelector("#scheduler-next-capture"),
+  schedulerRuleCount: document.querySelector("#scheduler-rule-count"),
   systemMemoryBar: document.querySelector("#system-memory-bar"),
   systemMemoryLabel: document.querySelector("#system-memory-label"),
   systemDiskRootBar: document.querySelector("#system-disk-root-bar"),
@@ -784,6 +786,7 @@ async function refreshStatus() {
       `${status.capture_stage.queued_files} files · ${formatBytes(status.capture_stage.queued_bytes)}`;
     document.querySelector("#sensor").textContent = status.camera.sensor || "Not detected";
     renderSync(status.sync);
+    renderSchedulerSummary(status.schedule, status.config.schedule.rules);
     if (!pageActive || captureRunning || reconfigureRunning) return;
     if (!status.camera.streaming && livePreview) {
       livePreview = false;
@@ -826,9 +829,26 @@ function renderSync(sync) {
     sync.next_scan_in_secs != null ? `${sync.next_scan_in_secs}s` : "—";
   elements.syncLastError.textContent = sync.last_error || "—";
 
-  elements.syncPause.disabled = !sync.enabled || sync.paused;
-  elements.syncResume.disabled = !sync.enabled || !sync.paused;
+  // One button, not two — label/target action flip with current state,
+  // same treatment as the scheduler's run-control toggle.
+  elements.syncToggle.textContent = sync.paused ? "Resume" : "Pause";
+  elements.syncToggle.className = sync.paused ? "good" : "";
+  elements.syncToggle.dataset.action = sync.paused ? "resume" : "pause";
+  elements.syncToggle.disabled = !sync.enabled;
   elements.syncRetryNow.disabled = !sync.enabled || sync.connectivity !== "backoff";
+}
+
+function renderSchedulerSummary(schedule, rules) {
+  const running = schedule.run_state === "Running";
+  elements.schedulerRunState.textContent = running ? "Running" : "Paused";
+  elements.schedulerRunState.className = `pill ${running ? "good" : "neutral"}`;
+  elements.schedulerNextCapture.textContent = schedule.next_capture_at
+    ? `${new Date(schedule.next_capture_at).toLocaleTimeString()} (${schedule.next_capture_rules.join(", ")})`
+    : running
+      ? "None scheduled"
+      : "—";
+  const count = rules?.length ?? 0;
+  elements.schedulerRuleCount.textContent = `${count} rule${count === 1 ? "" : "s"}`;
 }
 
 async function syncAction(path) {
@@ -1006,6 +1026,7 @@ setInterval(refreshStatus, 3000);
 setInterval(refreshSystemStatus, 15000);
 elements.discardConfig.addEventListener("click", fnDiscardConfig);
 elements.saveConfig.addEventListener("click", fnCommitConfig);
-elements.syncPause.addEventListener("click", () => syncAction("/api/sync/pause"));
-elements.syncResume.addEventListener("click", () => syncAction("/api/sync/resume"));
+elements.syncToggle.addEventListener("click", () =>
+  syncAction(`/api/sync/${elements.syncToggle.dataset.action}`),
+);
 elements.syncRetryNow.addEventListener("click", () => syncAction("/api/sync/retry-now"));

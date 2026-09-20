@@ -16,8 +16,10 @@ usage() {
     cat <<'EOF'
 Usage: setup-phase-01-journaling.sh [--dry-run] [--help]
 
-Idempotently configures volatile systemd journal storage with a 32 MiB limit
-and disables rsyslog when it is installed.
+Idempotently configures a small, bounded persistent systemd journal (16 MiB)
+so a crash or unexpected reboot leaves diagnosable log evidence, while
+keeping the footprint small to limit SD card writes. Disables rsyslog when
+it is installed.
 
   --dry-run   Report required changes without modifying the system.
   --help      Display this help.
@@ -37,8 +39,9 @@ desired_content() {
     cat <<'EOF'
 # Managed by Project Optic setup-phase-01-journaling.sh
 [Journal]
-Storage=volatile
-RuntimeMaxUse=32M
+Storage=persistent
+SystemMaxUse=16M
+RuntimeMaxUse=16M
 EOF
 }
 
@@ -55,7 +58,7 @@ if ((DRY_RUN)); then
     if drop_in_matches; then
         printf '[OK] %s already matches the plan.\n' "$DROP_IN_FILE"
     else
-        printf '[CHANGE] Write %s with Storage=volatile and RuntimeMaxUse=32M.\n' "$DROP_IN_FILE"
+        printf '[CHANGE] Write %s with Storage=persistent, SystemMaxUse=16M, RuntimeMaxUse=16M.\n' "$DROP_IN_FILE"
     fi
     if [[ -z "$rsyslog_load" || "$rsyslog_load" == "not-found" ]]; then
         printf '%s\n' '[OK] rsyslog is not installed.'
@@ -78,7 +81,7 @@ if ((EUID != 0)); then
     exit 77
 fi
 
-printf '%s\n' 'Configuring Project Optic Phase 1: RAM journaling'
+printf '%s\n' 'Configuring Project Optic Phase 1: bounded persistent journaling'
 
 install -d -m 0755 "$DROP_IN_DIR"
 if ! drop_in_matches; then
@@ -112,16 +115,34 @@ fi
 systemctl restart systemd-journald.service
 systemctl is-active --quiet systemd-journald.service
 
+# Restarting journald does not by itself migrate an already-buffered
+# runtime (/run) journal into persistent (/var) storage — that migration
+# normally happens once at boot via systemd-journal-flush.service. When
+# switching Storage=volatile -> persistent on a live system (not at boot),
+# it must be requested explicitly or the active journal stays in /run
+# until the next reboot despite the config already saying persistent.
+journalctl --flush
+
 effective=$(systemd-analyze cat-config systemd/journald.conf 2>/dev/null)
 journal_storage=$(printf '%s\n' "$effective" |
     awk -F= '/^[[:space:]]*Storage=/{value=$2} END{gsub(/[[:space:]]/, "", value); print value}')
-journal_limit=$(printf '%s\n' "$effective" |
+journal_system_limit=$(printf '%s\n' "$effective" |
+    awk -F= '/^[[:space:]]*SystemMaxUse=/{value=$2} END{gsub(/[[:space:]]/, "", value); print value}')
+journal_runtime_limit=$(printf '%s\n' "$effective" |
     awk -F= '/^[[:space:]]*RuntimeMaxUse=/{value=$2} END{gsub(/[[:space:]]/, "", value); print value}')
 
-if [[ "$journal_storage" != "volatile" || "$journal_limit" != "32M" ]]; then
-    printf 'Effective journald configuration is unexpected: Storage=%s RuntimeMaxUse=%s\n' \
-        "${journal_storage:-unset}" "${journal_limit:-unset}" >&2
+if [[ "$journal_storage" != "persistent" || "$journal_system_limit" != "16M" ||
+        "$journal_runtime_limit" != "16M" ]]; then
+    printf 'Effective journald configuration is unexpected: Storage=%s SystemMaxUse=%s RuntimeMaxUse=%s\n' \
+        "${journal_storage:-unset}" "${journal_system_limit:-unset}" "${journal_runtime_limit:-unset}" >&2
     exit 1
 fi
 
-printf '%s\n' 'Phase 1 setup complete: Storage=volatile, RuntimeMaxUse=32M.'
+machine_id=$(cat /etc/machine-id)
+if [[ ! -e "/var/log/journal/$machine_id/system.journal" ]]; then
+    printf 'Configuration claims persistent storage, but no system.journal was found under /var/log/journal/%s — the flush may have failed.\n' \
+        "$machine_id" >&2
+    exit 1
+fi
+
+printf '%s\n' 'Phase 1 setup complete: Storage=persistent, SystemMaxUse=16M, RuntimeMaxUse=16M.'

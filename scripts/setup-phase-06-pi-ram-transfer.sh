@@ -15,7 +15,7 @@ CAPTURE_GROUP="liam"
 CAPTURE_UID=1000
 CAPTURE_GID=1000
 CAPTURE_DIR="/mnt/capture"
-REMOTE_HOST="192.168.0.231"
+REMOTE_HOST="imacpro.local"
 REMOTE_PORT="2222"
 REMOTE_USER="admin"
 BACKUP_DIR="/var/backups/optic-hardening"
@@ -38,7 +38,7 @@ usage() {
 Usage: setup-phase-06-pi-ram-transfer.sh [--dry-run] [--host-key FILE] [--help]
 
 Configures a 256 MiB tmpfs capture stage and a verified SSH push service to
-the dedicated iMac receiver at 192.168.0.231:2222.
+the dedicated iMac receiver at imacpro.local:2222.
 
   --dry-run        Report required changes without modifying the system.
   --host-key FILE  Pin the exported iMac receiver public host key.

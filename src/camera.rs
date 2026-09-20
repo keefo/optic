@@ -89,9 +89,23 @@ pub enum CaptureProfile {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct AppConfig {
     pub profile: CaptureProfile,
     pub settings: CameraSettings,
+    /// The committed DNG preference for profiles that don't force one
+    /// either way (`Dci4k`) — `MasterArchive`/`Binning2k` ignore this and
+    /// always use their own forced value (`validate_raw_policy`). Mirrors
+    /// `CaptureRequest::save_dng`'s shape, but for autonomous scheduled
+    /// captures, which have no per-click UI checkbox to read from — see
+    /// `docs/optic-daemon-scheduler.md` §6.
+    pub save_dng: bool,
+    /// Autonomous timelapse scheduling rules — see `optic_scheduler` and
+    /// `docs/optic-daemon-scheduler.md`. `#[serde(default)]` at the
+    /// container level (above) means a `config.json` committed before
+    /// this field existed still deserializes fine, filling it with
+    /// `ScheduleConfig::default()` (no rules, nothing scheduled).
+    pub schedule: crate::optic_scheduler::ScheduleConfig,
 }
 
 impl Default for AppConfig {
@@ -99,6 +113,8 @@ impl Default for AppConfig {
         Self {
             profile: CaptureProfile::Binning2k,
             settings: CameraSettings::default(),
+            save_dng: false,
+            schedule: crate::optic_scheduler::ScheduleConfig::default(),
         }
     }
 }
@@ -182,12 +198,57 @@ pub(crate) struct PreviewSpec {
     pub fps: u8,
 }
 
+/// What triggered a capture — feeds the filename `native_camera.rs`
+/// actually writes (`testshot-` vs `scheduler-`, plus rule-slug tags for
+/// the latter), not just the capture-log's `source` string. Defaults to
+/// `WebUi` so the existing manual-capture JSON body (which never sends
+/// this field) keeps deserializing unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind")]
+pub enum CaptureSource {
+    #[default]
+    WebUi,
+    Scheduler {
+        rule_slugs: Vec<String>,
+    },
+}
+
+/// Formats the rule-slug tags inserted into a scheduler-triggered
+/// capture's filename (design doc §3.1): capped at the first 3 tags with
+/// `+N` for the rest, so a pathological many-rules-collide case can't
+/// produce an unusably long filename. `rule_slugs` is expected already
+/// sorted/deduplicated (`ForecastedShot.rule_slugs` guarantees this via
+/// `occurrences()`/`merge()`), so no sorting happens here — this function
+/// only formats, it doesn't re-derive ordering. Kept as a plain function
+/// in this cross-platform file (not `native_camera.rs`, whose real
+/// capture path is Linux-only) specifically so it stays unit-testable on
+/// any dev machine.
+pub(crate) fn format_rule_tags(rule_slugs: &[String]) -> Option<String> {
+    const MAX_TAGS: usize = 3;
+    if rule_slugs.is_empty() {
+        return None;
+    }
+    let shown = rule_slugs
+        .iter()
+        .take(MAX_TAGS)
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut joined = shown.join("-");
+    let overflow = rule_slugs.len().saturating_sub(MAX_TAGS);
+    if overflow > 0 {
+        joined.push_str(&format!("+{overflow}"));
+    }
+    Some(joined)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CaptureRequest {
     pub settings: CameraSettings,
     pub profile: CaptureProfile,
     pub save_dng: bool,
+    #[serde(default)]
+    pub source: CaptureSource,
 }
 
 impl CaptureRequest {
@@ -346,5 +407,57 @@ mod tests {
             ..CameraSettings::default()
         };
         assert!(invalid_awb.validate().is_err());
+    }
+
+    #[test]
+    fn format_rule_tags_is_none_for_an_empty_slice() {
+        assert_eq!(format_rule_tags(&[]), None);
+    }
+
+    #[test]
+    fn format_rule_tags_joins_up_to_three_tags_with_no_overflow_marker() {
+        let slugs = vec!["daytime".to_owned(), "weekday".to_owned()];
+        assert_eq!(format_rule_tags(&slugs), Some("daytime-weekday".to_owned()));
+
+        let three = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        assert_eq!(format_rule_tags(&three), Some("a-b-c".to_owned()));
+    }
+
+    #[test]
+    fn format_rule_tags_caps_at_three_with_a_plus_n_suffix() {
+        let five = vec![
+            "a".to_owned(),
+            "b".to_owned(),
+            "c".to_owned(),
+            "d".to_owned(),
+            "e".to_owned(),
+        ];
+        assert_eq!(format_rule_tags(&five), Some("a-b-c+2".to_owned()));
+    }
+
+    #[test]
+    fn capture_request_defaults_to_web_ui_source_when_the_field_is_omitted() {
+        // The existing manual-capture JSON body from app.js never sends a
+        // `source` field — this must keep deserializing exactly as before
+        // the field was added, defaulting to WebUi.
+        let request: CaptureRequest =
+            serde_json::from_str(r#"{"settings": {}, "profile": "dci_4k", "save_dng": false}"#)
+                .unwrap();
+        assert_eq!(request.source, CaptureSource::WebUi);
+    }
+
+    #[test]
+    fn capture_request_accepts_an_explicit_scheduler_source() {
+        let request: CaptureRequest = serde_json::from_str(
+            r#"{"settings": {}, "profile": "dci_4k", "save_dng": false,
+                "source": {"kind": "Scheduler", "rule_slugs": ["weekday-daytime"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            request.source,
+            CaptureSource::Scheduler {
+                rule_slugs: vec!["weekday-daytime".to_owned()]
+            }
+        );
     }
 }

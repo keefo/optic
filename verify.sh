@@ -8,8 +8,18 @@ export LC_ALL=C
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 EXPECTED_BESZEL_VERSION="0.19.0"
-EXPECTED_HUB_URL="http://192.168.0.231:8090"
-EXPECTED_CAPTURE_HOST="192.168.0.231"
+# Must stay an IP, never a hostname — confirmed directly (2026-09-20):
+# beszel-agent is a statically linked Go binary whose resolver only issues
+# plain unicast DNS queries to the router, never mDNS multicast, so
+# "imacpro.local" fails outright ("no such host") regardless of network
+# state. This is not a transient/fixable-later issue; it structurally
+# cannot resolve for this binary. See
+# worklogs/2026-09-20-stale-iMac-ip-beszel-and-sync.md. `EXPECTED_CAPTURE_HOST`
+# below is different and correctly a hostname: it feeds `optic_sync`'s SSH
+# connection, which shells out to the real `ssh` binary and resolves
+# `.local` names fine via the Pi's normal system resolver.
+EXPECTED_HUB_URL="http://192.168.0.202:8090"
+EXPECTED_CAPTURE_HOST="imacpro.local"
 EXPECTED_CAPTURE_USER="admin"
 EXPECTED_CAPTURE_PORT="2222"
 EXPECTED_CAPTURE_SIZE_BYTES=268435456

@@ -8,7 +8,7 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as PathParam, State},
+    extract::{Path as PathParam, Query, State},
     http::{StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -21,8 +21,10 @@ use crate::{
         CameraError, CameraSettings, CaptureProfile, CaptureRequest, CaptureResult, PreviewFrame,
         StreamRequest,
     },
+    durable_state,
     optic_camera::{CameraBackendKind, OpticCamera},
     optic_capture_log::{CaptureHealthStatus, CaptureLog, CaptureLogEntry},
+    optic_scheduler::{self, SchedulerHandle, SchedulerStatus, SchedulerUnavailable},
     optic_sync::{DataSyncManager, SyncStatus, SyncUnavailable},
     system_status::{self, SystemStatus, SystemStatusReader},
 };
@@ -37,8 +39,17 @@ pub struct AppState {
     sync: DataSyncManager,
     capture_log: Option<CaptureLog>,
     system_status: SystemStatusReader,
+    scheduler: SchedulerHandle,
     capture_dir: Arc<PathBuf>,
+    /// Durable source of truth for the committed config — real, persistent
+    /// storage (`~/.local/state/optic-daemon/config.json`), *not* the
+    /// `/mnt/capture` tmpfs. Written rarely (only on commit); never read on
+    /// a hot path. See design doc §2.1.
     config_path: Arc<PathBuf>,
+    /// Fast tmpfs mirror of `config_path`, hydrated at startup and updated
+    /// write-through on every commit (`durable_state`). Every frequent read
+    /// (status polling, discard) uses this, never `config_path` directly.
+    config_cache_path: Arc<PathBuf>,
     preview_config_path: Arc<PathBuf>,
     asset_dir: Arc<PathBuf>,
     sensor: Option<String>,
@@ -46,24 +57,29 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         camera: OpticCamera,
         sync: DataSyncManager,
         capture_log: Option<CaptureLog>,
         system_status: SystemStatusReader,
+        scheduler: SchedulerHandle,
         capture_dir: PathBuf,
+        config_path: PathBuf,
+        config_cache_path: PathBuf,
         asset_dir: PathBuf,
         sensor: Option<String>,
     ) -> Self {
-        let config_path = capture_dir.join("config.json");
         let preview_config_path = capture_dir.join("preview_config.json");
         Self {
             camera,
             sync,
             capture_log,
             system_status,
+            scheduler,
             capture_dir: Arc::new(capture_dir),
             config_path: Arc::new(config_path),
+            config_cache_path: Arc::new(config_cache_path),
             preview_config_path: Arc::new(preview_config_path),
             asset_dir: Arc::new(asset_dir),
             sensor,
@@ -88,6 +104,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sync/pause", post(sync_pause))
         .route("/api/sync/resume", post(sync_resume))
         .route("/api/sync/retry-now", post(sync_retry_now))
+        .route("/api/schedule/pause", post(schedule_pause))
+        .route("/api/schedule/resume", post(schedule_resume))
+        .route("/api/schedule/preview", post(schedule_preview))
+        .route("/api/schedule/forecast", get(schedule_forecast))
         .route("/api/system/status", get(system_status_handler))
         .route("/api/system/reboot", post(system_reboot))
         .route("/api/system/restart-daemon", post(system_restart_daemon))
@@ -221,7 +241,14 @@ struct StatusResponse {
     camera: CameraStatus,
     capture_stage: CaptureStageStatus,
     sync: SyncStatus,
+    schedule: SchedulerStatus,
     config: AppConfig,
+    /// Whether `config` above is a staged-but-uncommitted preview rather
+    /// than the committed config — lets a freshly loaded page (e.g. after
+    /// a refresh mid-edit) tell the two apart and restore its own "unsaved
+    /// changes" indicator (Save/Discard button state) accordingly, instead
+    /// of always assuming a clean load.
+    config_staged: bool,
 }
 
 #[derive(Serialize)]
@@ -260,22 +287,48 @@ impl StreamResponse {
     }
 }
 
-async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, AppError> {
-    let (queued_files, queued_bytes) = queue_usage(&state.capture_dir).await?;
-    let camera = state.camera.status();
+/// Whether there is a real, uncommitted edit pending: the preview file's
+/// content differs from the committed cache's. NOT the same as "the
+/// preview file exists" — `discard_config` resolves a staged edit by
+/// overwriting `preview_config_path` with a copy of the committed cache
+/// rather than deleting it (and `commit_config` never touches
+/// `preview_config_path` at all), so the file exists on disk from the
+/// first-ever staged edit onward for the rest of the daemon's life.
+/// Content equality, not existence, is the only reliable signal.
+async fn config_is_staged(preview_path: &Path, cache_path: &Path) -> bool {
+    let Ok(preview) = tokio::fs::read_to_string(preview_path).await else {
+        return false;
+    };
+    match durable_state::read_cached(cache_path).await {
+        Ok(cache) => preview != cache,
+        Err(_) => true,
+    }
+}
 
-    // Read from preview_config.json if present; otherwise, fall back to config.json or default
-    let config = if state.preview_config_path.exists() {
+/// Reads the currently-in-effect config: the staged preview if one exists,
+/// otherwise the committed config's fast tmpfs cache (never the durable
+/// SD-card path directly — this is on hot paths like `status()`'s every-
+/// few-seconds poll, design doc §2.1), otherwise defaults.
+async fn current_app_config(state: &AppState) -> AppConfig {
+    if state.preview_config_path.exists() {
         match tokio::fs::read_to_string(&*state.preview_config_path).await {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
             Err(_) => AppConfig::default(),
         }
     } else {
-        match tokio::fs::read_to_string(&*state.config_path).await {
+        match durable_state::read_cached(&state.config_cache_path).await {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
             Err(_) => AppConfig::default(),
         }
-    };
+    }
+}
+
+async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, AppError> {
+    let (queued_files, queued_bytes) = queue_usage(&state.capture_dir).await?;
+    let camera = state.camera.status();
+    let config_staged =
+        config_is_staged(&state.preview_config_path, &state.config_cache_path).await;
+    let config = current_app_config(&state).await;
     Ok(Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.started.elapsed().as_secs(),
@@ -293,7 +346,9 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
             queued_bytes,
         },
         sync: state.sync.status(),
+        schedule: state.scheduler.status(),
         config,
+        config_staged,
     }))
 }
 
@@ -310,6 +365,99 @@ async fn sync_resume(State(state): State<AppState>) -> Result<Json<SyncStatus>, 
 async fn sync_retry_now(State(state): State<AppState>) -> Result<Json<SyncStatus>, AppError> {
     state.sync.retry_now().await?;
     Ok(Json(state.sync.status()))
+}
+
+async fn schedule_pause(State(state): State<AppState>) -> Result<Json<SchedulerStatus>, AppError> {
+    state.scheduler.pause().await?;
+    Ok(Json(state.scheduler.status()))
+}
+
+async fn schedule_resume(State(state): State<AppState>) -> Result<Json<SchedulerStatus>, AppError> {
+    state.scheduler.resume().await?;
+    Ok(Json(state.scheduler.status()))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchedulePreviewRequest {
+    #[serde(default)]
+    station: Option<optic_scheduler::Station>,
+    #[serde(default)]
+    rules: Vec<optic_scheduler::Rule>,
+}
+
+/// Stages rule edits into `preview_config.json`, the same file
+/// `reconfigure_stream` stages camera settings into — but this never
+/// touches the camera pipeline at all, unlike that handler. Rejects
+/// invalid/duplicate slugs immediately (design doc §3.1's "immediate
+/// inline feedback" half of the validation contract; `commit_config` is
+/// the authoritative other half).
+async fn schedule_preview(
+    State(state): State<AppState>,
+    Json(request): Json<SchedulePreviewRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if let Err(error) = optic_scheduler::validate_rule_slugs(&request.rules) {
+        return Err(AppError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("invalid schedule rule slugs: {error:?}"),
+        });
+    }
+    let mut config = current_app_config(&state).await;
+    config.schedule.station = request.station;
+    config.schedule.rules = request.rules;
+    let serialized = serde_json::to_string_pretty(&config).map_err(|error| AppError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: error.to_string(),
+    })?;
+    let temp_path = state.preview_config_path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, serialized).await?;
+    tokio::fs::rename(temp_path, &*state.preview_config_path).await?;
+    Ok((StatusCode::OK, Json(Message::new("schedule staged"))))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ForecastParams {
+    hours: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ForecastShot {
+    at: chrono::DateTime<chrono::Utc>,
+    rule_slugs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ForecastResponse {
+    horizon_hours: u32,
+    shots: Vec<ForecastShot>,
+}
+
+/// Reads whatever is *currently staged* (preview if present, else the
+/// committed config) — design doc §8: edits are visible in the forecast
+/// immediately, before committing. Capped to a week regardless of what's
+/// requested, so a typo'd `hours` query param can't trigger a pathological
+/// computation.
+async fn schedule_forecast(
+    State(state): State<AppState>,
+    Query(params): Query<ForecastParams>,
+) -> Json<ForecastResponse> {
+    let horizon_hours = params.hours.unwrap_or(48).clamp(1, 168);
+    let config = current_app_config(&state).await;
+    let shots = optic_scheduler::forecast(
+        &config.schedule,
+        chrono::Utc::now(),
+        chrono::Duration::hours(i64::from(horizon_hours)),
+    )
+    .into_iter()
+    .map(|shot| ForecastShot {
+        at: shot.at.with_timezone(&chrono::Utc),
+        rule_slugs: shot.rule_slugs,
+    })
+    .collect();
+    Json(ForecastResponse {
+        horizon_hours,
+        shots,
+    })
 }
 
 /// Rollup window for the capture-health portion of the system panel. Fixed
@@ -351,11 +499,16 @@ async fn start_stream(
 ) -> Result<impl IntoResponse, AppError> {
     let accepted = request.clone();
 
-    // Reconfigure and Start streams exclusively write to the preview staging config
-    let config = AppConfig {
-        profile: request.profile,
-        settings: request.settings.clone(),
-    };
+    // Reconfigure and Start streams exclusively write to the preview staging
+    // config — but only profile/settings come from this request. Reading
+    // the current config first and overriding just those two fields (rather
+    // than constructing a bare-defaults AppConfig) preserves `save_dng`/
+    // `schedule` across every live-preview tweak; blindly reconstructing
+    // from scratch here would silently wipe scheduler rules on the next
+    // slider drag.
+    let mut config = current_app_config(&state).await;
+    config.profile = request.profile;
+    config.settings = request.settings.clone();
     if let Ok(serialized) = serde_json::to_string_pretty(&config) {
         let temp_path = state.preview_config_path.with_extension("json.tmp");
         if tokio::fs::write(&temp_path, serialized).await.is_ok() {
@@ -376,11 +529,11 @@ async fn reconfigure_stream(
 ) -> Result<impl IntoResponse, AppError> {
     let accepted = request.clone();
 
-    // Reconfigure and Start streams exclusively write to the preview staging config
-    let config = AppConfig {
-        profile: request.profile,
-        settings: request.settings.clone(),
-    };
+    // See `start_stream`'s comment: preserve save_dng/schedule, only
+    // override profile/settings from this request.
+    let mut config = current_app_config(&state).await;
+    config.profile = request.profile;
+    config.settings = request.settings.clone();
     if let Ok(serialized) = serde_json::to_string_pretty(&config) {
         let temp_path = state.preview_config_path.with_extension("json.tmp");
         if tokio::fs::write(&temp_path, serialized).await.is_ok() {
@@ -396,9 +549,19 @@ async fn reconfigure_stream(
 }
 
 async fn stop_stream(State(state): State<AppState>) -> impl IntoResponse {
-    // Delete the preview stage temporary configuration file when the preview stream closes/stops
-    let _ = tokio::fs::remove_file(&*state.preview_config_path).await;
-
+    // Deliberately does NOT touch preview_config.json. It used to delete it
+    // unconditionally here, back when that file was purely camera-preview
+    // scratch space — but it's now the general staging file for the whole
+    // AppConfig, including schedule rule edits (design doc §9: "reuses the
+    // existing preview/commit/discard config flow"). `pagehide` (which
+    // calls this via sendBeacon) fires on *any* navigation away from the
+    // dashboard, including a plain refresh — deleting the preview here was
+    // silently discarding legitimate unsaved edits (e.g. an unchecked rule
+    // on the scheduler page) any time the camera preview merely stopped,
+    // even though nothing else in this file resolves staged config except
+    // an explicit `/api/config/commit` or `/api/config/discard`. Stopping
+    // the live preview and having unsaved edits are orthogonal; only the
+    // latter two endpoints should ever decide the fate of staged config.
     match state.camera.stop_stream().await {
         Ok(true) => (StatusCode::OK, Json(Message::new("preview stopped"))).into_response(),
         Ok(false) => (
@@ -498,11 +661,32 @@ async fn capture(
 
 async fn commit_config(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
     if state.preview_config_path.exists() {
-        // Overwrite the persistent operational production config under config.json atomically
         let content = tokio::fs::read_to_string(&*state.preview_config_path).await?;
-        let temp_path = state.config_path.with_extension("json.tmp");
-        tokio::fs::write(&temp_path, &content).await?;
-        tokio::fs::rename(temp_path, &*state.config_path).await?;
+        // Authoritative slug-uniqueness check (design doc §3.1/§14):
+        // rejects the whole commit if two rules collide, rather than
+        // silently accepting one and losing the operator's intent. Only
+        // enforced here if the preview actually parses as AppConfig —
+        // malformed preview JSON isn't this check's job to report.
+        if let Ok(config) = serde_json::from_str::<AppConfig>(&content)
+            && let Err(error) = optic_scheduler::validate_rule_slugs(&config.schedule.rules)
+        {
+            return Err(AppError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: format!("invalid schedule rule slugs: {error:?}"),
+            });
+        }
+        // Promote the staged preview to the committed config: durable
+        // SD-card path first, then its tmpfs cache mirror (design doc
+        // §2.1) — never the other order, so a crash between the two never
+        // leaves the cache ahead of a value that was never actually
+        // durably committed.
+        durable_state::write_through(&state.config_path, &state.config_cache_path, &content)
+            .await?;
+        // Wake the scheduler to re-read the new config immediately, rather
+        // than letting it wait out a sleep already armed against the old
+        // one (design doc §2.1's hot-reload requirement — a rule edit
+        // could otherwise silently take hours to apply).
+        state.scheduler.notify_config_changed().await;
     }
     Ok((
         StatusCode::OK,
@@ -511,14 +695,18 @@ async fn commit_config(State(state): State<AppState>) -> Result<impl IntoRespons
 }
 
 async fn discard_config(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
-    // Revert preview state by copying config.json back to preview_config.json
-    if state.config_path.exists() {
-        let content = tokio::fs::read_to_string(&*state.config_path).await?;
-        let temp_path = state.preview_config_path.with_extension("json.tmp");
-        tokio::fs::write(&temp_path, &content).await?;
-        tokio::fs::rename(temp_path, &*state.preview_config_path).await?;
-    } else {
-        let _ = tokio::fs::remove_file(&*state.preview_config_path).await;
+    // Revert preview state by copying the committed config's tmpfs cache
+    // back to preview_config.json (reads the cache, not the durable
+    // SD-card path — design doc §2.1; the cache is always in sync with it).
+    match durable_state::read_cached(&state.config_cache_path).await {
+        Ok(content) => {
+            let temp_path = state.preview_config_path.with_extension("json.tmp");
+            tokio::fs::write(&temp_path, &content).await?;
+            tokio::fs::rename(temp_path, &*state.preview_config_path).await?;
+        }
+        Err(_) => {
+            let _ = tokio::fs::remove_file(&*state.preview_config_path).await;
+        }
     }
     Ok((
         StatusCode::OK,
@@ -575,6 +763,15 @@ impl From<SyncUnavailable> for AppError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "optic_sync is unavailable".to_owned(),
+        }
+    }
+}
+
+impl From<SchedulerUnavailable> for AppError {
+    fn from(_: SchedulerUnavailable) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "optic_scheduler is unavailable".to_owned(),
         }
     }
 }
@@ -796,6 +993,61 @@ mod tests {
             "text/plain; charset=utf-8"
         );
         assert!(body_string(response).await.contains("app.js"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn config_is_staged_is_false_when_no_preview_file_exists() {
+        let dir = unique_temp_dir("staged-no-preview");
+        let preview_path = dir.join("preview_config.json");
+        let cache_path = dir.join("config_cache.json");
+        std::fs::write(&cache_path, "committed").unwrap();
+
+        assert!(!config_is_staged(&preview_path, &cache_path).await);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn config_is_staged_is_true_when_preview_content_differs_from_cache() {
+        let dir = unique_temp_dir("staged-differs");
+        let preview_path = dir.join("preview_config.json");
+        let cache_path = dir.join("config_cache.json");
+        std::fs::write(&cache_path, "committed").unwrap();
+        std::fs::write(&preview_path, "edited").unwrap();
+
+        assert!(config_is_staged(&preview_path, &cache_path).await);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn config_is_staged_is_false_once_preview_content_matches_cache_again() {
+        // Mirrors what commit_config/discard_config actually do: neither
+        // deletes preview_config.json, they just make its content match
+        // the committed cache again (discard by overwriting it, commit by
+        // leaving it as-is once the cache itself catches up to it). Mere
+        // file existence can never be the signal — only content equality.
+        let dir = unique_temp_dir("staged-resolved");
+        let preview_path = dir.join("preview_config.json");
+        let cache_path = dir.join("config_cache.json");
+        std::fs::write(&cache_path, "same").unwrap();
+        std::fs::write(&preview_path, "same").unwrap();
+
+        assert!(!config_is_staged(&preview_path, &cache_path).await);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn config_is_staged_is_true_when_preview_exists_but_nothing_was_ever_committed() {
+        let dir = unique_temp_dir("staged-no-cache-yet");
+        let preview_path = dir.join("preview_config.json");
+        let cache_path = dir.join("config_cache.json");
+        std::fs::write(&preview_path, "first edit ever").unwrap();
+
+        assert!(config_is_staged(&preview_path, &cache_path).await);
 
         std::fs::remove_dir_all(&dir).ok();
     }
