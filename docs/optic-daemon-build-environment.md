@@ -75,6 +75,13 @@ cd /Users/admin/Documents/projects/optic
 Set `OPTIC_DEPLOY_TARGET=user@host` only when the Pi cannot be reached as
 `liam@optic.local`. The manual commands below remain available for diagnosis.
 
+The pinned Rust version comes from `rust-toolchain.toml` (`channel`), which
+the script uploads and reads on the Pi. The Biome file list comes from
+`biome.json` `files.includes`. GitHub Actions CI reads both files too, and
+installs the same `required_packages` pins; see
+[`optic-daemon-ci-cd.md`](optic-daemon-ci-cd.md). To change the toolchain or
+the linted files, edit those files, not the script.
+
 For a change touching only `src/web/*` (HTML/CSS/JS), use the fast path
 instead — it skips the entire Rust bootstrap/test/clippy/build and never
 stops or restarts `optic-daemon.service` (the daemon serves these files

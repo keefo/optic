@@ -1,0 +1,125 @@
+# CI gates for optic-daemon. Design: docs/optic-daemon-ci-cd.md.
+# Mirrors the checks scripts/build-deploy-optic-daemon.sh runs on the Pi,
+# and builds the release binary for the Pi's exact ABI (Debian 13 arm64,
+# pinned Raspberry Pi libcamera). Nothing here deploys.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  web-lint:
+    name: Biome (web assets)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: biomejs/setup-biome@4c91541eaada48f67d7dbd7833600ce162b68f51 # v2.7.1
+        with:
+          version: 2.5.14
+      # The checked file list lives in biome.json `files.includes`.
+      - run: biome ci
+
+  rust-arm64:
+    name: Rust (Debian 13 arm64)
+    runs-on: ubuntu-24.04-arm
+    container: debian:trixie
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      # Same bindgen inputs as the Pi build, but from system-installed packages.
+      LIBCLANG_PATH: /usr/lib/aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned native build dependencies
+        run: scripts/ci-install-build-deps.sh
+
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml | head -n 1)
+          [[ $channel =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad channel: $channel" >&2; exit 1; }
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs |
+            sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+          "$HOME/.cargo/bin/rustup" toolchain install "$channel" --profile minimal --component rustfmt,clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-I$(gcc -print-file-name=include)" >> "$GITHUB_ENV"
+
+      - name: Show toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version
+          cargo clippy --version
+          gcc --version | head -n 1
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo test
+        run: cargo test --locked --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --locked --release
+
+      - name: Verify release binary
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          binary=target/release/optic-daemon
+          test -x "$binary"
+          ldd "$binary" | tee ldd.txt
+          if grep -q 'not found' ldd.txt; then
+            echo 'release binary has unresolved shared libraries' >&2
+            exit 1
+          fi
+          grep -q 'libcamera.so.0.7' ldd.txt
+          grep -q 'libturbojpeg.so.0' ldd.txt
+          grep -aqF "$version" "$binary"
+          echo "OPTIC_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Package artifact
+        run: |
+          name="optic-daemon-${OPTIC_VERSION}-aarch64-linux-gnu"
+          dist="dist/$name"
+          mkdir -p "$dist"
+          install -m 0755 target/release/optic-daemon "$dist/optic-daemon"
+          cp -r src/web "$dist/web"
+          install -m 0644 systemd/optic-daemon.service "$dist/optic-daemon.service"
+          printf '%s\n' "$OPTIC_VERSION" > "$dist/VERSION"
+          printf '%s\n' "$GITHUB_SHA" > "$dist/COMMIT"
+          (cd "$dist" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "dist/$name.sha256"
+          mv "dist/$name.sha256" "$dist/SHA256SUMS"
+          cat "$dist/SHA256SUMS"
+          echo "ARTIFACT_NAME=$name-${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+          retention-days: 14
+          if-no-files-found: error

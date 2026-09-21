@@ -1,0 +1,11 @@
+# Keep SHA-pinned GitHub Actions current. Cargo updates are intentionally
+# excluded (they change Cargo.lock); see docs/optic-daemon-ci-cd.md phase 4.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

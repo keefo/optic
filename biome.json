@@ -1,5 +1,18 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.5.14/schema.json",
+  "files": {
+    "includes": [
+      "src/web/app.js",
+      "src/web/index.html",
+      "src/web/scheduler.js",
+      "src/web/scheduler.html",
+      "src/web/capture-history.js",
+      "src/web/capture-history.html",
+      "src/web/config.js",
+      "src/web/config.html",
+      "src/web/footer.js"
+    ]
+  },
   "assist": { "actions": { "source": { "organizeImports": "on" } } },
   "linter": {
     "enabled": true,
