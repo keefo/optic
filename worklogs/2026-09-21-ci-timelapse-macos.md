@@ -1,7 +1,7 @@
 # Dated Worklog: 2026-09-21 - CI: macOS Job for the Timelapse Tool
 
-Status: **implemented and locally tested**; GitHub run pending (see
-Validation).
+Status: **implemented and tested on GitHub Actions** (PR #5). The job is
+not a required check.
 
 ## Objective
 
@@ -163,3 +163,33 @@ are not installed, so they were not run.
    - Unset, with ffmpeg hidden: `SKIPPED: ffmpeg not on PATH`, then pass.
 6. `cargo fmt` and `cargo clippy --locked --all-targets -- -D warnings`
    in `tools/timelapse`: clean.
+
+## Validation (GitHub Actions, PR #5, head `0b1e0d9`)
+
+Both the `push` run (35574394334) and the `pull_request` run (35574397375)
+passed every job.
+
+| Job | Push run | PR run |
+|---|---|---|
+| Detect changed scope | pass, 6 s | pass, 7 s |
+| Biome (web assets) | pass, 8 s | pass, 8 s |
+| Rust (Debian 13 arm64) | pass, 1m47s | pass, 1m43s |
+| **Timelapse tool (macOS)** | **pass, 29 s** | **pass, 31 s** |
+
+- `changes` emitted `docs_only=false` and `timelapse=true`.
+- The push-run log of the macOS job
+  (`gh run view 35574394334 --job 106252885163 --log`) shows:
+  - image `macos-15-arm64` (macOS 15.7.9);
+  - rustup not preinstalled, so it was installed, then `1.98.1-aarch64-apple-darwin`
+    (rustc 1.98.1);
+  - `brew install ffmpeg` poured the `ffmpeg--9.0.1_1.arm64_sequoia`
+    bottle, taking about 3 s including dependencies;
+  - `cargo test --locked --all-targets`: 41 unit and 4 integration tests
+    passed, no `SKIPPED` line (with `OPTIC_REQUIRE_FFMPEG=1` a skip would
+    have failed), and the integration suite finished in 0.34 s;
+  - clippy clean; release build finished in 3.59 s.
+
+  The 29 s total is plausible: the crate has about 44 small dependencies.
+- The runner's ffmpeg is 9.0.1 and the dev iMac's is 9.0.2. Both pass.
+- Skip path: the commit recording these results changes only this
+  worklog, so its CI run should skip all three build jobs. See below.
