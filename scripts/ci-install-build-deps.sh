@@ -18,9 +18,14 @@ export DEBIAN_FRONTEND=noninteractive
 
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEPLOY_SCRIPT="$PROJECT_ROOT/scripts/build-deploy-optic-daemon.sh"
-RPI_KEY_URL=https://archive.raspberrypi.com/debian/raspberrypi.gpg.key
+# The archive key comes from the raspberrypi-archive-keyring package, pinned
+# by SHA-256. The loose raspberrypi.gpg.key download carries SHA-1 binding
+# signatures, which Debian 13's apt verifier (sqv) rejects since 2026-02-01;
+# the package ships the same key re-signed with SHA-512.
+RPI_KEYRING_DEB_URL=https://archive.raspberrypi.com/debian/pool/main/r/raspberrypi-archive-keyring/raspberrypi-archive-keyring_2025.1+rpt1_all.deb
+RPI_KEYRING_DEB_SHA256=2e727149d7acb8cc7f604e66d0049161039c8aa1eaf1175e54f9e69d963d60e4
 RPI_KEY_FINGERPRINT=CF8A1AF502A2AA2D763BAE7E82B129927FA3303E
-RPI_KEYRING=/usr/share/keyrings/raspberrypi-archive-keyring.gpg
+RPI_KEYRING=/usr/share/keyrings/raspberrypi-archive-keyring.pgp
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -56,14 +61,20 @@ apt-get update
 apt-get install -y --no-install-recommends \
     ca-certificates curl gcc g++ git gpg libc6-dev pkg-config xz-utils
 
-printf '%s\n' '==> Adding the Raspberry Pi archive (fingerprint-pinned)'
-key_file=$(mktemp)
-trap 'rm -f "$key_file"' EXIT
-curl --proto '=https' --tlsv1.2 --fail --silent --show-error "$RPI_KEY_URL" -o "$key_file"
+printf '%s\n' '==> Adding the Raspberry Pi archive (keyring package and fingerprint pinned)'
+work_dir=$(mktemp -d)
+trap 'rm -rf "$work_dir"' EXIT
+curl --proto '=https' --tlsv1.2 --fail --silent --show-error "$RPI_KEYRING_DEB_URL" \
+    -o "$work_dir/keyring.deb"
+printf '%s  %s\n' "$RPI_KEYRING_DEB_SHA256" "$work_dir/keyring.deb" | sha256sum --check --quiet || \
+    fail 'raspberrypi-archive-keyring package SHA-256 mismatch'
+dpkg-deb -x "$work_dir/keyring.deb" "$work_dir/keyring"
+key_file="$work_dir/keyring/usr/share/keyrings/raspberrypi-archive-keyring.pgp"
+[[ -r $key_file ]] || fail 'keyring package does not contain raspberrypi-archive-keyring.pgp'
 actual_fingerprint=$(gpg --show-keys --with-colons "$key_file" | awk -F: '$1 == "fpr" { print $10; exit }')
 [[ $actual_fingerprint == "$RPI_KEY_FINGERPRINT" ]] || \
     fail "Raspberry Pi archive key fingerprint mismatch: got ${actual_fingerprint:-none}"
-gpg --dearmor < "$key_file" > "$RPI_KEYRING"
+install -m 0644 "$key_file" "$RPI_KEYRING"
 cat > /etc/apt/sources.list.d/raspi.sources <<EOF
 Types: deb
 URIs: http://archive.raspberrypi.com/debian/
