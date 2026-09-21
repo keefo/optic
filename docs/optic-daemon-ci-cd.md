@@ -6,11 +6,14 @@ Status (2026-09-20):
   The cold run took 4m35s and a warm run 1m45s; 116 Linux tests pass. The
   CI binary has not been hardware-validated yet (phase 2).
 - Phases 2–4 are planned.
+- 2026-09-21: added a macOS job for the separate `tools/timelapse`
+  workspace (§5.1, `timelapse-macos`).
 
 Worklogs:
 
 - research: [`2026-09-20-github-ci-cd-plan.md`](../worklogs/2026-09-20-github-ci-cd-plan.md);
-- phase 1: [`2026-09-20-ci-phase1-gates.md`](../worklogs/2026-09-20-ci-phase1-gates.md).
+- phase 1: [`2026-09-20-ci-phase1-gates.md`](../worklogs/2026-09-20-ci-phase1-gates.md);
+- timelapse macOS job: [`2026-09-21-ci-timelapse-macos.md`](../worklogs/2026-09-21-ci-timelapse-macos.md).
 
 ## 1. Goals and Non-goals
 
@@ -105,7 +108,12 @@ Mac (human) ─► ./scripts/build-deploy-optic-daemon.sh --release X.Y.Z
   the required checks would never report and block the PR. The step fails
   open: a new branch, `workflow_dispatch`, an unknown `before` commit, or
   a failed `changes` job all run the full CI (added 2026-09-21,
-  `worklogs/2026-09-21-ci-skip-docs-only.md`).
+  `worklogs/2026-09-21-ci-skip-docs-only.md`). The script also prints
+  `timelapse=true|false`, which gates `timelapse-macos` below. It is true
+  when any non-`.md` path is under `tools/timelapse/`, or is
+  `.github/workflows/ci.yml`, `scripts/ci-changed-scope.sh`, or
+  `rust-toolchain.toml`. Empty input and every fallback case give
+  `timelapse=true`, so it fails open too.
 - **`web-lint`** uses `biomejs/setup-biome` with version `2.5.14`, then runs
   `biome ci`. The checked file list lives in `biome.json` `files.includes`.
   The deploy script runs `biome check` with no paths, so both use the same
@@ -140,6 +148,25 @@ Mac (human) ─► ./scripts/build-deploy-optic-daemon.sh --release X.Y.Z
      `VERSION` and `COMMIT`, write `SHA256SUMS`, and upload with
      `actions/upload-artifact` (`retention-days: 14`).
   9. `timeout-minutes: 60`.
+- **`timelapse-macos`** ("Timelapse tool (macOS)", added 2026-09-21).
+  `tools/timelapse` is its own Cargo workspace (a Mac-only tool,
+  `docs/timelapse-builder.md`), so `rust-arm64`'s root `cargo` commands
+  never build or test it.
+  1. `runs-on: macos-15`.
+  2. Runs `if: !cancelled() && needs.changes.outputs.timelapse != 'false'`,
+     so daemon-only and docs-only changes skip it.
+  3. Not a required check. Tool-only changes still run `rust-arm64` and
+     `web-lint`.
+  4. Installs the `rust-toolchain.toml` channel with rustup, then
+     `brew install ffmpeg`.
+  5. `OPTIC_REQUIRE_FFMPEG=1` makes the ffmpeg encode and frame-order
+     integration test fail instead of skipping when ffmpeg is missing.
+  6. In `tools/timelapse`, runs `cargo fmt --all -- --check`,
+     `cargo test --locked --all-targets`,
+     `cargo clippy --locked --all-targets -- -D warnings`, and
+     `cargo build --locked --release`.
+  7. `Swatinem/rust-cache` with `workspaces: tools/timelapse -> target`.
+  8. No artifact is uploaded. `timeout-minutes: 30`.
 
 ### 5.2 `.github/workflows/release.yml`
 
@@ -232,7 +259,9 @@ Each phase gets its own dated worklog, per `CLAUDE.md`.
   (GHCR image, or cached `.deb`s).
 - **O3** (measured 2026-09-20): a Rust job takes about 4.6 min on a cold
   cache and about 1.8 min on a warm one, plus about 5 s for Biome. That is
-  roughly 2–5 billed minutes per push.
+  roughly 2–5 billed minutes per push. `timelapse-macos` runs only when
+  the tool or the CI definition changes, because macOS minutes are billed
+  at about 10× Linux on this private repo.
 - **O4**: `CLAUDE.md` imports `@AGENTS.md`, but no `AGENTS.md` exists in
   this checkout, so the tooling-constraints section it references is
   missing.
