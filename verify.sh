@@ -383,19 +383,25 @@ done
 
 section "1. Flash wear and RAM journaling"
 
+# Persistent but small: keeps crash evidence across reboots at bounded SD
+# wear (scripts/setup-phase-01-journaling.sh,
+# worklogs/2026-09-19-persistent-journal-crash-evidence.md).
 journal_storage=$(systemd_config_value systemd/journald.conf Storage)
-if [[ "$journal_storage" == "volatile" ]]; then
-    pass "Journal storage is volatile"
+if [[ "$journal_storage" == "persistent" ]]; then
+    pass "Journal storage is persistent"
 else
-    fail "Journal storage must be volatile" "Storage=${journal_storage:-default}"
+    fail "Journal storage must be persistent" "Storage=${journal_storage:-default}"
 fi
 
-journal_limit=$(systemd_config_value systemd/journald.conf RuntimeMaxUse)
-if [[ "$journal_limit" == "32M" ]]; then
-    pass "Runtime journal size is constrained" "RuntimeMaxUse=32M"
-else
-    fail "Runtime journal size must be constrained" "expected=32M, actual=${journal_limit:-unset}"
-fi
+for journal_limit_key in SystemMaxUse RuntimeMaxUse; do
+    journal_limit=$(systemd_config_value systemd/journald.conf "$journal_limit_key")
+    if [[ "$journal_limit" == "16M" ]]; then
+        pass "Journal size is constrained" "$journal_limit_key=16M"
+    else
+        fail "Journal size must be constrained" \
+            "expected $journal_limit_key=16M, actual=${journal_limit:-unset}"
+    fi
+done
 
 if [[ "$(systemctl is-active systemd-journald.service 2>/dev/null || true)" == "active" ]]; then
     pass "systemd-journald is active"
@@ -403,14 +409,11 @@ else
     fail "systemd-journald is not active"
 fi
 
-persistent_journal_file=""
-if [[ -d /var/log/journal ]]; then
-    persistent_journal_file=$(find /var/log/journal -type f -name '*.journal*' -print -quit 2>/dev/null || true)
-fi
-if [[ -z "$persistent_journal_file" ]]; then
-    pass "No persistent journal files were found"
+machine_id=$(cat /etc/machine-id 2>/dev/null || true)
+if [[ -n "$machine_id" && -e "/var/log/journal/$machine_id/system.journal" ]]; then
+    pass "Persistent system journal is being written" "/var/log/journal/$machine_id"
 else
-    fail "Persistent journal files are writing to disk" "$persistent_journal_file"
+    fail "Persistent system journal is missing" "/var/log/journal/${machine_id:-unknown}/system.journal"
 fi
 
 unit_disabled rsyslog.service
@@ -893,6 +896,106 @@ fi
 
 info "Optical validation remains manual" \
     "confirm native-resolution framing and focus on the transferred iMac image"
+
+# Host access for the daemon's dashboard system actions
+# (scripts/setup-phase-08-daemon-host-access.sh). The user service needs
+# lingering to start at boot without a login.
+daemon_user=liam
+if [[ -e "/var/lib/systemd/linger/$daemon_user" ]]; then
+    pass "User manager lingering is enabled" "$daemon_user"
+else
+    fail "User manager lingering is disabled" "optic-daemon will not start at boot for $daemon_user"
+fi
+
+# pkcheck only asks polkitd for a decision; it performs no action. Any user
+# may check its own process without details, but passing --detail (needed to
+# scope the NTP rule to one unit and verb) requires a trusted root caller,
+# and the rule files are readable only by root and polkitd. Those checks use
+# non-interactive sudo when it is available and are skipped otherwise.
+policy_subject_uid=$(id -u "$daemon_user" 2>/dev/null || true)
+policy_subject_gid=$(id -g "$daemon_user" 2>/dev/null || true)
+policy_root=()
+if ((SECTION_ENABLED)); then
+    if ((EUID == 0)); then
+        policy_root=(env)
+    elif sudo -n true 2>/dev/null; then
+        policy_root=(sudo -n)
+    fi
+fi
+
+if ! ((SECTION_ENABLED)); then
+    :
+elif ! command -v pkcheck >/dev/null 2>&1; then
+    fail "PolicyKit checks are unavailable" "pkcheck is not installed"
+elif [[ -z "$policy_subject_uid" ]]; then
+    fail "PolicyKit rules were not checked" "user $daemon_user does not exist"
+elif [[ "$(id -u)" != "$policy_subject_uid" ]] && ((${#policy_root[@]} == 0)); then
+    warn "PolicyKit rules were not checked" "run verify.sh as $daemon_user or root"
+else
+    policy_subject=$$
+    policy_sleeper=""
+    if [[ "$(id -u)" != "$policy_subject_uid" ]]; then
+        # Running as root: evaluate a short-lived process owned by the daemon
+        # user, and wait until it has dropped root so polkitd sees that user.
+        setpriv --reuid="$policy_subject_uid" --regid="$policy_subject_gid" --init-groups -- sleep 30 &
+        policy_sleeper=$!
+        policy_subject=$policy_sleeper
+        for _ in {1..20}; do
+            [[ "$(stat -c %u "/proc/$policy_sleeper" 2>/dev/null || true)" == "$policy_subject_uid" ]] && break
+            sleep 0.1
+        done
+    fi
+
+    for policy_action in \
+        "org.freedesktop.login1.reboot|Reboot Pi" \
+        "org.freedesktop.timedate1.set-timezone|Station timezone save"; do
+        if pkcheck --process "$policy_subject" --action-id "${policy_action%%|*}" >/dev/null 2>&1; then
+            pass "PolicyKit authorizes $daemon_user for ${policy_action#*|}" "${policy_action%%|*}"
+        else
+            fail "PolicyKit does not authorize $daemon_user for ${policy_action#*|}" \
+                "${policy_action%%|*}; see scripts/setup-phase-08-daemon-host-access.sh"
+        fi
+    done
+
+    if ((${#policy_root[@]} == 0)); then
+        warn "NTP sync PolicyKit rule was not checked" "unit-scoped checks need root; rerun with sudo"
+    else
+        if "${policy_root[@]}" pkcheck --process "$policy_subject" \
+            --action-id org.freedesktop.systemd1.manage-units \
+            --detail unit systemd-timesyncd.service --detail verb restart >/dev/null 2>&1; then
+            pass "PolicyKit authorizes $daemon_user for NTP Sync now" "restart systemd-timesyncd.service"
+        else
+            fail "PolicyKit does not authorize $daemon_user for NTP Sync now" \
+                "restart systemd-timesyncd.service; see scripts/setup-phase-08-daemon-host-access.sh"
+        fi
+        # pkcheck exits 1 (not authorized) or 2 (authentication required)
+        # for a denial; anything else is an error, not proof of scoping.
+        "${policy_root[@]}" pkcheck --process "$policy_subject" \
+            --action-id org.freedesktop.systemd1.manage-units \
+            --detail unit ssh.service --detail verb restart >/dev/null 2>&1
+        policy_status=$?
+        if ((policy_status == 0)); then
+            fail "NTP sync PolicyKit rule is too broad" "$daemon_user may restart ssh.service without authentication"
+        elif ((policy_status == 1 || policy_status == 2)); then
+            pass "NTP sync PolicyKit rule stays scoped to one unit" "ssh.service restart still requires authentication"
+        else
+            fail "NTP sync PolicyKit scope check failed" "pkcheck exit status $policy_status"
+        fi
+
+        for policy_rule in 60-optic-daemon-reboot.rules 61-optic-daemon-ntp-sync.rules 62-optic-daemon-set-timezone.rules; do
+            policy_rule_meta=$("${policy_root[@]}" stat -c '%a %U:%G' "/etc/polkit-1/rules.d/$policy_rule" 2>/dev/null || true)
+            if [[ "$policy_rule_meta" == "644 root:root" ]]; then
+                pass "PolicyKit rule is installed" "$policy_rule ($policy_rule_meta)"
+            elif [[ -z "$policy_rule_meta" ]]; then
+                fail "PolicyKit rule is missing" "/etc/polkit-1/rules.d/$policy_rule"
+            else
+                warn "PolicyKit rule has unexpected ownership or mode" "$policy_rule ($policy_rule_meta)"
+            fi
+        done
+    fi
+
+    [[ -z "$policy_sleeper" ]] || kill "$policy_sleeper" 2>/dev/null || true
+fi
 
 section "9. Immutable root protection"
 

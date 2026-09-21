@@ -55,6 +55,13 @@ pub struct TimeSyncStatus {
     pub timezone: String,
     pub ntp_enabled: bool,
     pub synchronized: bool,
+    /// When `systemd-timesyncd` last got a good reply from a time server,
+    /// read from its marker file (see `TIMESYNC_MARKER`). `synchronized`
+    /// alone can't show a *new* sync: it stays `true` across a "Sync now"
+    /// restart. The Config page compares this against the value from before
+    /// the click. `None` when the marker doesn't exist yet (no sync since
+    /// boot).
+    pub last_synced_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -257,12 +264,27 @@ async fn time_sync_status() -> Option<TimeSyncStatus> {
     if !output.status.success() {
         return None;
     }
-    parse_timedatectl_show(&String::from_utf8_lossy(&output.stdout))
+    let mut status = parse_timedatectl_show(&String::from_utf8_lossy(&output.stdout))?;
+    status.last_synced_at = modified_at(Path::new(TIMESYNC_MARKER)).await;
+    Some(status)
 }
 
 #[cfg(not(target_os = "linux"))]
 async fn time_sync_status() -> Option<TimeSyncStatus> {
     None
+}
+
+/// `systemd-timesyncd` touches this file on every successful
+/// synchronization (`man systemd-timesyncd`), so its mtime is the last
+/// sync time. It lives on `/run`, which stays readable under the daemon's
+/// `ProtectSystem=strict` sandbox, and is world-readable (`0644`).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const TIMESYNC_MARKER: &str = "/run/systemd/timesync/synchronized";
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+async fn modified_at(path: &Path) -> Option<chrono::DateTime<chrono::Utc>> {
+    let modified = tokio::fs::metadata(path).await.ok()?.modified().ok()?;
+    Some(modified.into())
 }
 
 /// Parses `timedatectl show`'s `Key=Value`-per-line output (not the
@@ -292,6 +314,7 @@ fn parse_timedatectl_show(text: &str) -> Option<TimeSyncStatus> {
         timezone: timezone?,
         ntp_enabled: ntp_enabled?,
         synchronized: synchronized?,
+        last_synced_at: None,
     })
 }
 
@@ -447,6 +470,30 @@ mod tests {
         let status = parse_timedatectl_show("Timezone=UTC\nNTP=no\nNTPSynchronized=no\n").unwrap();
         assert!(!status.ntp_enabled);
         assert!(!status.synchronized);
+    }
+
+    #[tokio::test]
+    async fn modified_at_is_none_for_a_missing_marker() {
+        let path =
+            std::env::temp_dir().join(format!("optic-timesync-missing-{}", std::process::id()));
+        assert_eq!(modified_at(&path).await, None);
+    }
+
+    #[tokio::test]
+    async fn modified_at_reports_the_marker_mtime() {
+        let path =
+            std::env::temp_dir().join(format!("optic-timesync-marker-{}", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        let synced = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_789_000_000);
+        file.set_modified(synced).unwrap();
+        drop(file);
+
+        let reported = modified_at(&path).await;
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            reported,
+            Some(chrono::DateTime::<chrono::Utc>::from(synced))
+        );
     }
 
     #[test]
