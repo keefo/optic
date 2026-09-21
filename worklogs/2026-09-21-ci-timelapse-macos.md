@@ -191,5 +191,25 @@ passed every job.
 
   The 29 s total is plausible: the crate has about 44 small dependencies.
 - The runner's ffmpeg is 9.0.1 and the dev iMac's is 9.0.2. Both pass.
-- Skip path: the commit recording these results changes only this
-  worklog, so its CI run should skip all three build jobs. See below.
+- **Skip path on GitHub (criterion 3, docs-only case):** push `9fba284`
+  changed only this worklog. In run 35574622457, `Detect changed scope`
+  succeeded, and `Biome`, `Rust (Debian 13 arm64)`, and **`Timelapse tool
+  (macOS)` were all skipped**. The matching `pull_request` run 35574625698
+  diffs the whole PR against `main`, so all four jobs ran and passed, as
+  designed.
+- PR #5 afterwards showed `MERGEABLE` / `CLEAN`.
+
+## Remaining Limitations / Follow-Up
+
+- The daemon-only skip (criterion 3) was shown locally only: the classifier
+  cases and the PR #6 range gave `timelapse=false`. No daemon-only PR has run
+  since this change.
+- Tool-only changes still run `rust-arm64` and `web-lint`, about 2 billed
+  Linux minutes. The classifier could gain a `daemon` flag if that matters.
+- `Timelapse tool (macOS)` is not a required check. Adding it to the `main`
+  ruleset is the user's decision.
+- The runner is Apple Silicon (`macos-15-arm64`), while the dev iMac is
+  Intel. The tool is pure Rust plus ffmpeg, so this shouldn't matter, but
+  CI doesn't cover x86_64 macOS.
+- `docs/optic-daemon-ci-cd.md` O4 still says `AGENTS.md` is missing. That is
+  stale on `main` (it's now a symlink) and not in this track's scope.
