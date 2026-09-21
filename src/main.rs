@@ -32,7 +32,7 @@ const DEFAULT_SYNC_REMOTE_USER: &str = "admin";
 const DEV_ASSET_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/web");
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main()   -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
