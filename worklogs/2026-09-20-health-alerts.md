@@ -340,6 +340,22 @@ since the Run control card already shows it.
   has no `id="run-state"`; no service restart (ActiveEnterTimestamp still
   00:19:21 PDT). Visual check on the real Pi dashboard pending the user.
 
+## GitHub CI and PR (2026-09-21, user-approved)
+
+- Committed the work, rebased onto `origin/main` (18e2f84: adds
+  `.github/workflows/ci.yml`, `rust-toolchain.toml`, provisioning 0.1.30);
+  no overlapping files, clean rebase. Branch version is now 0.1.30 from
+  `main`; still no bump in this branch.
+- Local checks on the rebased tree: fmt OK, clippy `-D warnings` OK,
+  **151 tests passed**.
+- Pushed `feat/health-alerts` and opened PR #6
+  (https://github.com/keefo/optic/pull/6). CI (push run 35573245157, PR run
+  35573251239): Detect changed scope ✅, Biome (web assets) ✅ — first Biome
+  run on this branch's JS/HTML — and Rust (Debian 13 arm64: fmt, test,
+  clippy, release build, ldd/version check, artifact) ✅ on both runs.
+- Not merged. Deploy-script stale-binary fix deferred to a separate PR
+  (user decision).
+
 ## Out-of-Scope File
 
 `src/web/footer.js`, and (UI change above) `src/web/scheduler.html` and
