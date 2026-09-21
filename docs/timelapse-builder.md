@@ -206,7 +206,14 @@ directory, or ffmpeg-availability errors, before anything is written.
   temp dir. It checks encoded frame order by mean luma, that the source
   directory is untouched, refusal of `--out` inside the source, the error
   for a missing ffmpeg, and that dry runs write nothing. The encode test is
-  skipped, with a message, if ffmpeg isn't on PATH.
+  skipped, with a message, if ffmpeg isn't on PATH, unless
+  `OPTIC_REQUIRE_FFMPEG` is set.
+
+**CI:** the `Timelapse tool (macOS)` job in `.github/workflows/ci.yml`
+runs fmt, clippy, the tests with Homebrew ffmpeg and
+`OPTIC_REQUIRE_FFMPEG=1`, and a release build on `macos-15`. It runs only
+when `tools/timelapse/**` or the CI definition changes (see
+`docs/optic-daemon-ci-cd.md` §5.1).
 
 ## 8. Known Limitations
 

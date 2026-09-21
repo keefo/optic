@@ -1,6 +1,8 @@
 //! End-to-end tests of the `optic-timelapse` binary against tiny generated
 //! fixtures in a temp directory (never real captures). The encode test needs
-//! `ffmpeg` on PATH and is skipped, loudly, without it.
+//! `ffmpeg` on PATH and is skipped, loudly, without it, unless
+//! `OPTIC_REQUIRE_FFMPEG` is set (as in CI), which turns the skip into a
+//! failure.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -77,6 +79,11 @@ fn ffmpeg_available() -> bool {
 #[test]
 fn encodes_generated_frames_in_timestamp_order_and_leaves_source_untouched() {
     if !ffmpeg_available() {
+        // CI sets OPTIC_REQUIRE_FFMPEG=1 so this can't silently pass there.
+        assert!(
+            std::env::var_os("OPTIC_REQUIRE_FFMPEG").is_none(),
+            "ffmpeg not on PATH but OPTIC_REQUIRE_FFMPEG is set"
+        );
         eprintln!("SKIPPED: ffmpeg not on PATH");
         return;
     }

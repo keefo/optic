@@ -27,13 +27,15 @@ jobs:
   # Docs-only changes skip the build jobs below. GitHub counts a required
   # check whose job was skipped by `if:` as passing, so the ruleset's two
   # required checks still resolve. Fails open: if this job fails, its output
-  # is empty and both build jobs run.
+  # is empty and both build jobs run. `timelapse` gates the macOS job for
+  # tools/timelapse the same way (empty output means it runs).
   changes:
     name: Detect changed scope
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       docs_only: ${{ steps.scope.outputs.docs_only }}
+      timelapse: ${{ steps.scope.outputs.timelapse }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -57,7 +59,7 @@ jobs:
             result=$(printf '%s\n' "$files" | scripts/ci-changed-scope.sh)
           else
             echo "No usable diff range for $EVENT; running full CI."
-            result="docs_only=false"
+            result=$'docs_only=false\ntimelapse=true'
           fi
           echo "$result" | tee -a "$GITHUB_OUTPUT"
 
@@ -164,3 +166,67 @@ jobs:
           path: dist/
           retention-days: 14
           if-no-files-found: error
+
+  # tools/timelapse is a separate Cargo workspace (a Mac-only tool), so the
+  # root cargo commands above never build or test it. Runs only when the
+  # tool or this CI definition changes; not a required check.
+  # Design: docs/optic-daemon-ci-cd.md §5.1, docs/timelapse-builder.md.
+  timelapse-macos:
+    name: Timelapse tool (macOS)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.timelapse != 'false' }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: "0"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      # Turns the encode/order integration test's "ffmpeg missing" skip
+      # into a failure.
+      OPTIC_REQUIRE_FFMPEG: "1"
+    defaults:
+      run:
+        working-directory: tools/timelapse
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          channel=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' ../../rust-toolchain.toml | head -n 1)
+          [[ $channel =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad channel: $channel" >&2; exit 1; }
+          if ! command -v rustup >/dev/null; then
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs |
+              sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
+          rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Show toolchain
+        run: |
+          rustc --version --verbose
+          cargo --version
+          cargo clippy --version
+          ffmpeg -hide_banner -version | head -n 1
+          sw_vers
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: tools/timelapse -> target
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo test
+        run: cargo test --locked --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo build --release
+        run: cargo build --locked --release

@@ -1,8 +1,9 @@
 # Dated Worklog: 2026-09-20 - Mac-Side Timelapse Builder
 
 Status: **implemented and tested on the iMac** (unit, integration, and a real
-end-to-end encode). Committed on `feat/timelapse-builder` at the user's request
-(not pushed). Awaiting user acceptance.
+end-to-end encode). Committed, pushed, and opened as PR #5 (rebased onto
+`main` on 2026-09-21). Awaiting user acceptance. The CI job for the tool is
+in `worklogs/2026-09-21-ci-timelapse-macos.md`.
 
 ## Objective
 
@@ -106,10 +107,10 @@ Design: `docs/timelapse-builder.md`.
 - zsh gotcha seen during probing: `$sz:r` is a zsh history modifier, so
   `testsrc2=s=$sz:r=24` loses `:r`. Use `${sz}`, or run probes under
   `bash -c`.
-- `CLAUDE.md` imports `@AGENTS.md`, but no `AGENTS.md` exists in this
-  worktree, so the "persist tooling fixes to AGENTS.md" rule can't be applied
-  here. Left for the user; not created on this branch, to avoid a
-  cross-track conflict.
+- `CLAUDE.md` imported `@AGENTS.md`, but no `AGENTS.md` existed in this
+  worktree at the time. *Resolved 2026-09-21:* after rebasing onto `main`,
+  `AGENTS.md` is a symlink to `CLAUDE.md`, and the zsh `$sz:r` rule was
+  appended to its Environment and Tooling Constraints.
 - `CLAUDE.md`'s repository-structure list has no `tools/` entry. Adding one is
   a one-line shared-file edit, left for merge time.
 
@@ -321,8 +322,8 @@ The folder now holds only the two final outputs listed above.
   segment whose last frame is within `--split-gap` of now.
 - Local timezone only; missed shots are not time-filled; deflicker can't fix
   large auto-exposure jumps (see design doc §8).
-- `CLAUDE.md` references a missing `AGENTS.md`, and its structure list has
-  no `tools/` entry. Both are shared-file edits left for merge time.
+- *Resolved 2026-09-21:* `CLAUDE.md` now lists `tools/` in its repository
+  structure, and `AGENTS.md` exists on `main`.
 - Only `master-archive` scheduler data exists, so `4k-dci`/`2k-binning`
   real encodes are untested. Those paths are covered by unit tests, and the
   integration test uses the `2k-binning` naming.

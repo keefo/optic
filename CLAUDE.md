@@ -19,6 +19,8 @@ here. Those details belong in project documentation and dated worklogs.
   limitations, and next steps.
 - `scripts/`: setup, build, deployment, and operational automation.
 - `systemd/`: service and timer definitions.
+- `tools/`: standalone developer tools, each a separate Cargo workspace (for
+  example `tools/timelapse/`, the Mac-side timelapse builder).
 - `Cargo.toml` and `Cargo.lock`: Rust package and locked dependency metadata.
 - `setup.md`: host setup and commissioning guidance.
 - `verify.sh`: read-only host verification.
@@ -171,6 +173,7 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 
 - Do not use `orca worktree set --comment ...` without a selector (`orca worktree set --help` lists `--worktree <selector>` as required); use `orca worktree set --worktree current --comment ...` instead.
 - Do not use `git push origin main` (GitHub ruleset GH013: changes to `main` must go through a pull request with 2 required status checks); push a branch and open a pull request instead.
+- Do not use `$var:r`-style expansions such as `testsrc2=s=$sz:r=24` in zsh (zsh treats `:r` as a history modifier and strips it); use `${sz}` or run the command under `bash -c` instead.
 
 ## Orca Worktree Completion Rules
 - When the task, PR, or assigned scope is finished:
