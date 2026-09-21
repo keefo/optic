@@ -92,6 +92,20 @@ Mac (human) ─► ./scripts/build-deploy-optic-daemon.sh --release X.Y.Z
   `workflow_dispatch`. A `concurrency` group per ref cancels superseded runs.
 - `permissions: contents: read` at the top level. Every third-party action
   is pinned to a full commit SHA with a version comment.
+- **`changes`** ("Detect changed scope") runs first. It diffs the PR
+  (base...head) or push (`before..sha`) and pipes the file list to
+  `scripts/ci-changed-scope.sh`. When **every** changed path is
+  documentation (`*.md`, `docs/**`, `worklogs/**`, `case/**`), it outputs
+  `docs_only=true` and both jobs below are skipped with
+  `if: !cancelled() && needs.changes.outputs.docs_only != 'true'`. GitHub
+  counts a required check skipped this way as passing, so the `main`
+  ruleset's required checks (`Biome (web assets)`,
+  `Rust (Debian 13 arm64)`) need no change and docs-only PRs merge
+  without a build. Workflow-level `paths-ignore` is deliberately not used:
+  the required checks would never report and block the PR. The step fails
+  open: a new branch, `workflow_dispatch`, an unknown `before` commit, or
+  a failed `changes` job all run the full CI (added 2026-09-21,
+  `worklogs/2026-09-21-ci-skip-docs-only.md`).
 - **`web-lint`** uses `biomejs/setup-biome` with version `2.5.14`, then runs
   `biome ci`. The checked file list lives in `biome.json` `files.includes`.
   The deploy script runs `biome check` with no paths, so both use the same
