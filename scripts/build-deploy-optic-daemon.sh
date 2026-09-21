@@ -341,7 +341,9 @@ fi
 printf '%s\n' '==> Linting web assets with Biome'
 [[ -x $HOME/biome ]] || fail "Biome binary is missing: $HOME/biome"
 cd "$SOURCE_DIR"
-"$HOME/biome" check src/web/app.js src/web/index.html src/web/scheduler.js src/web/scheduler.html || \
+"$HOME/biome" check src/web/app.js src/web/index.html src/web/scheduler.js src/web/scheduler.html \
+    src/web/capture-history.js src/web/capture-history.html src/web/config.js src/web/config.html \
+    src/web/footer.js || \
     fail 'Web assets failed Biome validation'
 
 if [[ $MODE == full ]]; then
@@ -518,6 +520,14 @@ if ! grep -F 'Manage rules' <<<"$index_html" >/dev/null; then
     printf '%s\n' 'The served dashboard is missing the scheduler summary link.' >&2
     rollback
 fi
+if ! grep -F 'class="app-tabs"' <<<"$index_html" >/dev/null; then
+    printf '%s\n' 'The served dashboard is missing the primary nav tab bar.' >&2
+    rollback
+fi
+if ! grep -F 'class="system-footer"' <<<"$index_html" >/dev/null; then
+    printf '%s\n' 'The served dashboard is missing the system-status footer.' >&2
+    rollback
+fi
 
 scheduler_html=$(curl --fail --silent --show-error http://127.0.0.1:8000/scheduler.html) || rollback
 if ! grep -F 'Shot forecaster' <<<"$scheduler_html" >/dev/null; then
@@ -527,6 +537,34 @@ fi
 scheduler_js=$(curl --fail --silent --show-error http://127.0.0.1:8000/scheduler.js) || rollback
 if ! grep -F 'schedule/forecast' <<<"$scheduler_js" >/dev/null; then
     printf '%s\n' 'The served scheduler script is missing expected content.' >&2
+    rollback
+fi
+
+capture_history_html=$(curl --fail --silent --show-error http://127.0.0.1:8000/capture-history.html) || rollback
+if ! grep -F 'Query capture history' <<<"$capture_history_html" >/dev/null; then
+    printf '%s\n' 'The served capture-history page is missing expected content.' >&2
+    rollback
+fi
+capture_history_js=$(curl --fail --silent --show-error http://127.0.0.1:8000/capture-history.js) || rollback
+if ! grep -F '/api/captures' <<<"$capture_history_js" >/dev/null; then
+    printf '%s\n' 'The served capture-history script is missing expected content.' >&2
+    rollback
+fi
+
+config_html=$(curl --fail --silent --show-error http://127.0.0.1:8000/config.html) || rollback
+if ! grep -F 'Time &amp; NTP' <<<"$config_html" >/dev/null; then
+    printf '%s\n' 'The served config page is missing expected content.' >&2
+    rollback
+fi
+config_js=$(curl --fail --silent --show-error http://127.0.0.1:8000/config.js) || rollback
+if ! grep -F '/api/timezones' <<<"$config_js" >/dev/null; then
+    printf '%s\n' 'The served config script is missing expected content.' >&2
+    rollback
+fi
+
+footer_js=$(curl --fail --silent --show-error http://127.0.0.1:8000/footer.js) || rollback
+if ! grep -F '/api/system/status' <<<"$footer_js" >/dev/null; then
+    printf '%s\n' 'The served footer script is missing expected content.' >&2
     rollback
 fi
 

@@ -9,7 +9,9 @@
 > section 1). Implementation history lives in
 > `worklogs/2026-09-18-capture-history-module.md`; this doc is the living
 > design record, updated as decisions are made or the design changes,
-> independent of any single dated worklog entry.
+> independent of any single dated worklog entry. §6's originally-deferred
+> dashboard query UI was implemented 2026-09-20 — see §7 and
+> `worklogs/2026-09-20-scheduler-phase2f-capture-history-page.md`.
 
 ## 1. Problem Statement
 
@@ -190,7 +192,8 @@ database.
       duration_ms INTEGER NOT NULL,
       bytes_total INTEGER NOT NULL,
       error TEXT,                     -- NULL on success
-      detail_json TEXT NOT NULL       -- full CaptureLogEntry, same as the .log.json file
+      detail_json TEXT NOT NULL,      -- full CaptureLogEntry, same as the .log.json file
+      triggered_by TEXT NOT NULL DEFAULT ''  -- ",slug-a,slug-b," (§7); added 2026-09-20, migrated in-place
   );
   CREATE INDEX IF NOT EXISTS idx_captures_captured_at ON captures(captured_at);
   CREATE INDEX IF NOT EXISTS idx_captures_success ON captures(success);
@@ -266,8 +269,9 @@ at whatever point Phase 9 is actually scheduled).
 ## 6. Non-Goals (v1)
 
 - No remote/Mac-side merged history database (see §3.2's closing note).
-- No UI work yet — this doc covers the data layer only. The dashboard
-  panel for querying this history is a separate, later effort.
+- ~~No UI work yet~~ — **resolved 2026-09-20, see §7.** The dashboard
+  panel for querying this history was originally scoped as a separate,
+  later effort; it now exists.
 - No dedicated writable partition for OverlayFS Phase 9 survival (§4,
   Option A decided) — a known, accepted, revisit-later tradeoff, not an
   oversight.
@@ -285,3 +289,33 @@ at whatever point Phase 9 is actually scheduled).
   until the simpler parts of this module have proven useful in practice.
 - No changes to `optic_camera`'s or `NativeCameraBackend`'s existing actor
   protocol, and no changes to `native_camera.rs` at all.
+
+## 7. Dashboard Query UI (implemented 2026-09-20)
+
+`GET /api/captures` (in `src/web.rs`) queries `CaptureLog::query`
+(`src/optic_capture_log.rs`) with an optional `source`, `profile`,
+`success`, `rule_slug`, `since`/`until` (unix ms, `captured_at`-inclusive),
+and `limit`/`offset` (default 50, clamped to 200 — same posture as the
+scheduler forecast's `hours` clamp, §8 of `docs/optic-daemon-scheduler.md`).
+It returns `{entries, total, limit, offset}`, where `entries` is a page of
+full `CaptureLogEntry` JSON (the same shape as each `.log.json` file and
+the `detail_json` column, reused rather than hand-picked into a second
+response shape) and `total` is the filtered count independent of the page
+size, for pagination controls.
+
+The `rule_slug` filter matches against a new `triggered_by` column: the
+row's `CaptureLogEntry.triggered_by` rule slugs, stored comma-padded
+(`,slug-a,slug-b,`) and matched with `LIKE '%,<slug>,%'` so a slug that's a
+substring of another rule's slug (`dawn` vs. `dawn-2`) can't false-match.
+A database created before this column existed is migrated forward
+in-place the next time `CaptureLog::open` runs (`ALTER TABLE ... ADD
+COLUMN`, guarded by a `PRAGMA table_info` check) — no fresh database or
+manual migration step required.
+
+`/capture-history.html` (+ `capture-history.js`) is a dedicated page, not
+a widget embedded in the dashboard or scheduler page: a filter form over
+the fields above, a paginated results table (time, source, triggering
+rule(s), profile, outcome, duration, bytes), and Newer/Older paging.
+Linked from the dashboard's system panel and the scheduler page header.
+See `worklogs/2026-09-20-scheduler-phase2f-capture-history-page.md` for
+the implementation and validation record.

@@ -18,16 +18,20 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     camera::{AppConfig, CaptureProfile, CaptureRequest, CaptureSource},
-    durable_state,
+    durable_state, ephemeris,
     optic_camera::OpticCamera,
     optic_capture_log::{CaptureLog, CaptureLogEntry},
 };
 
 /// Occurrences within this window of each other collapse into one physical
-/// capture (design doc §3.1). Chosen to be shorter than any real capture
-/// takes, so it's physically impossible for the sensor to have honored two
-/// occurrences this close together as separate shots anyway.
-pub const MERGE_WINDOW: Duration = Duration::seconds(5);
+/// capture (design doc §3.1). The doc originally proposed 5s on the
+/// assumption real captures are faster than that; measured data
+/// (`docs/optic-daemon-capture-performance.md`) shows real captures
+/// actually take ~5.1-5.6s end to end, right at that line — 10s gives real
+/// margin above the slowest measured profile (MasterArchive+DNG, ~5.46s)
+/// so two rules whose occurrences are genuinely close together still merge
+/// into one physical shot, not two, per user decision 2026-09-20.
+pub const MERGE_WINDOW: Duration = Duration::seconds(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScheduleRunState {
@@ -109,12 +113,95 @@ pub enum Trigger {
         days: RecurringDays,
         time: NaiveTime,
     },
-    // `Ephemeris` (Solar/Lunar/MilkyWay) is Phase 2+ — not part of this
-    // slice. See design doc §2 / the phase-1 worklog.
+    /// Fires at a Solar/Lunar/MilkyWay event, optionally offset — design
+    /// doc §2/§14. Requires `ScheduleConfig.station` to be set; a rule
+    /// using this trigger with no station configured produces zero
+    /// occurrences (same "dead rule" handling as an unsatisfiable
+    /// constraint, not an error — see `rule_occurrences`).
+    Ephemeris {
+        target: CelestialTarget,
+        /// Signed offset from the named event, in seconds (e.g. -1800 =
+        /// "30 minutes before"). `chrono::Duration` isn't directly
+        /// serde-friendly, so this is stored as the same kind of `_secs`
+        /// integer every other duration field in this file already uses.
+        #[serde(default)]
+        offset_secs: i64,
+    },
 }
 
 fn default_align_to_wall_clock() -> bool {
     true
+}
+
+/// Shared by every event taxonomy that can fire on either an upward or
+/// downward crossing of a threshold (design doc §2) — no longer
+/// solar-specific in practice (used by `SolarEvent::FixedElevation`,
+/// `MilkyWayEvent::CoreElevation`), so the name isn't either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CrossingDirection {
+    Rising,
+    Setting,
+    Both,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "event")]
+pub enum CelestialTarget {
+    Solar(SolarEvent),
+    Lunar(LunarEvent),
+    MilkyWay(MilkyWayEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SolarEvent {
+    SolarNoon,
+    Nadir,
+    Sunrise,
+    Sunset,
+    CivilDawn,
+    CivilDusk,
+    NauticalDawn,
+    NauticalDusk,
+    AstronomicalDawn,
+    AstronomicalDusk,
+    GoldenHourMorningStart,
+    GoldenHourMorningEnd,
+    GoldenHourEveningStart,
+    GoldenHourEveningEnd,
+    BlueHourMorningStart,
+    BlueHourMorningEnd,
+    BlueHourEveningStart,
+    BlueHourEveningEnd,
+    FixedElevation {
+        degrees: f64,
+        direction: CrossingDirection,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum LunarEvent {
+    Moonrise,
+    Moonset,
+    LunarTransit,
+    LunarAntitransit,
+    NewMoon,
+    FirstQuarter,
+    FullMoon,
+    LastQuarter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MilkyWayEvent {
+    CoreRise,
+    CoreSet,
+    CoreTransit,
+    CoreElevation {
+        degrees: f64,
+        direction: CrossingDirection,
+    },
+    Orientation {
+        azimuth_degrees: f64,
+    },
 }
 
 // Adjacent tagging (`content = "value"`), not pure internal tagging like
@@ -151,20 +238,118 @@ impl RecurringDays {
 /// redundant anyway — constraints are AND-composed (see `holds()`), so a
 /// second instance of a type could only narrow or exactly duplicate the
 /// first, never add anything a single range/window can't already express.
-/// Future Phase 2+ constraint types (`SunElevationWindow`,
-/// `MoonElevationWindow`, `MoonIlluminationWindow`,
-/// `MilkyWayElevationWindow` — design doc §2) get added here the same way,
-/// one field at a time, as each is actually implemented — not stubbed out
-/// in advance.
+/// `SunElevationWindow`/`MoonElevationWindow`/`MoonIlluminationWindow`/
+/// `MilkyWayElevationWindow` (design doc §2) were added here the same way
+/// `time_window` was — one named field at a time, each actually
+/// implemented rather than stubbed out in advance.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Constraints {
     pub time_window: Option<TimeWindow>,
+    pub sun_elevation_window: Option<SunElevationWindow>,
+    pub moon_elevation_window: Option<MoonElevationWindow>,
+    pub moon_illumination_window: Option<MoonIlluminationWindow>,
+    pub milky_way_elevation_window: Option<MilkyWayElevationWindow>,
 }
 
 impl Constraints {
-    fn holds(&self, when: DateTime<Tz>) -> bool {
+    /// `station` is only consulted by the four `*Window` constraints below
+    /// `time_window` — passed through even when `None` (rather than
+    /// requiring callers to skip calling `holds` at all) so a rule mixing
+    /// `time_window` with an elevation window still evaluates its
+    /// time-of-day half correctly on a schedule with no station
+    /// configured; the elevation half then simply can't hold (see each
+    /// window's own `holds`), the same "dead rule" treatment as any other
+    /// permanently-unsatisfiable constraint.
+    fn holds(&self, when: DateTime<Tz>, station: Option<&Station>) -> bool {
         self.time_window.as_ref().is_none_or(|c| c.holds(when))
+            && self
+                .sun_elevation_window
+                .as_ref()
+                .is_none_or(|c| c.holds(when, station))
+            && self
+                .moon_elevation_window
+                .as_ref()
+                .is_none_or(|c| c.holds(when, station))
+            && self
+                .moon_illumination_window
+                .as_ref()
+                .is_none_or(|c| c.holds(when))
+            && self
+                .milky_way_elevation_window
+                .as_ref()
+                .is_none_or(|c| c.holds(when, station))
+    }
+}
+
+/// Sun elevation angle, in degrees, that must hold for the constraint to
+/// pass — e.g. `{ -90, -6 }` = "astronomically dark or darker."
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SunElevationWindow {
+    pub min_deg: f64,
+    pub max_deg: f64,
+}
+
+impl SunElevationWindow {
+    fn holds(&self, when: DateTime<Tz>, station: Option<&Station>) -> bool {
+        let Some(station) = station else { return false };
+        let jd = ephemeris::julian_day(when.with_timezone(&Utc));
+        let elevation = ephemeris::elevation_deg(ephemeris::sun_equatorial(jd), station, jd);
+        elevation >= self.min_deg && elevation <= self.max_deg
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoonElevationWindow {
+    pub min_deg: f64,
+    pub max_deg: f64,
+}
+
+impl MoonElevationWindow {
+    fn holds(&self, when: DateTime<Tz>, station: Option<&Station>) -> bool {
+        let Some(station) = station else { return false };
+        let jd = ephemeris::julian_day(when.with_timezone(&Utc));
+        let elevation = ephemeris::elevation_deg(ephemeris::moon_equatorial(jd), station, jd);
+        elevation >= self.min_deg && elevation <= self.max_deg
+    }
+}
+
+/// Moon illuminated-fraction percentage (0.0-100.0) that must hold — e.g.
+/// `{ 0, 20 }` = "dark-sky window" (new moon through thin crescent).
+/// Unlike the three elevation windows, illumination doesn't depend on the
+/// observer's location at all (it's a Sun-Moon-Earth geometry fact), so
+/// this constraint holds regardless of whether a `Station` is configured.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MoonIlluminationWindow {
+    pub min_pct: f64,
+    pub max_pct: f64,
+}
+
+impl MoonIlluminationWindow {
+    fn holds(&self, when: DateTime<Tz>) -> bool {
+        let jd = ephemeris::julian_day(when.with_timezone(&Utc));
+        let pct = ephemeris::moon_illumination_pct(jd);
+        pct >= self.min_pct && pct <= self.max_pct
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MilkyWayElevationWindow {
+    pub min_deg: f64,
+    pub max_deg: f64,
+}
+
+impl MilkyWayElevationWindow {
+    fn holds(&self, when: DateTime<Tz>, station: Option<&Station>) -> bool {
+        let Some(station) = station else { return false };
+        let jd = ephemeris::julian_day(when.with_timezone(&Utc));
+        let elevation =
+            ephemeris::elevation_deg(ephemeris::milky_way_core_equatorial(jd), station, jd);
+        elevation >= self.min_deg && elevation <= self.max_deg
     }
 }
 
@@ -226,6 +411,101 @@ pub fn forecast(
     occurrences(schedule, from_utc.with_timezone(&tz), horizon)
 }
 
+/// Design doc §8's dead-rule advisory: any *enabled* rule that
+/// contributes to zero of `shots` — a likely misconfiguration (e.g. a
+/// `TimeWindow` and a `SunElevationWindow` that never both hold for this
+/// station), surfaced to the operator instead of silently producing
+/// nothing forever (§3.1).
+pub fn dead_rule_slugs(schedule: &ScheduleConfig, shots: &[ForecastedShot]) -> Vec<String> {
+    schedule
+        .rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .filter(|rule| {
+            !shots
+                .iter()
+                .any(|shot| shot.rule_slugs.iter().any(|slug| slug == &rule.slug))
+        })
+        .map(|rule| rule.slug.clone())
+        .collect()
+}
+
+/// One pair of enabled rules both "active" (each contributing at least
+/// one instant) over a shared span of time — design doc §3.1's "what
+/// merge+tag does not solve": two different cadences can both stay
+/// active for hours without any individual occurrence ever landing
+/// inside the same merge window as the other, so their *combined* rate
+/// over that shared span is higher than either rule's own stated rate,
+/// without ever showing up as a single merged, multi-tagged shot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OverlapAdvisory {
+    pub rule_slugs: [String; 2],
+    pub window_start: DateTime<Tz>,
+    pub window_end: DateTime<Tz>,
+    /// Count of each rule's own contributed instants that fall inside
+    /// `[window_start, window_end]`, summed — a shot both rules merged
+    /// into is counted once per rule, matching how "combined rate" reads
+    /// naturally (Weekday Baseline's own shots + Site Visit's own shots
+    /// in that window), not the count of distinct physical shots.
+    pub combined_shots: usize,
+}
+
+/// Every enabled-rule pair whose own contributed instants (read back out
+/// of the already-merged `shots`) overlap in time at all. Quadratic in
+/// rule count, which is fine — schedules have a handful of rules, not
+/// thousands.
+pub fn overlap_advisories(
+    schedule: &ScheduleConfig,
+    shots: &[ForecastedShot],
+) -> Vec<OverlapAdvisory> {
+    let enabled_slugs: Vec<&str> = schedule
+        .rules
+        .iter()
+        .filter(|rule| rule.enabled)
+        .map(|rule| rule.slug.as_str())
+        .collect();
+
+    let own_times = |slug: &str| -> Vec<DateTime<Tz>> {
+        shots
+            .iter()
+            .filter(|shot| shot.rule_slugs.iter().any(|s| s == slug))
+            .map(|shot| shot.at)
+            .collect()
+    };
+
+    let mut advisories = Vec::new();
+    for i in 0..enabled_slugs.len() {
+        for j in (i + 1)..enabled_slugs.len() {
+            let (a, b) = (enabled_slugs[i], enabled_slugs[j]);
+            let a_times = own_times(a);
+            let b_times = own_times(b);
+            let (Some(a_first), Some(a_last)) = (a_times.first(), a_times.last()) else {
+                continue;
+            };
+            let (Some(b_first), Some(b_last)) = (b_times.first(), b_times.last()) else {
+                continue;
+            };
+            let window_start = (*a_first).max(*b_first);
+            let window_end = (*a_last).min(*b_last);
+            if window_start >= window_end {
+                continue;
+            }
+            let combined_shots = a_times
+                .iter()
+                .chain(b_times.iter())
+                .filter(|at| **at >= window_start && **at <= window_end)
+                .count();
+            advisories.push(OverlapAdvisory {
+                rule_slugs: [a.to_owned(), b.to_owned()],
+                window_start,
+                window_end,
+                combined_shots,
+            });
+        }
+    }
+    advisories
+}
+
 /// The single implementation behind both "when should the actor wake up
 /// next" and the Shot Forecaster (design doc §3): deterministic, no I/O, no
 /// real clock reads — everything is a function of `schedule` and `from`.
@@ -241,14 +521,15 @@ pub fn occurrences(
 ) -> Vec<ForecastedShot> {
     let until = from + horizon;
     let tz = schedule.tz();
+    let station = schedule.station.as_ref();
 
     let mut raw: Vec<(DateTime<Tz>, &str)> = Vec::new();
     for rule in &schedule.rules {
         if !rule.enabled {
             continue;
         }
-        for when in rule_occurrences(&rule.trigger, tz, from, until) {
-            if rule.constraints.holds(when) {
+        for when in rule_occurrences(&rule.trigger, tz, station, from, until) {
+            if rule.constraints.holds(when, station) {
                 raw.push((when, rule.slug.as_str()));
             }
         }
@@ -261,6 +542,7 @@ pub fn occurrences(
 fn rule_occurrences(
     trigger: &Trigger,
     tz: Tz,
+    station: Option<&Station>,
     from: DateTime<Tz>,
     until: DateTime<Tz>,
 ) -> Vec<DateTime<Tz>> {
@@ -271,6 +553,210 @@ fn rule_occurrences(
         } => interval_occurrences(*every_secs, *align_to_wall_clock, from, until),
         Trigger::RecurringTime { days, time } => {
             recurring_time_occurrences(days, *time, tz, from, until)
+        }
+        Trigger::Ephemeris {
+            target,
+            offset_secs,
+        } => {
+            // No station configured: a dead rule, same treatment as any
+            // other permanently-unsatisfiable trigger/constraint — zero
+            // occurrences, not an error (design doc §3.1's dead-rule
+            // handling).
+            let Some(station) = station else {
+                return Vec::new();
+            };
+            ephemeris_occurrences(
+                target,
+                *offset_secs,
+                station,
+                from.with_timezone(&Utc),
+                until.with_timezone(&Utc),
+            )
+            .into_iter()
+            .map(|utc| utc.with_timezone(&tz))
+            .collect()
+        }
+    }
+}
+
+/// Dispatches a `CelestialTarget` to the right `ephemeris` search
+/// primitive. Every named event maps to either a threshold-crossing
+/// search (rise/set/named-twilight-tier/fixed-elevation/orientation) or an
+/// extremum search (transit/antitransit) over the same underlying
+/// elevation (or azimuth) function — see `ephemeris`'s module doc for why
+/// those two primitives are enough for all three taxonomies.
+///
+/// `pub(crate)`: also used directly by `web.rs`'s Config-page celestial
+/// preview (`GET /api/celestial-preview`), which needs one-off
+/// next-occurrence lookups for an ad-hoc (possibly not-yet-saved)
+/// `Station` — not a `Rule`/`Trigger`, so it calls this shared primitive
+/// straight rather than going through `occurrences()`'s schedule-level
+/// machinery.
+pub(crate) fn ephemeris_occurrences(
+    target: &CelestialTarget,
+    offset_secs: i64,
+    station: &Station,
+    from: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    // A signed offset shifts the *search window* by the same amount in
+    // the opposite direction, then shifts results back — simpler and
+    // exactly equivalent to shifting each found instant after the fact,
+    // and correctly still finds an event whose un-offset instant falls
+    // just outside `[from, until]` but whose offset instant belongs
+    // inside it.
+    let offset = Duration::seconds(offset_secs);
+    let search_from = from - offset;
+    let search_until = until - offset;
+
+    let raw = match target {
+        CelestialTarget::Solar(event) => {
+            solar_occurrences(*event, station, search_from, search_until)
+        }
+        CelestialTarget::Lunar(event) => {
+            lunar_occurrences(*event, station, search_from, search_until)
+        }
+        CelestialTarget::MilkyWay(event) => {
+            milky_way_occurrences(event, station, search_from, search_until)
+        }
+    };
+    raw.into_iter().map(|t| t + offset).collect()
+}
+
+fn sun_elevation_at(station: &Station) -> impl Fn(DateTime<Utc>) -> f64 + '_ {
+    move |t| {
+        let jd = ephemeris::julian_day(t);
+        ephemeris::elevation_deg(ephemeris::sun_equatorial(jd), station, jd)
+    }
+}
+
+fn moon_elevation_at(station: &Station) -> impl Fn(DateTime<Utc>) -> f64 + '_ {
+    move |t| {
+        let jd = ephemeris::julian_day(t);
+        ephemeris::elevation_deg(ephemeris::moon_equatorial(jd), station, jd)
+    }
+}
+
+fn milky_way_elevation_at(station: &Station) -> impl Fn(DateTime<Utc>) -> f64 + '_ {
+    move |t| {
+        let jd = ephemeris::julian_day(t);
+        ephemeris::elevation_deg(ephemeris::milky_way_core_equatorial(jd), station, jd)
+    }
+}
+
+fn solar_occurrences(
+    event: SolarEvent,
+    station: &Station,
+    from: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    use CrossingDirection as Dir;
+    let elevation = sun_elevation_at(station);
+    let (threshold, direction) = match event {
+        SolarEvent::Sunrise => (-0.8333, Dir::Rising),
+        SolarEvent::Sunset => (-0.8333, Dir::Setting),
+        SolarEvent::CivilDawn => (-6.0, Dir::Rising),
+        SolarEvent::CivilDusk => (-6.0, Dir::Setting),
+        SolarEvent::NauticalDawn => (-12.0, Dir::Rising),
+        SolarEvent::NauticalDusk => (-12.0, Dir::Setting),
+        SolarEvent::AstronomicalDawn => (-18.0, Dir::Rising),
+        SolarEvent::AstronomicalDusk => (-18.0, Dir::Setting),
+        SolarEvent::GoldenHourMorningStart => (-4.0, Dir::Rising),
+        SolarEvent::GoldenHourMorningEnd => (6.0, Dir::Rising),
+        SolarEvent::GoldenHourEveningStart => (6.0, Dir::Setting),
+        SolarEvent::GoldenHourEveningEnd => (-4.0, Dir::Setting),
+        SolarEvent::BlueHourMorningStart => (-6.0, Dir::Rising),
+        SolarEvent::BlueHourMorningEnd => (-4.0, Dir::Rising),
+        SolarEvent::BlueHourEveningStart => (-4.0, Dir::Setting),
+        SolarEvent::BlueHourEveningEnd => (-6.0, Dir::Setting),
+        SolarEvent::FixedElevation { degrees, direction } => (degrees, direction),
+        SolarEvent::SolarNoon => return ephemeris::find_extrema(from, until, true, elevation),
+        SolarEvent::Nadir => return ephemeris::find_extrema(from, until, false, elevation),
+    };
+    ephemeris::find_crossings(from, until, threshold, direction, elevation)
+}
+
+fn lunar_occurrences(
+    event: LunarEvent,
+    station: &Station,
+    from: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    match event {
+        LunarEvent::Moonrise => {
+            ephemeris::find_crossings(from, until, 0.0, CrossingDirection::Rising, |t| {
+                let jd = ephemeris::julian_day(t);
+                ephemeris::elevation_deg(ephemeris::moon_equatorial(jd), station, jd)
+                    - ephemeris::moon_rise_set_altitude_deg(jd)
+            })
+        }
+        LunarEvent::Moonset => {
+            ephemeris::find_crossings(from, until, 0.0, CrossingDirection::Setting, |t| {
+                let jd = ephemeris::julian_day(t);
+                ephemeris::elevation_deg(ephemeris::moon_equatorial(jd), station, jd)
+                    - ephemeris::moon_rise_set_altitude_deg(jd)
+            })
+        }
+        LunarEvent::LunarTransit => {
+            ephemeris::find_extrema(from, until, true, moon_elevation_at(station))
+        }
+        LunarEvent::LunarAntitransit => {
+            ephemeris::find_extrema(from, until, false, moon_elevation_at(station))
+        }
+        LunarEvent::NewMoon => {
+            ephemeris::lunar_phase_occurrences(ephemeris::LunarPhase::New, from, until)
+        }
+        LunarEvent::FirstQuarter => {
+            ephemeris::lunar_phase_occurrences(ephemeris::LunarPhase::First, from, until)
+        }
+        LunarEvent::FullMoon => {
+            ephemeris::lunar_phase_occurrences(ephemeris::LunarPhase::Full, from, until)
+        }
+        LunarEvent::LastQuarter => {
+            ephemeris::lunar_phase_occurrences(ephemeris::LunarPhase::Last, from, until)
+        }
+    }
+}
+
+fn milky_way_occurrences(
+    event: &MilkyWayEvent,
+    station: &Station,
+    from: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    use CrossingDirection as Dir;
+    match *event {
+        // Same -0.5667° refraction threshold `astro::transit` uses for a
+        // star/planet rise/set — the core is, geometrically, exactly that.
+        MilkyWayEvent::CoreRise => ephemeris::find_crossings(
+            from,
+            until,
+            -0.5667,
+            Dir::Rising,
+            milky_way_elevation_at(station),
+        ),
+        MilkyWayEvent::CoreSet => ephemeris::find_crossings(
+            from,
+            until,
+            -0.5667,
+            Dir::Setting,
+            milky_way_elevation_at(station),
+        ),
+        MilkyWayEvent::CoreTransit => {
+            ephemeris::find_extrema(from, until, true, milky_way_elevation_at(station))
+        }
+        MilkyWayEvent::CoreElevation { degrees, direction } => ephemeris::find_crossings(
+            from,
+            until,
+            degrees,
+            direction,
+            milky_way_elevation_at(station),
+        ),
+        MilkyWayEvent::Orientation { azimuth_degrees } => {
+            ephemeris::find_azimuth_crossings(from, until, azimuth_degrees, move |t| {
+                let jd = ephemeris::julian_day(t);
+                ephemeris::azimuth_deg(ephemeris::milky_way_core_equatorial(jd), station, jd)
+            })
         }
     }
 }
@@ -725,14 +1211,20 @@ async fn fire_capture(
     config: &AppConfig,
     shot: &ForecastedShot,
 ) -> LastCapture {
-    // MasterArchive/Binning2k force their own DNG policy regardless of the
-    // committed preference (`validate_raw_policy`); only Dci4k actually
-    // reads it. Computed this way, rather than trusting `config.save_dng`
-    // outright, so a scheduled capture can never violate that policy.
+    // Binning2k forces its own DNG policy regardless of the committed
+    // preference (`validate_raw_policy` rejects it outright). MasterArchive
+    // and Dci4k both read `config.save_dng` — as of 2026-09-20,
+    // `POST /api/config/save-dng` gives the dashboard's DNG checkbox a real
+    // staged/committed path (it previously only fed a one-off manual
+    // `CaptureRequest`, never persisted config — reading `config.save_dng`
+    // for MasterArchive before that endpoint existed would have silently
+    // dropped the DNG from every scheduled frame, since the field could
+    // never actually be set to `true`). Now that the field is genuinely
+    // settable, a scheduled Master Archive capture respects whatever was
+    // last saved, same as every other camera setting already does.
     let save_dng = match config.profile {
-        CaptureProfile::MasterArchive => true,
         CaptureProfile::Binning2k => false,
-        CaptureProfile::Dci4k => config.save_dng,
+        CaptureProfile::MasterArchive | CaptureProfile::Dci4k => config.save_dng,
     };
     let request = CaptureRequest {
         settings: config.settings.clone(),
@@ -742,12 +1234,13 @@ async fn fire_capture(
             rule_slugs: shot.rule_slugs.clone(),
         },
     };
+    let source = request.source.clone();
     let requested_at = std::time::SystemTime::now();
     let result = camera.capture_to_stage(capture_dir, request).await;
     let completed_at = std::time::SystemTime::now();
 
     if let Some(capture_log) = capture_log {
-        let mut entry = CaptureLogEntry::new(
+        let entry = CaptureLogEntry::new(
             requested_at,
             completed_at,
             completed_at
@@ -757,9 +1250,9 @@ async fn fire_capture(
             config.profile,
             config.settings.clone(),
             save_dng,
+            &source,
             &result,
         );
-        entry.source = "scheduler".to_owned();
         capture_log.record(entry).await;
     }
 
@@ -1029,7 +1522,7 @@ mod tests {
     fn merge_keeps_occurrences_outside_the_window_separate() {
         let raw = vec![
             (utc(2026, 1, 1, 10, 5, 0), "a"),
-            (utc(2026, 1, 1, 10, 5, 6), "b"), // 6s > 5s MERGE_WINDOW
+            (utc(2026, 1, 1, 10, 5, 11), "b"), // 11s > 10s MERGE_WINDOW
         ];
         let shots = merge(raw);
         assert_eq!(shots.len(), 2);
@@ -1039,7 +1532,7 @@ mod tests {
 
     #[test]
     fn merge_collapses_a_single_fast_rule_with_itself() {
-        // A 2s interval is faster than MERGE_WINDOW (5s) — deliberately
+        // A 2s interval is faster than MERGE_WINDOW (10s) — deliberately
         // merges with itself, per the doc comment on `merge()`.
         let raw = vec![
             (utc(2026, 1, 1, 10, 0, 0), "fast"),
@@ -1074,12 +1567,132 @@ mod tests {
                         start: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
                         end: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
                     }),
+                    ..Default::default()
                 },
             }],
         };
         let from = utc(2026, 1, 1, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::days(2));
         assert!(shots.is_empty());
+    }
+
+    #[test]
+    fn dead_rule_slugs_flags_only_enabled_rules_with_zero_contributed_shots() {
+        let dead = Rule {
+            constraints: Constraints {
+                time_window: Some(TimeWindow {
+                    days: RecurringDays::Every,
+                    start: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+                    end: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+                }),
+                ..Default::default()
+            },
+            ..rule("dead", interval(60, true))
+        };
+        let mut disabled_dead = dead.clone();
+        disabled_dead.id = "disabled-dead".into();
+        disabled_dead.slug = "disabled-dead".into();
+        disabled_dead.enabled = false;
+        let alive = rule("alive", interval(300, true));
+        let schedule = ScheduleConfig {
+            station: None,
+            rules: vec![dead, disabled_dead, alive],
+        };
+        let from = utc(2026, 1, 1, 0, 0, 0);
+        let shots = occurrences(&schedule, from, Duration::hours(1));
+
+        // Only the *enabled* dead rule is flagged — a disabled rule
+        // producing zero shots is expected, not a misconfiguration to
+        // warn about.
+        assert_eq!(dead_rule_slugs(&schedule, &shots), vec!["dead".to_owned()]);
+    }
+
+    #[test]
+    fn overlap_advisories_finds_nothing_for_rules_with_disjoint_time_windows() {
+        // Design doc §4's own worked example: Peak/Off hours rules
+        // partition the day cleanly via non-overlapping `TimeWindow`
+        // constraints, so their occurrence ranges never overlap at all —
+        // the case the advisory must correctly report nothing for.
+        let morning = Rule {
+            constraints: Constraints {
+                time_window: Some(TimeWindow {
+                    days: RecurringDays::Every,
+                    start: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
+                    end: NaiveTime::from_hms_opt(12, 0, 0).unwrap(),
+                }),
+                ..Default::default()
+            },
+            ..rule("morning-only", interval(300, true))
+        };
+        let evening = Rule {
+            constraints: Constraints {
+                time_window: Some(TimeWindow {
+                    days: RecurringDays::Every,
+                    start: NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
+                    end: NaiveTime::from_hms_opt(22, 0, 0).unwrap(),
+                }),
+                ..Default::default()
+            },
+            ..rule("evening-only", interval(300, true))
+        };
+        let schedule = ScheduleConfig {
+            station: None,
+            rules: vec![morning, evening],
+        };
+        let from = utc(2026, 1, 1, 0, 0, 0);
+        let shots = occurrences(&schedule, from, Duration::hours(24));
+        assert!(!shots.is_empty());
+        assert!(overlap_advisories(&schedule, &shots).is_empty());
+    }
+
+    #[test]
+    fn overlap_advisories_reports_a_shared_span_for_two_sustained_different_cadence_rules() {
+        // Mirrors design doc §3.1's own example: a 5-minute-cadence
+        // "baseline" rule and a 30-second-cadence "site visit" rule, both
+        // active over the same hour — most of their individual instants
+        // land more than MERGE_WINDOW (10s) apart, so they stay
+        // separately attributed (no single merged, multi-tagged shot),
+        // but the combined rate over their shared span is visibly higher
+        // than either alone — exactly what the merge+tag mechanism does
+        // *not* surface on its own (§3.1's "what this does not solve").
+        let schedule = ScheduleConfig {
+            station: None,
+            rules: vec![
+                rule("baseline", interval(300, true)),
+                rule("site-visit", interval(30, true)),
+            ],
+        };
+        let from = utc(2026, 1, 1, 10, 0, 0);
+        let shots = occurrences(&schedule, from, Duration::minutes(30));
+
+        let advisories = overlap_advisories(&schedule, &shots);
+        assert_eq!(advisories.len(), 1);
+        let advisory = &advisories[0];
+        assert_eq!(
+            advisory.rule_slugs,
+            ["baseline".to_owned(), "site-visit".to_owned()]
+        );
+        assert!(advisory.window_start < advisory.window_end);
+        // "baseline" contributes at most 6 shots across the *entire*
+        // 30-minute horizon (5-minute cadence) — so any count clearly
+        // above that within the (narrower) overlap window can only come
+        // from "site-visit"'s much faster 30s cadence also contributing,
+        // which is exactly the "combined rate exceeds either rule alone"
+        // signal this advisory exists to surface.
+        assert!(advisory.combined_shots > 6);
+    }
+
+    #[test]
+    fn overlap_advisories_ignores_disabled_rules() {
+        let mut disabled = rule("site-visit", interval(30, true));
+        disabled.enabled = false;
+        let schedule = ScheduleConfig {
+            station: None,
+            rules: vec![rule("baseline", interval(300, true)), disabled],
+        };
+        let from = utc(2026, 1, 1, 10, 0, 0);
+        let shots = occurrences(&schedule, from, Duration::minutes(30));
+        assert!(overlap_advisories(&schedule, &shots).is_empty());
     }
 
     #[test]
@@ -1200,6 +1813,7 @@ mod tests {
                 start: NaiveTime::from_hms_opt(8, 0, 0).unwrap(),
                 end: NaiveTime::from_hms_opt(18, 0, 0).unwrap(),
             }),
+            ..Default::default()
         };
         let json = serde_json::to_string(&original).expect("Rule must serialize");
         let parsed: Rule = serde_json::from_str(&json).expect("Rule must round-trip");

@@ -35,6 +35,26 @@ pub struct SystemStatus {
     pub uptime_seconds: u64,
     pub cpu_temp_celsius: Option<f32>,
     pub network_interfaces: Vec<NetworkInterfaceStatus>,
+    pub time_sync: Option<TimeSyncStatus>,
+    /// The system clock's current reading — a plain `chrono::Utc::now()`,
+    /// not sourced from `timedatectl` and not gated behind `time_sync`
+    /// being `Some` (unlike the NTP/timezone fields, "what time is it"
+    /// needs no platform-specific tool and is always available, including
+    /// on non-Linux dev targets). The footer formats this in the
+    /// system's own timezone (`time_sync.timezone` when present) rather
+    /// than the viewer's browser timezone, since the whole point is
+    /// showing what the *Pi* thinks the time is.
+    pub now: chrono::DateTime<chrono::Utc>,
+}
+
+/// `timedatectl show`'s view of the system clock, for the Config page's
+/// Time & NTP section. `None` on a platform without `timedatectl`
+/// (non-Linux dev targets), same posture as `cpu_temp_celsius`.
+#[derive(Debug, Serialize)]
+pub struct TimeSyncStatus {
+    pub timezone: String,
+    pub ntp_enabled: bool,
+    pub synchronized: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -97,6 +117,8 @@ impl SystemStatusReader {
             network_interfaces: tokio::task::spawn_blocking(network_interfaces)
                 .await
                 .unwrap_or_default(),
+            time_sync: time_sync_status().await,
+            now: chrono::Utc::now(),
         }
     }
 
@@ -217,6 +239,62 @@ fn parse_vcgencmd_temp(text: &str) -> Option<f32> {
         .ok()
 }
 
+#[cfg(target_os = "linux")]
+async fn time_sync_status() -> Option<TimeSyncStatus> {
+    let output = Command::new("timedatectl")
+        .args([
+            "show",
+            "-p",
+            "Timezone",
+            "-p",
+            "NTP",
+            "-p",
+            "NTPSynchronized",
+        ])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_timedatectl_show(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn time_sync_status() -> Option<TimeSyncStatus> {
+    None
+}
+
+/// Parses `timedatectl show`'s `Key=Value`-per-line output (not the
+/// `--value`-only form, which drops the keys and relies on request
+/// ordering — the safer format to parse even though it's marginally more
+/// code). Real captured output looks like:
+/// ```text
+/// Timezone=America/Vancouver
+/// NTP=yes
+/// NTPSynchronized=yes
+/// ```
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_timedatectl_show(text: &str) -> Option<TimeSyncStatus> {
+    let mut timezone = None;
+    let mut ntp_enabled = None;
+    let mut synchronized = None;
+    for line in text.lines() {
+        let (key, value) = line.split_once('=')?;
+        match key {
+            "Timezone" => timezone = Some(value.to_owned()),
+            "NTP" => ntp_enabled = Some(value == "yes"),
+            "NTPSynchronized" => synchronized = Some(value == "yes"),
+            _ => {}
+        }
+    }
+    Some(TimeSyncStatus {
+        timezone: timezone?,
+        ntp_enabled: ntp_enabled?,
+        synchronized: synchronized?,
+    })
+}
+
 /// Reboots the host via `systemctl reboot`, which talks to systemd/logind
 /// over D-Bus (no sudo, no setuid). Requires the scoped PolicyKit rule
 /// granting the invoking user `org.freedesktop.login1.reboot` without
@@ -235,6 +313,65 @@ pub async fn reboot_host() -> std::io::Result<()> {
     } else {
         Err(std::io::Error::other(format!(
             "reboot command exited with {status}"
+        )))
+    }
+}
+
+/// Forces an immediate NTP resync via `systemctl restart
+/// systemd-timesyncd.service` — the only real lever available:
+/// `systemd-timesyncd`'s own D-Bus interface
+/// (`org.freedesktop.timesync1.Manager`) exposes `SetRuntimeNTPServers`
+/// but no "resync now" method. Restarting a unit needs the broad
+/// `org.freedesktop.systemd1.manage-units` PolicyKit action, which (like
+/// `reboot_host`'s `org.freedesktop.login1.reboot`) the sandboxed daemon
+/// can't authenticate via `sudo` — same private-user-namespace reason
+/// documented on `reboot_host`. Rather than grant that broad action
+/// wholesale, the installed PolicyKit rule
+/// (`/etc/polkit-1/rules.d/61-optic-daemon-ntp-sync.rules`, host config,
+/// outside this repo) is scoped to exactly this one unit + the `restart`
+/// verb — confirmed live before this function was written (both that it
+/// authorizes this exact call and that it correctly denies a restart of
+/// any other unit), see `worklogs/2026-09-20-scheduler-phase2i-config-page-station-ntp-timezone.md`.
+pub async fn sync_ntp_now() -> std::io::Result<()> {
+    let status = Command::new("systemctl")
+        .arg("restart")
+        .arg("systemd-timesyncd.service")
+        .status()
+        .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "systemd-timesyncd restart exited with {status}"
+        )))
+    }
+}
+
+/// Sets the system timezone via `timedatectl set-timezone`, which talks
+/// to `org.freedesktop.timedate1.Manager.SetTimezone` over D-Bus (no
+/// sudo). Unlike `sync_ntp_now`, this has its own narrowly-scoped
+/// PolicyKit action already (`org.freedesktop.timedate1.set-timezone`) —
+/// no need to grant the broad `manage-units` action and detail-match a
+/// unit name. Requires the installed PolicyKit rule
+/// (`/etc/polkit-1/rules.d/62-optic-daemon-set-timezone.rules`, host
+/// config, outside this repo) granting the daemon's user that one action
+/// — confirmed live before this function was written, see
+/// `worklogs/2026-09-20-scheduler-phase2i-config-page-station-ntp-timezone.md`.
+/// Called from the Config page's "Save station" flow (user's explicit
+/// choice — keep the Station's timezone and the Pi's system clock in
+/// sync, rather than treating them as independent), not from every
+/// config commit.
+pub async fn set_system_timezone(timezone: &str) -> std::io::Result<()> {
+    let status = Command::new("timedatectl")
+        .arg("set-timezone")
+        .arg(timezone)
+        .status()
+        .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "timedatectl set-timezone exited with {status}"
         )))
     }
 }
@@ -295,6 +432,29 @@ mod tests {
         assert_eq!(parse_vcgencmd_temp("garbage"), None);
     }
 
+    #[test]
+    fn timedatectl_show_parses_real_output_format() {
+        let status =
+            parse_timedatectl_show("Timezone=America/Vancouver\nNTP=yes\nNTPSynchronized=yes\n")
+                .unwrap();
+        assert_eq!(status.timezone, "America/Vancouver");
+        assert!(status.ntp_enabled);
+        assert!(status.synchronized);
+    }
+
+    #[test]
+    fn timedatectl_show_reflects_ntp_disabled_and_unsynchronized() {
+        let status = parse_timedatectl_show("Timezone=UTC\nNTP=no\nNTPSynchronized=no\n").unwrap();
+        assert!(!status.ntp_enabled);
+        assert!(!status.synchronized);
+    }
+
+    #[test]
+    fn timedatectl_show_rejects_output_missing_expected_keys() {
+        assert!(parse_timedatectl_show("garbage").is_none());
+        assert!(parse_timedatectl_show("Timezone=UTC\n").is_none());
+    }
+
     #[tokio::test]
     async fn cpu_temp_is_none_on_non_linux_dev_targets() {
         // This test only asserts the behavior actually exercised on the
@@ -343,5 +503,9 @@ mod tests {
             !status.network_interfaces.is_empty(),
             "expected at least one non-loopback network interface on the dev machine"
         );
+        // `now` is a plain `Utc::now()` read, not derived from anything
+        // else in the snapshot — a regression that left it at a fixed/
+        // default value would otherwise pass every other assertion here.
+        assert!((chrono::Utc::now() - status.now).num_seconds().abs() < 5);
     }
 }

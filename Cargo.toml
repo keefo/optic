@@ -6,6 +6,7 @@ license = "MIT"
 description = "Project Optic camera control daemon"
 
 [dependencies]
+astro = "2"
 async-stream = "0.3"
 axum = { version = "0.8", features = ["json"] }
 bytes = "1"

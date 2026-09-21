@@ -145,9 +145,6 @@ impl CaptureProfile {
 
     pub(crate) fn validate_raw_policy(self, save_dng: bool) -> Result<(), CameraError> {
         match (self, save_dng) {
-            (Self::MasterArchive, false) => Err(CameraError::Invalid(
-                "Master Archive requires a companion DNG",
-            )),
             (Self::Binning2k, true) => Err(CameraError::Invalid(
                 "2K Binning does not support companion DNG capture",
             )),
@@ -372,6 +369,8 @@ mod tests {
 
     #[test]
     fn capture_profiles_enforce_raw_policy() {
+        // Master Archive's DNG is a default, not a requirement — 2026-09-20,
+        // at the user's explicit request to be able to uncheck it.
         assert!(
             CaptureProfile::MasterArchive
                 .validate_raw_policy(true)
@@ -380,7 +379,7 @@ mod tests {
         assert!(
             CaptureProfile::MasterArchive
                 .validate_raw_policy(false)
-                .is_err()
+                .is_ok()
         );
         assert!(CaptureProfile::Dci4k.validate_raw_policy(false).is_ok());
         assert!(CaptureProfile::Dci4k.validate_raw_policy(true).is_ok());

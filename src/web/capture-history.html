@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Capture History — Project Optic</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/capture-history.js" defer></script>
+  <script src="/footer.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand">
+      <img class="brand-icon" src="/icon.svg" alt="" width="48" height="48">
+      <div>
+        <p class="eyebrow">PROJECT OPTIC</p>
+        <h2>Capture History</h2>
+      </div>
+    </div>
+  </header>
+
+  <nav class="app-tabs" aria-label="Primary">
+    <a href="/">Dashboard</a>
+    <a href="/scheduler.html">Scheduler</a>
+    <a href="/capture-history.html" aria-current="page">Capture History</a>
+    <a href="/config.html">Config</a>
+  </nav>
+
+  <main class="capture-history-main">
+    <section class="capture-filters-card" aria-labelledby="filters-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">FILTERS</p>
+          <h2 id="filters-title">Query capture history</h2>
+        </div>
+      </div>
+      <form id="filters-form" class="station-grid">
+        <label>
+          <span>Quick range</span>
+          <select id="filter-quick-range">
+            <option value="">Custom / Any</option>
+            <option value="1">Last hour</option>
+            <option value="6">Last 6 hours</option>
+            <option value="24">Last 24 hours</option>
+            <option value="168">Last 7 days</option>
+            <option value="720">Last 30 days</option>
+          </select>
+        </label>
+        <label>
+          <span>Source</span>
+          <select id="filter-source">
+            <option value="">Any</option>
+            <option value="web_ui">Web UI</option>
+            <option value="scheduler">Scheduler</option>
+          </select>
+        </label>
+        <label>
+          <span>Profile</span>
+          <select id="filter-profile">
+            <option value="">Any</option>
+            <option value="master_archive">Master Archive</option>
+            <option value="dci_4k">4K DCI Widescreen</option>
+            <option value="binning_2k">2K Binning</option>
+          </select>
+        </label>
+        <label>
+          <span>Outcome</span>
+          <select id="filter-success">
+            <option value="">Any</option>
+            <option value="true">Success</option>
+            <option value="false">Failure</option>
+          </select>
+        </label>
+        <label>
+          <span>Triggering rule slug</span>
+          <input id="filter-rule-slug" type="text" placeholder="e.g. dawn">
+        </label>
+        <label>
+          <span>Captured after</span>
+          <input id="filter-since" type="datetime-local">
+        </label>
+        <label>
+          <span>Captured before</span>
+          <input id="filter-until" type="datetime-local">
+        </label>
+      </form>
+      <div class="button-row margin-top-10">
+        <button id="apply-filters" class="accent" type="button">Apply filters</button>
+        <button id="reset-filters" class="text-button" type="button">Reset</button>
+      </div>
+      <p id="filters-notice" class="notice" role="status"></p>
+    </section>
+
+    <section class="capture-results-card" aria-labelledby="results-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">RESULTS</p>
+          <h2 id="results-title">Captures</h2>
+        </div>
+        <span id="results-summary" class="muted">—</span>
+      </div>
+      <table class="forecast-table">
+        <thead>
+          <tr>
+            <th>When</th>
+            <th>Source</th>
+            <th>Rule(s)</th>
+            <th>Profile</th>
+            <th>Outcome</th>
+            <th>Duration</th>
+            <th>Bytes</th>
+          </tr>
+        </thead>
+        <tbody id="results-body">
+          <tr><td colspan="7" class="empty-state">Loading&hellip;</td></tr>
+        </tbody>
+      </table>
+      <div class="button-row margin-top-10">
+        <button id="prev-page" type="button" disabled>&larr; Newer</button>
+        <span id="page-indicator" class="muted">—</span>
+        <button id="next-page" type="button" disabled>Older &rarr;</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="system-footer">
+    <span id="footer-summary" class="muted">Loading system status&hellip;</span>
+    <div class="button-row">
+      <button id="footer-restart-daemon" type="button">Restart daemon</button>
+      <button id="footer-reboot" class="bad" type="button">Reboot Pi</button>
+    </div>
+  </footer>
+</body>
+</html>

@@ -668,18 +668,41 @@ concurrency style.
   /api/status` — reading the §2.1 tmpfs cache, never the SD card
   directly, same as every other frequent read.
 
-## 6. DNG: Follows the Configured Profile (Confirmed)
+## 6. DNG: Follows the Committed Preference (Confirmed; revised 2026-09-20, twice)
 
-Scheduled captures request DNG exactly according to whatever the
-currently committed `CaptureProfile` already dictates
-(`validate_raw_policy` in `src/camera.rs`): `MasterArchive` always
-includes a DNG (mandatory), `Binning2k` never does (forbidden), `Dci4k`
-follows whatever `settings.save_dng` is currently set to. There is no
-separate "scheduler DNG" toggle. This is confirmed by the user, not a
-default needing revisiting — but it means the Storage Forecaster (§8)
-must surface a clear warning when `MasterArchive` (mandatory DNG, ~30 MB/
-shot measured) is paired with an aggressive rule set, since that
-combination is what actually drives tmpfs risk.
+Scheduled captures request DNG according to a per-profile policy in
+`optic_scheduler.rs::fire_capture`:
+
+- `Binning2k` never includes a DNG — `validate_raw_policy` (`src/camera.rs`)
+  forbids it outright, unchanged all along.
+- `MasterArchive` and `Dci4k` both read the committed `AppConfig.save_dng`
+  — i.e. a scheduled capture uses whatever was last **saved** on the
+  dashboard, exactly like every other camera setting (`profile`,
+  `settings`) already works. `MasterArchive`'s companion DNG changed from
+  mandatory to a default-on preference earlier the same night
+  (`validate_raw_policy` no longer rejects `save_dng: false` for it), and
+  briefly (within this same session) `fire_capture` kept it hardcoded
+  `true` regardless of `config.save_dng` — because at that point nothing
+  in the UI could actually *set* `AppConfig.save_dng` to anything but its
+  `false` default, so reading it would have silently dropped the DNG from
+  every scheduled frame. That gap is now closed:
+  `POST /api/config/save-dng` (`src/web.rs`) gives the dashboard's DNG
+  checkbox a real staged/committed path (its own endpoint, not piggybacked
+  on `reconfigure_stream`, since saving a DNG has nothing to do with the
+  live preview pipeline and that path only stages while a preview is
+  actually running). With that in place, reading `config.save_dng` for
+  `MasterArchive` is safe and correct — "Save Settings" now means the
+  same thing for every setting, DNG included.
+
+There is no separate "scheduler DNG" toggle — it's the same committed
+preference the dashboard checkbox stages. This means the Storage
+Forecaster (§8) must surface a clear warning when `MasterArchive` with
+DNG enabled (~30 MB/shot measured) is paired with an aggressive rule
+set, since that combination is what actually drives tmpfs risk; unlike
+before, that combination is no longer unconditional — a user who saved
+`save_dng: false` for Master Archive gets the smaller (~7.8 MB/shot)
+estimate instead, same as the forecast already computes per
+`web.rs::estimated_bytes_per_shot`.
 
 ## 7. Full-Disk Behavior — Resolved
 
@@ -964,24 +987,76 @@ which is done. `CaptureRequest` gained a `source: CaptureSource` field
 `publish_capture` — the one place that actually names the file — can
 make this decision directly, rather than threading it through as a
 separate parameter. `optic_capture_log.rs::derive_capture_id` needed no
-change (confirmed it treats the whole basename as opaque). Not done:
-`optic_capture_log.rs::failure_capture_id` (the synthetic ID minted only
-when a capture *fails*, so no real file exists) still always says
-`testshot-` regardless of source — cosmetic-only, doesn't reach
-`optic_sync` since there's no real file, left as a minor follow-up. Also
-not done: this doc's own suggestion (above) that the capture-log record
-carry the tag list as structured data (`triggered_by: Vec<String>`) — the
-`source` field there is still a plain string; a separate enhancement if
-ever needed, not required for the filename fix.
+change (confirmed it treats the whole basename as opaque). Both items
+originally left as follow-up here are now also done (2026-09-20, same
+session as the Phase 2 work below):
+`optic_capture_log.rs::failure_capture_id` now takes the real
+`CaptureSource` and mints a `scheduler-`-prefixed synthetic id for a
+scheduler-sourced failure (previously always `testshot-` regardless of
+source), and `CaptureLogEntry` gained a `triggered_by: Vec<String>`
+field (empty for `WebUi`, the firing rule slugs for `Scheduler`) —
+`#[serde(default)]` so old `.log.json` files/database rows written
+before this field existed still deserialize.
 
-1. **New dependencies** (§11) — confirm `chrono`/`chrono-tz`, a solar
-   crate, and now a *separate* lunar ephemeris/phase crate (unresearched)
-   are acceptable additions (none currently in `Cargo.toml`). MilkyWay
-   likely needs none of these (§2/§11 implementation notes).
-2. **Station config entry** — this Pi has no GPS; latitude/longitude must
-   be entered manually. Low-stakes, but confirm a plain manual lat/long/
-   elevation/timezone form (no map picker, no IP-geolocation) is
-   sufficient for v1.
-3. **Merge-window duration** (§3.1) — proposed 5s (shorter than any real
-   capture). Confirm, or tune once real per-profile capture durations are
-   measured on hardware.
+**Resolved:** merge-window duration (§3.1) — bumped from the originally
+proposed 5s to **10s** (2026-09-20), after real measured capture
+durations (`docs/optic-daemon-capture-performance.md`) turned out to be
+~5.1-5.6s end to end — at or above the original "shorter than any real
+capture" assumption, not safely under it. 10s gives real margin above
+the slowest measured profile (MasterArchive+DNG, ~5.46s).
+
+**Resolved:** Station config entry — a plain manual lat/long/elevation/
+timezone form, no map picker, no IP-geolocation, confirmed sufficient.
+Implemented as a "Station" card, originally on the dashboard (not the
+Scheduler page — explicit user direction), staged through the same
+shared preview/commit/discard flow every other config section already
+uses. **Moved 2026-09-20** to a new dedicated `/config.html` page
+(alongside a Time & NTP section) — see
+`worklogs/2026-09-20-scheduler-phase2i-config-page-station-ntp-timezone.md`.
+Timezone changed from free text to a `<select>` sourced from
+`GET /api/timezones` (the backend's own `chrono_tz::TZ_VARIANTS`), fixing
+a real latent bug: a typo'd free-text zone previously fell back to UTC
+silently (`Station::tz`'s `.unwrap_or(chrono_tz::UTC)`), now structurally
+impossible since only backend-recognized names are selectable.
+
+**Resolved:** new dependencies (§11) — added exactly one new crate,
+`astro` v2.0.0 (pure Rust, MIT, a Meeus' *Astronomical Algorithms*
+implementation), covering **both** Sun and Moon — the "separate lunar
+crate" research item this section flagged turned out unnecessary once
+`astro` was actually evaluated, and its Galactic-coordinate support
+(`coords::gal_frm_eq`) meant MilkyWay needed no dependency at all either,
+confirming this doc's own suspicion. Full detail in
+`worklogs/2026-09-20-scheduler-phase2a-ephemeris-engine.md`.
+
+**Resolved:** `Trigger::Ephemeris` (§2) is implemented in full —
+`SolarEvent`/`LunarEvent`/`MilkyWayEvent`, `CrossingDirection`, and the
+four new `Constraints` fields (`sun_elevation_window`,
+`moon_elevation_window`, `moon_illumination_window`,
+`milky_way_elevation_window`), built on two shared generic search
+primitives (threshold-crossing and extremum-finding) rather than three
+separate per-taxonomy implementations, per this doc's own hint that any
+fixed-or-moving RA/Dec target can share one rise/set/transit/elevation
+engine. Verified live against the real Pi/Station (not just unit tests)
+— a `Sunset` trigger, a `Moonrise` trigger, and a `CoreRise` trigger each
+produced physically correct, night-to-night-consistent occurrence times,
+including MilkyWay core rise showing the exact ~4-min/day sidereal drift
+this doc's §2 implementation notes predicted. Rule-editor UI for all of
+this (trigger type, event picker, the four constraint boxes) is also
+done. Both phases fully documented in
+`worklogs/2026-09-20-scheduler-phase2a-ephemeris-engine.md` and
+`worklogs/2026-09-20-scheduler-phase2b-ephemeris-rule-editor-ui.md`.
+
+**Resolved:** Storage/Bandwidth Forecaster (§8) — per-shot byte
+estimates for all three profiles (including `Dci4k`, previously flagged
+"TBD/measure" and now measured live against real hardware), a fill-time
+projection counting up from the *actual current* `/mnt/capture` queue
+(not zero), and a two-tier UI warning. Full detail, including the real
+measured byte counts and the documented scene-dependence caveat for
+JPEG sizing, in
+`worklogs/2026-09-20-scheduler-phase2c-storage-forecaster.md`.
+
+**Resolved:** dead-rule and overlap advisories (§8) — both pure
+functions of the already-computed forecast (`dead_rule_slugs`,
+`overlap_advisories` in `optic_scheduler.rs`), surfaced in the Shot
+Forecaster UI. Detail in
+`worklogs/2026-09-20-scheduler-phase2d-overlap-and-dead-rule-advisories.md`.

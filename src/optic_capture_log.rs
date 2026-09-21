@@ -29,7 +29,9 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
-use crate::camera::{CameraError, CameraSettings, CaptureFile, CaptureProfile, CaptureResult};
+use crate::camera::{
+    CameraError, CameraSettings, CaptureFile, CaptureProfile, CaptureResult, CaptureSource,
+};
 
 static LAST_FAILURE_SUFFIX: AtomicU64 = AtomicU64::new(0);
 
@@ -40,6 +42,16 @@ static LAST_FAILURE_SUFFIX: AtomicU64 = AtomicU64::new(0);
 pub struct CaptureLogEntry {
     pub capture_id: String,
     pub source: String,
+    /// The rule slug(s) that triggered this capture — empty for
+    /// `CaptureSource::WebUi`, populated for `CaptureSource::Scheduler`.
+    /// Structured alongside `source`'s plain string, per the design doc's
+    /// own follow-up note (`docs/optic-daemon-scheduler.md` §3.1): lets
+    /// the dashboard show/filter "what triggered this shot" without
+    /// re-parsing filenames. `#[serde(default)]` so a `.log.json` file or
+    /// database row written before this field existed still deserializes
+    /// (as empty) rather than failing.
+    #[serde(default)]
+    pub triggered_by: Vec<String>,
     pub requested_at_unix_ms: u128,
     pub completed_at_unix_ms: u128,
     pub duration_ms: u128,
@@ -67,9 +79,14 @@ impl CaptureLogEntry {
         profile: CaptureProfile,
         settings: CameraSettings,
         save_dng: bool,
+        source: &CaptureSource,
         outcome: &Result<CaptureResult, CameraError>,
     ) -> Self {
-        let capture_id = derive_capture_id(profile, outcome);
+        let capture_id = derive_capture_id(profile, source, outcome);
+        let (source_str, triggered_by) = match source {
+            CaptureSource::WebUi => ("web_ui".to_owned(), Vec::new()),
+            CaptureSource::Scheduler { rule_slugs } => ("scheduler".to_owned(), rule_slugs.clone()),
+        };
         let (success, error, files, bytes, width, height) = match outcome {
             Ok(result) => (
                 true,
@@ -90,7 +107,8 @@ impl CaptureLogEntry {
         };
         Self {
             capture_id,
-            source: "web_ui".to_owned(),
+            source: source_str,
+            triggered_by,
             requested_at_unix_ms: unix_ms(requested_at),
             completed_at_unix_ms: unix_ms(completed_at),
             duration_ms,
@@ -121,6 +139,7 @@ fn unix_ms(time: SystemTime) -> u128 {
 /// "Decisions Made" §3 for why this is scoped this way.
 fn derive_capture_id(
     profile: CaptureProfile,
+    source: &CaptureSource,
     outcome: &Result<CaptureResult, CameraError>,
 ) -> String {
     match outcome {
@@ -129,12 +148,23 @@ fn derive_capture_id(
             .first()
             .and_then(|file| file.filename.rsplit_once('.'))
             .map(|(basename, _extension)| basename.to_owned())
-            .unwrap_or_else(|| failure_capture_id(profile)),
-        Err(_) => failure_capture_id(profile),
+            .unwrap_or_else(|| failure_capture_id(profile, source)),
+        Err(_) => failure_capture_id(profile, source),
     }
 }
 
-fn failure_capture_id(profile: CaptureProfile) -> String {
+/// Matches `native_camera.rs::publish_capture`'s real-file prefix choice
+/// (`scheduler-` vs `testshot-`) for the source — previously always
+/// `testshot-` regardless of source, since no real file exists on a
+/// failed capture to actually reach `optic_sync`'s allowlist either way;
+/// fixed anyway (design doc §14's noted follow-up) since a scheduler
+/// failure's synthetic log-only id reading as a manual "test shot" was a
+/// real, if cosmetic, inconsistency.
+fn failure_capture_id(profile: CaptureProfile, source: &CaptureSource) -> String {
+    let prefix = match source {
+        CaptureSource::WebUi => "testshot",
+        CaptureSource::Scheduler { .. } => "scheduler",
+    };
     let now = unix_ms(SystemTime::now()) as u64;
     let mut previous = LAST_FAILURE_SUFFIX.load(Ordering::Relaxed);
     let suffix = loop {
@@ -149,7 +179,7 @@ fn failure_capture_id(profile: CaptureProfile) -> String {
             Err(current) => previous = current,
         }
     };
-    format!("testshot-{}-failed-{suffix}", profile_slug(profile))
+    format!("{prefix}-{}-failed-{suffix}", profile_slug(profile))
 }
 
 fn profile_slug(profile: CaptureProfile) -> &'static str {
@@ -205,11 +235,13 @@ impl CaptureLog {
                 duration_ms INTEGER NOT NULL,
                 bytes_total INTEGER NOT NULL,
                 error TEXT,
-                detail_json TEXT NOT NULL
+                detail_json TEXT NOT NULL,
+                triggered_by TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_captures_captured_at ON captures(captured_at);
             CREATE INDEX IF NOT EXISTS idx_captures_success ON captures(success);",
         )?;
+        migrate_triggered_by_column(&db)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 capture_dir,
@@ -249,13 +281,17 @@ impl CaptureLog {
         let bytes_total = entry.bytes as i64;
         let error_text = entry.error.clone();
         let detail_json = json;
+        // Padded (`,slug-a,slug-b,`) rather than a bare join, so a
+        // `LIKE '%,<slug>,%'` filter can't false-match a slug that's only a
+        // substring of another rule's slug (e.g. "dawn" inside "dawn-2").
+        let triggered_by_padded = format!(",{},", entry.triggered_by.join(","));
 
         let outcome = tokio::task::spawn_blocking(move || {
             let connection = inner.db.lock().expect("capture log db mutex poisoned");
             connection.execute(
                 "INSERT OR REPLACE INTO captures
-                 (capture_id, captured_at, source, profile, save_dng, success, duration_ms, bytes_total, error, detail_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (capture_id, captured_at, source, profile, save_dng, success, duration_ms, bytes_total, error, detail_json, triggered_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     capture_id,
                     captured_at,
@@ -267,6 +303,7 @@ impl CaptureLog {
                     bytes_total,
                     error_text,
                     detail_json,
+                    triggered_by_padded,
                 ],
             )
         })
@@ -328,6 +365,128 @@ impl CaptureLog {
         .await
         .unwrap_or_else(|_| CaptureHealthStatus::empty(window_hours))
     }
+
+    /// Paginated, filtered history query for the capture-history dashboard
+    /// page (`GET /api/captures`). Filters against the flat indexed columns
+    /// where possible; falls back to a `LIKE` scan of the padded
+    /// `triggered_by` column for the rule-slug filter, which is fine at
+    /// this table's realistic size (a single Pi's lifetime capture count,
+    /// not a multi-tenant workload). Each matching row's full detail is
+    /// read back from `detail_json` — the same struct already used for the
+    /// `.log.json` files — rather than hand-picking columns into a second,
+    /// parallel response shape.
+    pub async fn query(&self, filter: CaptureQueryFilter) -> CaptureQueryPage {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = inner.db.lock().expect("capture log db mutex poisoned");
+
+            let (where_sql, count_params) = build_where_clause(&filter);
+            let count_refs: Vec<&dyn rusqlite::ToSql> =
+                count_params.iter().map(|p| p.as_ref()).collect();
+            let total: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM captures {where_sql}"),
+                    count_refs.as_slice(),
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            let (_, mut select_params) = build_where_clause(&filter);
+            select_params.push(Box::new(i64::from(filter.limit)));
+            select_params.push(Box::new(i64::from(filter.offset)));
+            let select_refs: Vec<&dyn rusqlite::ToSql> =
+                select_params.iter().map(|p| p.as_ref()).collect();
+            let select_sql = format!(
+                "SELECT detail_json FROM captures {where_sql} ORDER BY captured_at DESC LIMIT ? OFFSET ?"
+            );
+
+            let entries = (|| -> rusqlite::Result<Vec<CaptureLogEntry>> {
+                let mut statement = connection.prepare(&select_sql)?;
+                let rows =
+                    statement.query_map(select_refs.as_slice(), |row| row.get::<_, String>(0))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    if let Ok(entry) = serde_json::from_str::<CaptureLogEntry>(&row?) {
+                        out.push(entry);
+                    }
+                }
+                Ok(out)
+            })()
+            .unwrap_or_default();
+
+            CaptureQueryPage {
+                entries,
+                total: total.max(0) as u64,
+            }
+        })
+        .await
+        .unwrap_or_else(|_| CaptureQueryPage {
+            entries: Vec::new(),
+            total: 0,
+        })
+    }
+}
+
+fn build_where_clause(filter: &CaptureQueryFilter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(source) = &filter.source {
+        clauses.push("source = ?".to_owned());
+        params.push(Box::new(source.clone()));
+    }
+    if let Some(profile) = &filter.profile {
+        clauses.push("profile = ?".to_owned());
+        params.push(Box::new(profile.clone()));
+    }
+    if let Some(success) = filter.success {
+        clauses.push("success = ?".to_owned());
+        params.push(Box::new(success));
+    }
+    if let Some(rule_slug) = &filter.rule_slug {
+        clauses.push("triggered_by LIKE ?".to_owned());
+        params.push(Box::new(format!("%,{rule_slug},%")));
+    }
+    if let Some(since_unix_ms) = filter.since_unix_ms {
+        clauses.push("captured_at >= ?".to_owned());
+        params.push(Box::new((since_unix_ms / 1000) as i64));
+    }
+    if let Some(until_unix_ms) = filter.until_unix_ms {
+        clauses.push("captured_at <= ?".to_owned());
+        params.push(Box::new((until_unix_ms / 1000) as i64));
+    }
+
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+    (where_sql, params)
+}
+
+/// Adds the `triggered_by` column to a `captures` table created before it
+/// existed (any database from before tonight's Phase 2f). A no-op on a
+/// fresh table, which already has the column via `CREATE TABLE`.
+fn migrate_triggered_by_column(db: &Connection) -> rusqlite::Result<()> {
+    let mut has_column = false;
+    {
+        let mut statement = db.prepare("PRAGMA table_info(captures)")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "triggered_by" {
+                has_column = true;
+                break;
+            }
+        }
+    }
+    if !has_column {
+        db.execute(
+            "ALTER TABLE captures ADD COLUMN triggered_by TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Rollup of recent capture outcomes, for the system-health dashboard
@@ -340,6 +499,29 @@ pub struct CaptureHealthStatus {
     pub last_capture_at_unix_ms: Option<u128>,
     pub last_capture_success: Option<bool>,
     pub average_duration_ms: Option<f64>,
+}
+
+/// Filter + pagination parameters for `CaptureLog::query`, built by
+/// `web.rs`'s `/api/captures` handler from the request's query string.
+#[derive(Debug, Clone, Default)]
+pub struct CaptureQueryFilter {
+    pub source: Option<String>,
+    pub profile: Option<String>,
+    pub success: Option<bool>,
+    pub rule_slug: Option<String>,
+    pub since_unix_ms: Option<u64>,
+    pub until_unix_ms: Option<u64>,
+    pub limit: u32,
+    pub offset: u32,
+}
+
+/// One page of `CaptureLog::query` results, plus the total count matching
+/// the filter (independent of `limit`/`offset`) so the caller can render
+/// "X-Y of Z" and enable/disable pagination controls.
+#[derive(Debug, Serialize)]
+pub struct CaptureQueryPage {
+    pub entries: Vec<CaptureLogEntry>,
+    pub total: u64,
 }
 
 impl CaptureHealthStatus {
@@ -394,6 +576,7 @@ mod tests {
             CaptureProfile::Dci4k,
             CameraSettings::default(),
             false,
+            &CaptureSource::WebUi,
             &success_outcome("testshot-4k-dci-1000.jpg"),
         );
         let json = serde_json::to_string(&entry).unwrap();
@@ -402,21 +585,66 @@ mod tests {
         assert!(parsed.success);
         assert_eq!(parsed.duration_ms, 250);
         assert_eq!(parsed.bytes, 1234);
+        assert_eq!(parsed.source, "web_ui");
+        assert!(parsed.triggered_by.is_empty());
+    }
+
+    #[test]
+    fn capture_log_entry_records_the_triggering_rule_slugs_for_a_scheduler_source() {
+        let source = CaptureSource::Scheduler {
+            rule_slugs: vec!["dawn".to_owned(), "golden-hour".to_owned()],
+        };
+        let entry = CaptureLogEntry::new(
+            SystemTime::now(),
+            SystemTime::now(),
+            250,
+            CaptureProfile::MasterArchive,
+            CameraSettings::default(),
+            true,
+            &source,
+            &success_outcome("scheduler-master-archive-dawn-golden-hour-1000.jpg"),
+        );
+        assert_eq!(entry.source, "scheduler");
+        assert_eq!(
+            entry.triggered_by,
+            vec!["dawn".to_owned(), "golden-hour".to_owned()]
+        );
     }
 
     #[test]
     fn derive_capture_id_shares_the_jpeg_basename_on_success() {
         let id = derive_capture_id(
             CaptureProfile::MasterArchive,
+            &CaptureSource::WebUi,
             &success_outcome("testshot-master-archive-1789753359227.jpg"),
         );
         assert_eq!(id, "testshot-master-archive-1789753359227");
     }
 
     #[test]
-    fn derive_capture_id_mints_a_synthetic_id_on_failure() {
-        let id = derive_capture_id(CaptureProfile::Binning2k, &Err(CameraError::Timeout));
+    fn derive_capture_id_mints_a_testshot_prefixed_synthetic_id_on_web_ui_failure() {
+        let id = derive_capture_id(
+            CaptureProfile::Binning2k,
+            &CaptureSource::WebUi,
+            &Err(CameraError::Timeout),
+        );
         assert!(id.starts_with("testshot-2k-binning-failed-"));
+    }
+
+    #[test]
+    fn derive_capture_id_mints_a_scheduler_prefixed_synthetic_id_on_scheduler_failure() {
+        let source = CaptureSource::Scheduler {
+            rule_slugs: vec!["dawn".to_owned()],
+        };
+        let id = derive_capture_id(
+            CaptureProfile::Binning2k,
+            &source,
+            &Err(CameraError::Timeout),
+        );
+        assert!(
+            id.starts_with("scheduler-2k-binning-failed-"),
+            "expected a scheduler- prefixed id, got {id}"
+        );
     }
 
     #[tokio::test]
@@ -432,6 +660,7 @@ mod tests {
             CaptureProfile::MasterArchive,
             CameraSettings::default(),
             true,
+            &CaptureSource::WebUi,
             &success_outcome("testshot-master-archive-42.jpg"),
         );
         log.record(entry).await;
@@ -469,6 +698,7 @@ mod tests {
             CaptureProfile::Dci4k,
             CameraSettings::default(),
             false,
+            &CaptureSource::WebUi,
             &Err(CameraError::Busy),
         );
         let capture_id = entry.capture_id.clone();
@@ -595,5 +825,260 @@ mod tests {
         assert_eq!(health.successful, 0);
         assert_eq!(health.last_capture_at_unix_ms, None);
         assert_eq!(health.average_duration_ms, None);
+    }
+
+    /// A database created before tonight's Phase 2f (`triggered_by` didn't
+    /// exist yet) must open cleanly, gain the column, and let an old row
+    /// read back with an empty `triggered_by` rather than failing to open
+    /// or losing the row.
+    #[tokio::test]
+    async fn opening_a_pre_phase_2f_database_migrates_the_triggered_by_column() {
+        let db_path = unique_temp_dir("legacy-db").join("history.db");
+        let capture_dir = unique_temp_dir("legacy-capture-dir");
+        {
+            let legacy = Connection::open(&db_path).unwrap();
+            legacy
+                .execute_batch(
+                    "CREATE TABLE captures (
+                        capture_id TEXT PRIMARY KEY,
+                        captured_at INTEGER NOT NULL,
+                        source TEXT NOT NULL,
+                        profile TEXT NOT NULL,
+                        save_dng INTEGER NOT NULL,
+                        success INTEGER NOT NULL,
+                        duration_ms INTEGER NOT NULL,
+                        bytes_total INTEGER NOT NULL,
+                        error TEXT,
+                        detail_json TEXT NOT NULL
+                    );",
+                )
+                .unwrap();
+            legacy
+                .execute(
+                    "INSERT INTO captures
+                     (capture_id, captured_at, source, profile, save_dng, success, duration_ms, bytes_total, error, detail_json)
+                     VALUES ('legacy-1', 1758153600, 'web_ui', 'master_archive', 1, 1, 1000, 5000, NULL, '{}')",
+                    [],
+                )
+                .unwrap();
+        }
+
+        // Opening twice (simulating two daemon restarts) must be idempotent.
+        let log = CaptureLog::open(&db_path, capture_dir.clone()).unwrap();
+        drop(log);
+        let log = CaptureLog::open(&db_path, capture_dir).unwrap();
+
+        let connection = log.inner.db.lock().unwrap();
+        let triggered_by: String = connection
+            .query_row(
+                "SELECT triggered_by FROM captures WHERE capture_id = 'legacy-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggered_by, "");
+    }
+
+    fn scheduler_source(rule_slugs: &[&str]) -> CaptureSource {
+        CaptureSource::Scheduler {
+            rule_slugs: rule_slugs.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    async fn seed_query_fixture(log: &CaptureLog) {
+        let now = SystemTime::now();
+        log.record(CaptureLogEntry::new(
+            now,
+            now,
+            100,
+            CaptureProfile::MasterArchive,
+            CameraSettings::default(),
+            true,
+            &CaptureSource::WebUi,
+            &success_outcome("testshot-master-archive-1.jpg"),
+        ))
+        .await;
+        log.record(CaptureLogEntry::new(
+            now,
+            now,
+            200,
+            CaptureProfile::Dci4k,
+            CameraSettings::default(),
+            false,
+            &scheduler_source(&["dawn"]),
+            &success_outcome("scheduler-4k-dci-dawn-2.jpg"),
+        ))
+        .await;
+        log.record(CaptureLogEntry::new(
+            now,
+            now,
+            300,
+            CaptureProfile::Binning2k,
+            CameraSettings::default(),
+            false,
+            &scheduler_source(&["dawn-2"]),
+            &success_outcome("scheduler-2k-binning-dawn-2-3.jpg"),
+        ))
+        .await;
+        log.record(CaptureLogEntry::new(
+            now,
+            now,
+            400,
+            CaptureProfile::MasterArchive,
+            CameraSettings::default(),
+            true,
+            &scheduler_source(&["golden-hour"]),
+            &Err(CameraError::Busy),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn query_filters_by_source_profile_and_success_independently() {
+        let db_path = unique_temp_dir("query-filter-db").join("history.db");
+        let capture_dir = unique_temp_dir("query-filter-capture-dir");
+        let log = CaptureLog::open(&db_path, capture_dir).unwrap();
+        seed_query_fixture(&log).await;
+
+        let by_source = log
+            .query(CaptureQueryFilter {
+                source: Some("scheduler".to_owned()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(by_source.total, 3);
+
+        let by_profile = log
+            .query(CaptureQueryFilter {
+                profile: Some("master_archive".to_owned()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(by_profile.total, 2);
+
+        let by_success = log
+            .query(CaptureQueryFilter {
+                success: Some(false),
+                limit: 10,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(by_success.total, 1);
+        assert!(
+            by_success.entries[0]
+                .capture_id
+                .starts_with("scheduler-master-archive-failed-"),
+            "got {}",
+            by_success.entries[0].capture_id
+        );
+    }
+
+    /// A rule slug that's a substring of another rule's slug ("dawn" vs.
+    /// "dawn-2") must not false-match via the padded `LIKE` filter.
+    #[tokio::test]
+    async fn query_filters_by_rule_slug_without_substring_false_matches() {
+        let db_path = unique_temp_dir("query-rule-slug-db").join("history.db");
+        let capture_dir = unique_temp_dir("query-rule-slug-capture-dir");
+        let log = CaptureLog::open(&db_path, capture_dir).unwrap();
+        seed_query_fixture(&log).await;
+
+        let dawn = log
+            .query(CaptureQueryFilter {
+                rule_slug: Some("dawn".to_owned()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(dawn.total, 1);
+        assert_eq!(dawn.entries[0].triggered_by, vec!["dawn".to_owned()]);
+
+        let dawn_2 = log
+            .query(CaptureQueryFilter {
+                rule_slug: Some("dawn-2".to_owned()),
+                limit: 10,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(dawn_2.total, 1);
+        assert_eq!(dawn_2.entries[0].triggered_by, vec!["dawn-2".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn query_paginates_newest_first_with_a_total_independent_of_limit() {
+        let db_path = unique_temp_dir("query-page-db").join("history.db");
+        let capture_dir = unique_temp_dir("query-page-capture-dir");
+        let log = CaptureLog::open(&db_path, capture_dir).unwrap();
+        seed_query_fixture(&log).await;
+
+        let page1 = log
+            .query(CaptureQueryFilter {
+                limit: 2,
+                offset: 0,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(
+            page1.total, 4,
+            "total must reflect all matching rows, not just this page"
+        );
+        assert_eq!(page1.entries.len(), 2);
+
+        let page2 = log
+            .query(CaptureQueryFilter {
+                limit: 2,
+                offset: 2,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(page2.total, 4);
+        assert_eq!(page2.entries.len(), 2);
+
+        let page1_ids: Vec<_> = page1.entries.iter().map(|e| &e.capture_id).collect();
+        let page2_ids: Vec<_> = page2.entries.iter().map(|e| &e.capture_id).collect();
+        assert!(
+            page1_ids.iter().all(|id| !page2_ids.contains(id)),
+            "pages must not overlap"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_filters_by_captured_at_date_range() {
+        let db_path = unique_temp_dir("query-range-db").join("history.db");
+        let capture_dir = unique_temp_dir("query-range-capture-dir");
+        let log = CaptureLog::open(&db_path, capture_dir).unwrap();
+
+        {
+            let connection = log.inner.db.lock().unwrap();
+            connection.execute(
+                "INSERT INTO captures (capture_id, captured_at, source, profile, save_dng, success, duration_ms, bytes_total, error, detail_json, triggered_by)
+                 VALUES ('old', 1758153600, 'web_ui', 'master_archive', 1, 1, 1000, 5000, NULL, '{}', ',,')",
+                [],
+            ).unwrap();
+            connection.execute(
+                "INSERT INTO captures (capture_id, captured_at, source, profile, save_dng, success, duration_ms, bytes_total, error, detail_json, triggered_by)
+                 VALUES ('new', 1758240000, 'web_ui', 'master_archive', 1, 1, 1000, 5000, NULL, '{}', ',,')",
+                [],
+            ).unwrap();
+        }
+
+        let since_new = log
+            .query(CaptureQueryFilter {
+                since_unix_ms: Some(1758240000 * 1000),
+                limit: 10,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(since_new.total, 1);
+
+        let until_old = log
+            .query(CaptureQueryFilter {
+                until_unix_ms: Some(1758153600 * 1000),
+                limit: 10,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(until_old.total, 1);
     }
 }

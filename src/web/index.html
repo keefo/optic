@@ -8,6 +8,7 @@
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" defer></script>
+  <script src="/footer.js" defer></script>
 </head>
 <body>
   <header class="site-header">
@@ -23,6 +24,13 @@
       <span id="camera-status" class="pill neutral">Camera unknown</span>
     </div>
   </header>
+
+  <nav class="app-tabs" aria-label="Primary">
+    <a href="/" aria-current="page">Dashboard</a>
+    <a href="/scheduler.html">Scheduler</a>
+    <a href="/capture-history.html">Capture History</a>
+    <a href="/config.html">Config</a>
+  </nav>
 
   <main>
     <section class="preview-card" aria-labelledby="preview-title">
@@ -93,7 +101,7 @@
             <input type="radio" name="capture-profile" value="master_archive" checked>
             <span>
               <strong>Master Archive</strong>
-              <small>4056 × 3040 · 12-bit full readout · JPEG Q100 + DNG</small>
+              <small>4056 × 3040 · 12-bit full readout · JPEG Q100 (+ optional DNG)</small>
             </span>
           </label>
           <label class="profile-option">
@@ -112,8 +120,8 @@
           </label>
         </div>
         <label id="dng-option" class="check profile-raw">
-          <input id="save-dng" type="checkbox" checked disabled>
-          <span>Save companion DNG <small id="dng-help">Required for Master Archive</small></span>
+          <input id="save-dng" type="checkbox" checked>
+          <span>Save companion DNG <small id="dng-help">Recommended for Master Archive</small></span>
         </label>
       </section>
 
@@ -180,8 +188,8 @@
       </section>
 
       <div class="button-row margin-top-10">
-        <button id="discard-config" class="text-button bad" type="button" disabled>Discard Changes</button>
         <button id="save-config" class="accent good" type="button" disabled>Save Settings</button>
+        <button id="discard-config" class="text-button bad" type="button" hidden>Discard Changes</button>
       </div>
     </section>
 
@@ -224,48 +232,14 @@
         <button id="sync-retry-now" type="button">Retry now</button>
       </div>
     </section>
-
-    <section class="system-card" aria-labelledby="system-title">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">SYSTEM</p>
-          <h2 id="system-title">Pi health &amp; control</h2>
-        </div>
-      </div>
-      <dl>
-        <div>
-          <dt>Memory</dt>
-          <dd>
-            <div class="usage-bar"><div id="system-memory-bar" class="usage-bar-fill"></div></div>
-            <span id="system-memory-label" class="usage-bar-label">—</span>
-          </dd>
-        </div>
-        <div>
-          <dt>Root disk</dt>
-          <dd>
-            <div class="usage-bar"><div id="system-disk-root-bar" class="usage-bar-fill"></div></div>
-            <span id="system-disk-root-label" class="usage-bar-label">—</span>
-          </dd>
-        </div>
-        <div>
-          <dt>Capture disk</dt>
-          <dd>
-            <div class="usage-bar"><div id="system-disk-capture-bar" class="usage-bar-fill"></div></div>
-            <span id="system-disk-capture-label" class="usage-bar-label">—</span>
-          </dd>
-        </div>
-        <div><dt>CPU temp</dt><dd id="system-temp">—</dd></div>
-        <div><dt>Uptime</dt><dd id="system-uptime">—</dd></div>
-        <div><dt>Network</dt><dd id="system-network">—</dd></div>
-        <div><dt>Captures (24h)</dt><dd id="system-capture-health">—</dd></div>
-      </dl>
-      <div class="button-row">
-        <button id="system-restart-daemon" type="button">Restart daemon</button>
-        <button id="system-reboot" class="bad" type="button">Reboot Pi</button>
-      </div>
-    </section>
   </main>
 
-  <footer>Local network control plane</footer>
+  <footer class="system-footer">
+    <span id="footer-summary" class="muted">Loading system status&hellip;</span>
+    <div class="button-row">
+      <button id="footer-restart-daemon" type="button">Restart daemon</button>
+      <button id="footer-reboot" class="bad" type="button">Reboot Pi</button>
+    </div>
+  </footer>
 </body>
 </html>

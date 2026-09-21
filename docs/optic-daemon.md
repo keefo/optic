@@ -272,7 +272,7 @@ Engineered for minimal storage consumption, high reliability, and superior signa
 | **1-Yr Storage (5m)** | ~680 GB (JPG) / ~3.2 TB (RAW) | ~420 GB (JPG) / ~2.3 TB (RAW) | ~160 GB (JPG) |
 | **Target Output** | Fine Art / Archival / Pan-Zoom | 4K Cinema Timelines | Web Dashboards / Storage-Limited |
 
-The dashboard does not expose a separate JPEG-quality override. Quality is part of each preset. Master Archive always saves its companion DNG, 4K DCI offers DNG as an opt-in, and 2K Binning disables DNG to preserve its efficiency goal. Master Archive's live MJPEG preview uses the full `4056 × 3040` output at 2 FPS. The lower-bandwidth 4K DCI and 2K previews use `1352 × 720` and `1014 × 760` output while retaining their selected sensor modes and framing at up to 8 FPS. Changing profile while preview is live restarts the camera pipeline.
+The dashboard does not expose a separate JPEG-quality override. Quality is part of each preset. Master Archive saves its companion DNG by default but it can be unchecked (2026-09-20 — it was previously mandatory), 4K DCI offers DNG as an opt-in, and 2K Binning disables DNG to preserve its efficiency goal. The checkbox is a real staged/saveable setting (`POST /api/config/save-dng`), not just a one-off per-capture choice — Save Settings persists it, and scheduled (timelapse) captures use whatever was last saved, same as every other camera setting — see `docs/optic-daemon-scheduler.md` §6. Master Archive's live MJPEG preview uses the full `4056 × 3040` output at 2 FPS. The lower-bandwidth 4K DCI and 2K previews use `1352 × 720` and `1014 × 760` output while retaining their selected sensor modes and framing at up to 8 FPS. Changing profile while preview is live restarts the camera pipeline.
 
 
 ### Web API Endpoints

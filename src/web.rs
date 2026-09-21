@@ -23,8 +23,11 @@ use crate::{
     },
     durable_state,
     optic_camera::{CameraBackendKind, OpticCamera},
-    optic_capture_log::{CaptureHealthStatus, CaptureLog, CaptureLogEntry},
-    optic_scheduler::{self, SchedulerHandle, SchedulerStatus, SchedulerUnavailable},
+    optic_capture_log::{CaptureHealthStatus, CaptureLog, CaptureLogEntry, CaptureQueryFilter},
+    optic_scheduler::{
+        self, CelestialTarget, LunarEvent, MilkyWayEvent, SchedulerHandle, SchedulerStatus,
+        SchedulerUnavailable, SolarEvent, Station,
+    },
     optic_sync::{DataSyncManager, SyncStatus, SyncUnavailable},
     system_status::{self, SystemStatus, SystemStatusReader},
 };
@@ -107,10 +110,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/schedule/pause", post(schedule_pause))
         .route("/api/schedule/resume", post(schedule_resume))
         .route("/api/schedule/preview", post(schedule_preview))
+        .route("/api/config/save-dng", post(stage_save_dng))
         .route("/api/schedule/forecast", get(schedule_forecast))
+        .route("/api/captures", get(capture_history))
         .route("/api/system/status", get(system_status_handler))
         .route("/api/system/reboot", post(system_reboot))
         .route("/api/system/restart-daemon", post(system_restart_daemon))
+        .route("/api/system/ntp-sync", post(system_ntp_sync))
+        .route("/api/system/timezone", post(system_set_timezone))
+        .route("/api/timezones", get(list_timezones))
+        .route("/api/celestial-preview", get(celestial_preview))
         .with_state(state)
 }
 
@@ -416,6 +425,38 @@ async fn schedule_preview(
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SaveDngRequest {
+    save_dng: bool,
+}
+
+/// Stages the committed DNG preference (`AppConfig.save_dng`) into
+/// `preview_config.json`, same file/pattern as `schedule_preview` —
+/// deliberately its own tiny endpoint rather than piggybacking on
+/// `StreamRequest`/`reconfigure_stream`: saving a companion DNG has
+/// nothing to do with the live preview pipeline (the MJPEG stream never
+/// produces a DNG), and `reconfigure_stream`'s staging only fires while
+/// `livePreview` is true client-side (`schedulePreviewUpdate`'s guard),
+/// which would make toggling this checkbox a no-op whenever the preview
+/// isn't currently running. This path stages unconditionally, same as
+/// `schedule_preview`.
+async fn stage_save_dng(
+    State(state): State<AppState>,
+    Json(request): Json<SaveDngRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let mut config = current_app_config(&state).await;
+    config.save_dng = request.save_dng;
+    let serialized = serde_json::to_string_pretty(&config).map_err(|error| AppError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: error.to_string(),
+    })?;
+    let temp_path = state.preview_config_path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, serialized).await?;
+    tokio::fs::rename(temp_path, &*state.preview_config_path).await?;
+    Ok((StatusCode::OK, Json(Message::new("DNG preference staged"))))
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct ForecastParams {
     hours: Option<u32>,
 }
@@ -426,10 +467,95 @@ struct ForecastShot {
     rule_slugs: Vec<String>,
 }
 
+/// `/mnt/capture`'s fixed tmpfs size (design doc §7/§8): 256 MiB.
+const CAPTURE_TMPFS_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Per-shot byte estimates for the Storage/Bandwidth Forecaster (design
+/// doc §8). Real measurements, not guesses — captured live against this
+/// same Pi/sensor on 2026-09-20 (`worklogs/2026-09-20-scheduler-phase2c-storage-forecaster.md`
+/// has the exact capture responses).
+///
+/// **Known limitation, stated plainly rather than hidden behind false
+/// precision**: the JPEG component of each figure is scene-dependent —
+/// a dark/night scene compresses far more than a detailed daytime one.
+/// The same Pi's `MasterArchive` JPEG measured 7.78 MB in an earlier
+/// (daytime) session vs. 1.72 MB just now (nighttime) — a ~4.5x spread
+/// on the *same profile, same sensor, same day*. The DNG component does
+/// **not** vary this way (raw sensor data, size fixed by resolution) and
+/// measured consistently across sessions. To keep the forecaster's
+/// storage/fill-time warning conservative rather than falsely
+/// reassuring, every constant here uses the **larger** of any measured
+/// samples for that profile — these are deliberately worst-case-leaning
+/// estimates, not averages.
+fn estimated_bytes_per_shot(profile: CaptureProfile, save_dng: bool) -> u64 {
+    match profile {
+        // DNG was mandatory here (`validate_raw_policy`) until 2026-09-20,
+        // when it became an optional default at the user's request — same
+        // as `Dci4k`, `save_dng` is now genuinely consulted. Larger of two
+        // measured sessions: JPEG 7,783,245 B (daytime) + DNG 24,661,360 B.
+        CaptureProfile::MasterArchive if save_dng => 32_444_605,
+        // No live no-DNG MasterArchive sample exists yet (this combination
+        // was rejected outright before tonight) — uses the same measured
+        // JPEG-only figure as the DNG case above (7,783,245 B), which is
+        // already the larger/conservative daytime sample of just the JPEG
+        // component, not a guess.
+        CaptureProfile::MasterArchive => 7_783_245,
+        // Never includes DNG (`validate_raw_policy`) — `save_dng` is
+        // irrelevant here either. Larger of five same-session samples
+        // (avg ~529.7 KB); tonight's separate measurement was a
+        // dramatically smaller 51.8 KB, underscoring the scene-dependence
+        // note above.
+        CaptureProfile::Binning2k => 530_000,
+        // The one profile where `save_dng` was already consulted before
+        // tonight. Both figures measured live tonight (2026-09-20, ~03:15
+        // UTC) — no prior daytime sample existed for this profile at all
+        // (design doc §11/§8 flagged it "TBD/measure"); flagged in the
+        // worklog as the weakest of the three estimates for exactly that
+        // reason.
+        CaptureProfile::Dci4k if save_dng => 17_891_671,
+        CaptureProfile::Dci4k => 357_067,
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ForecastResponse {
     horizon_hours: u32,
     shots: Vec<ForecastShot>,
+    /// `estimated_bytes_per_shot * shots.len()` — the physical
+    /// (post-merge) shot count, per design doc §8's explicit note that
+    /// this must count physical captures, not raw per-rule occurrences.
+    estimated_total_bytes: u64,
+    estimated_bytes_per_shot: u64,
+    /// How full `/mnt/capture` already is right now, out of
+    /// `CAPTURE_TMPFS_CAPACITY_BYTES` — the baseline the fill-time
+    /// estimate below counts up from, not zero.
+    capture_stage_queued_bytes: u64,
+    capture_tmpfs_capacity_bytes: u64,
+    /// Seconds until `/mnt/capture` would fill **if sync stalled
+    /// entirely and captures kept firing at this forecast's average
+    /// rate** (design doc §7/§8's "fills in ~40 min if sync stalls"
+    /// framing) — `None` when the forecast has no shots at all, i.e. no
+    /// rate to project. Not a claim about what will actually happen
+    /// (sync is expected to keep draining the queue continuously); it's
+    /// the proactive-warning half of §7's full-disk answer, the
+    /// runtime skip+report behavior being the backstop.
+    estimated_seconds_to_fill_if_sync_stalled: Option<u64>,
+    /// Design doc §8's dead-rule advisory: enabled rules contributing to
+    /// zero of `shots` — likely misconfigured (contradictory
+    /// constraints), not intentionally idle.
+    dead_rule_slugs: Vec<String>,
+    /// Design doc §8's overlap advisory: enabled-rule pairs sustaining a
+    /// combined rate higher than either alone over a shared span — the
+    /// case §3.1's merge+tag mechanism alone doesn't surface.
+    overlap_advisories: Vec<OverlapAdvisoryResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct OverlapAdvisoryResponse {
+    rule_slugs: [String; 2],
+    window_start: chrono::DateTime<chrono::Utc>,
+    window_end: chrono::DateTime<chrono::Utc>,
+    combined_shots: usize,
 }
 
 /// Reads whatever is *currently staged* (preview if present, else the
@@ -440,24 +566,115 @@ struct ForecastResponse {
 async fn schedule_forecast(
     State(state): State<AppState>,
     Query(params): Query<ForecastParams>,
-) -> Json<ForecastResponse> {
+) -> Result<Json<ForecastResponse>, AppError> {
     let horizon_hours = params.hours.unwrap_or(48).clamp(1, 168);
     let config = current_app_config(&state).await;
-    let shots = optic_scheduler::forecast(
+    let raw_shots = optic_scheduler::forecast(
         &config.schedule,
         chrono::Utc::now(),
         chrono::Duration::hours(i64::from(horizon_hours)),
-    )
-    .into_iter()
-    .map(|shot| ForecastShot {
-        at: shot.at.with_timezone(&chrono::Utc),
-        rule_slugs: shot.rule_slugs,
-    })
-    .collect();
-    Json(ForecastResponse {
+    );
+
+    let dead_rule_slugs = optic_scheduler::dead_rule_slugs(&config.schedule, &raw_shots);
+    let overlap_advisories = optic_scheduler::overlap_advisories(&config.schedule, &raw_shots)
+        .into_iter()
+        .map(|advisory| OverlapAdvisoryResponse {
+            rule_slugs: advisory.rule_slugs,
+            window_start: advisory.window_start.with_timezone(&chrono::Utc),
+            window_end: advisory.window_end.with_timezone(&chrono::Utc),
+            combined_shots: advisory.combined_shots,
+        })
+        .collect();
+
+    let shots: Vec<ForecastShot> = raw_shots
+        .into_iter()
+        .map(|shot| ForecastShot {
+            at: shot.at.with_timezone(&chrono::Utc),
+            rule_slugs: shot.rule_slugs,
+        })
+        .collect();
+
+    let bytes_per_shot = estimated_bytes_per_shot(config.profile, config.save_dng);
+    let estimated_total_bytes = bytes_per_shot.saturating_mul(shots.len() as u64);
+    let (_, capture_stage_queued_bytes) = queue_usage(&state.capture_dir).await?;
+    let bytes_per_hour = estimated_total_bytes / u64::from(horizon_hours);
+    let estimated_seconds_to_fill_if_sync_stalled = (bytes_per_hour > 0).then(|| {
+        let remaining = CAPTURE_TMPFS_CAPACITY_BYTES.saturating_sub(capture_stage_queued_bytes);
+        (remaining as f64 / bytes_per_hour as f64 * 3600.0) as u64
+    });
+
+    Ok(Json(ForecastResponse {
         horizon_hours,
         shots,
-    })
+        estimated_total_bytes,
+        estimated_bytes_per_shot: bytes_per_shot,
+        capture_stage_queued_bytes,
+        capture_tmpfs_capacity_bytes: CAPTURE_TMPFS_CAPACITY_BYTES,
+        estimated_seconds_to_fill_if_sync_stalled,
+        dead_rule_slugs,
+        overlap_advisories,
+    }))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CaptureHistoryParams {
+    source: Option<String>,
+    profile: Option<String>,
+    success: Option<bool>,
+    rule_slug: Option<String>,
+    /// Unix milliseconds, inclusive — matches the rest of this API's
+    /// timestamp convention (`*_unix_ms` fields elsewhere).
+    since: Option<u64>,
+    until: Option<u64>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct CaptureHistoryResponse {
+    entries: Vec<CaptureLogEntry>,
+    total: u64,
+    limit: u32,
+    offset: u32,
+}
+
+/// Dedicated capture-history page's backing query (design doc
+/// `docs/optic-daemon-capture-log.md` §6's previously-deferred "dashboard
+/// panel for querying this history"). `limit` is clamped to keep a typo'd
+/// query param from triggering a pathological scan, same posture as
+/// `schedule_forecast`'s `hours` clamp.
+async fn capture_history(
+    State(state): State<AppState>,
+    Query(params): Query<CaptureHistoryParams>,
+) -> Result<Json<CaptureHistoryResponse>, AppError> {
+    let Some(capture_log) = &state.capture_log else {
+        return Err(AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "capture history is unavailable on this daemon".to_owned(),
+        });
+    };
+
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let offset = params.offset.unwrap_or(0);
+    let page = capture_log
+        .query(CaptureQueryFilter {
+            source: params.source,
+            profile: params.profile,
+            success: params.success,
+            rule_slug: params.rule_slug,
+            since_unix_ms: params.since,
+            until_unix_ms: params.until,
+            limit,
+            offset,
+        })
+        .await;
+
+    Ok(Json(CaptureHistoryResponse {
+        entries: page.entries,
+        total: page.total,
+        limit,
+        offset,
+    }))
 }
 
 /// Rollup window for the capture-health portion of the system panel. Fixed
@@ -491,6 +708,268 @@ async fn system_reboot() -> Result<impl IntoResponse, AppError> {
 async fn system_restart_daemon() -> impl IntoResponse {
     system_status::restart_daemon_detached();
     (StatusCode::OK, Json(Message::new("restarting")))
+}
+
+async fn system_ntp_sync() -> Result<impl IntoResponse, AppError> {
+    system_status::sync_ntp_now().await?;
+    Ok((StatusCode::OK, Json(Message::new("NTP sync requested"))))
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SetTimezoneRequest {
+    timezone: String,
+}
+
+/// Sets the Pi's system timezone (`timedatectl set-timezone`), called
+/// from the Config page's "Save station" flow — the user's explicit
+/// choice to keep the Station's timezone and the system clock in sync
+/// rather than treating them as independent settings. Validates against
+/// the same `chrono_tz::TZ_VARIANTS` list `list_timezones` serves,
+/// before ever invoking the OS command, so a malformed request can't
+/// reach `timedatectl` at all (defense in depth — `Command::arg` already
+/// passes this as a literal argv entry, never through a shell, so
+/// there's no injection risk either way, but a real validation error
+/// message is more useful than whatever `timedatectl` would print).
+async fn system_set_timezone(
+    Json(request): Json<SetTimezoneRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    if !is_valid_timezone(&request.timezone) {
+        return Err(AppError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("not a recognized IANA timezone: {}", request.timezone),
+        });
+    }
+    system_status::set_system_timezone(&request.timezone).await?;
+    Ok((
+        StatusCode::OK,
+        Json(Message::new("system timezone updated")),
+    ))
+}
+
+fn is_valid_timezone(timezone: &str) -> bool {
+    chrono_tz::TZ_VARIANTS
+        .iter()
+        .any(|tz| tz.name() == timezone)
+}
+
+/// Every valid IANA timezone name, for the Config page's timezone
+/// `<select>` (design doc's own `Station.timezone` doc comment already
+/// calls this out as an IANA name; this endpoint is what actually
+/// enforces it can only ever be one, rather than a free-text field that
+/// silently falls back to UTC on a typo — see
+/// `optic_scheduler.rs::Station::tz`).
+async fn list_timezones() -> Json<Vec<&'static str>> {
+    Json(chrono_tz::TZ_VARIANTS.iter().map(|tz| tz.name()).collect())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CelestialPreviewParams {
+    latitude: f64,
+    longitude: f64,
+    #[serde(default)]
+    elevation_m: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct CelestialPreviewItem {
+    group: &'static str,
+    label: &'static str,
+    /// `None` if no occurrence was found within the search horizon —
+    /// extremely rare for these events at real-world latitudes (would
+    /// need e.g. polar day/night), but astronomically possible, so this
+    /// is a real `Option`, not an infallible unwrap.
+    at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CelestialPreviewResponse {
+    items: Vec<CelestialPreviewItem>,
+    moon_illumination_pct: f64,
+    moon_waxing: bool,
+}
+
+/// Celestial-event preview for the Config page's Station card — lets an
+/// operator sanity-check "does this location/timezone actually look
+/// right?" against real astronomy immediately, without first saving
+/// anything or navigating to the Scheduler's forecast. Deliberately a
+/// GET with lat/long/elevation as query params, not reading the
+/// committed/staged `Station` from `AppConfig` at all: previewing
+/// whatever is *currently typed into the form* (including an unsaved
+/// edit) is the whole point — `timezone` isn't a parameter here because
+/// none of this math depends on it (ephemeris positions are computed in
+/// absolute UTC/Julian-day terms; `Station.timezone` only matters for
+/// the scheduler's local-wall-clock trigger types, e.g.
+/// `RecurringTime`), the frontend applies the Station's timezone purely
+/// for display formatting.
+///
+/// The curated list below (not every `SolarEvent`/`LunarEvent`/
+/// `MilkyWayEvent` variant — `FixedElevation`/`CoreElevation`/
+/// `Orientation` need an explicit degrees/azimuth parameter this preview
+/// has no input for) covers what's actually useful for planning a
+/// timelapse: the day/night/twilight boundaries, the two photography-
+/// specific windows (golden/blue hour), Moon rise/set + current
+/// illumination/phase trend, and the Milky Way core's daily window,
+/// since this project's own Ephemeris trigger work this session was
+/// largely in service of Milky Way timelapses.
+async fn celestial_preview(
+    Query(params): Query<CelestialPreviewParams>,
+) -> Result<Json<CelestialPreviewResponse>, AppError> {
+    if !(-90.0..=90.0).contains(&params.latitude) || !(-180.0..=180.0).contains(&params.longitude) {
+        return Err(AppError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: "latitude must be -90..=90 and longitude -180..=180".to_owned(),
+        });
+    }
+    let station = Station {
+        latitude: params.latitude,
+        longitude: params.longitude,
+        elevation_m: params.elevation_m,
+        // Irrelevant to every computation below (see doc comment) — a
+        // placeholder, not a guess at the real value.
+        timezone: "UTC".to_owned(),
+    };
+    let now = chrono::Utc::now();
+    let short_horizon = now + chrono::Duration::hours(48);
+    // Consecutive same-phase Moon events are ~29.5 days apart; 35 days
+    // guarantees catching the next one.
+    let long_horizon = now + chrono::Duration::days(35);
+
+    let next = |target: CelestialTarget, until: chrono::DateTime<chrono::Utc>| {
+        optic_scheduler::ephemeris_occurrences(&target, 0, &station, now, until)
+            .into_iter()
+            .next()
+    };
+    let solar = |event: SolarEvent| next(CelestialTarget::Solar(event), short_horizon);
+    let lunar = |event: LunarEvent| next(CelestialTarget::Lunar(event), short_horizon);
+    let milky_way = |event: MilkyWayEvent| next(CelestialTarget::MilkyWay(event), short_horizon);
+
+    let items = vec![
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Sunrise",
+            at: solar(SolarEvent::Sunrise),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Sunset",
+            at: solar(SolarEvent::Sunset),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Solar noon",
+            at: solar(SolarEvent::SolarNoon),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Civil dawn",
+            at: solar(SolarEvent::CivilDawn),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Civil dusk",
+            at: solar(SolarEvent::CivilDusk),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Astronomical dawn (true night ends)",
+            at: solar(SolarEvent::AstronomicalDawn),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Astronomical dusk (true night begins)",
+            at: solar(SolarEvent::AstronomicalDusk),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Golden hour start (morning)",
+            at: solar(SolarEvent::GoldenHourMorningStart),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Golden hour end (morning)",
+            at: solar(SolarEvent::GoldenHourMorningEnd),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Golden hour start (evening)",
+            at: solar(SolarEvent::GoldenHourEveningStart),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Golden hour end (evening)",
+            at: solar(SolarEvent::GoldenHourEveningEnd),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Blue hour start (morning)",
+            at: solar(SolarEvent::BlueHourMorningStart),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Blue hour end (morning)",
+            at: solar(SolarEvent::BlueHourMorningEnd),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Blue hour start (evening)",
+            at: solar(SolarEvent::BlueHourEveningStart),
+        },
+        CelestialPreviewItem {
+            group: "Sun",
+            label: "Blue hour end (evening)",
+            at: solar(SolarEvent::BlueHourEveningEnd),
+        },
+        CelestialPreviewItem {
+            group: "Moon",
+            label: "Moonrise",
+            at: lunar(LunarEvent::Moonrise),
+        },
+        CelestialPreviewItem {
+            group: "Moon",
+            label: "Moonset",
+            at: lunar(LunarEvent::Moonset),
+        },
+        CelestialPreviewItem {
+            group: "Moon",
+            label: "Lunar transit (highest point)",
+            at: lunar(LunarEvent::LunarTransit),
+        },
+        CelestialPreviewItem {
+            group: "Moon",
+            label: "Next new moon",
+            at: next(CelestialTarget::Lunar(LunarEvent::NewMoon), long_horizon),
+        },
+        CelestialPreviewItem {
+            group: "Moon",
+            label: "Next full moon",
+            at: next(CelestialTarget::Lunar(LunarEvent::FullMoon), long_horizon),
+        },
+        CelestialPreviewItem {
+            group: "Milky Way",
+            label: "Core rise",
+            at: milky_way(MilkyWayEvent::CoreRise),
+        },
+        CelestialPreviewItem {
+            group: "Milky Way",
+            label: "Core transit (highest point)",
+            at: milky_way(MilkyWayEvent::CoreTransit),
+        },
+        CelestialPreviewItem {
+            group: "Milky Way",
+            label: "Core set",
+            at: milky_way(MilkyWayEvent::CoreSet),
+        },
+    ];
+
+    let jd_now = crate::ephemeris::julian_day(now);
+    let illumination_now = crate::ephemeris::moon_illumination_pct(jd_now);
+    let illumination_tomorrow = crate::ephemeris::moon_illumination_pct(jd_now + 1.0);
+
+    Ok(Json(CelestialPreviewResponse {
+        items,
+        moon_illumination_pct: illumination_now,
+        moon_waxing: illumination_tomorrow > illumination_now,
+    }))
 }
 
 async fn start_stream(
@@ -635,6 +1114,7 @@ async fn capture(
     let profile = request.profile;
     let settings = request.settings.clone();
     let save_dng = request.save_dng;
+    let source = request.source.clone();
 
     let result = state
         .camera
@@ -651,6 +1131,7 @@ async fn capture(
             profile,
             settings,
             save_dng,
+            &source,
             &result,
         );
         capture_log.record(entry).await;
@@ -1050,6 +1531,98 @@ mod tests {
         assert!(config_is_staged(&preview_path, &cache_path).await);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn estimated_bytes_per_shot_ignores_save_dng_only_for_the_profile_that_forbids_it() {
+        assert_eq!(
+            estimated_bytes_per_shot(CaptureProfile::Binning2k, false),
+            estimated_bytes_per_shot(CaptureProfile::Binning2k, true),
+            "Binning2k never includes a DNG regardless of save_dng"
+        );
+    }
+
+    #[test]
+    fn estimated_bytes_per_shot_depends_on_save_dng_for_profiles_where_dng_is_optional() {
+        for profile in [CaptureProfile::MasterArchive, CaptureProfile::Dci4k] {
+            let with_dng = estimated_bytes_per_shot(profile, true);
+            let without_dng = estimated_bytes_per_shot(profile, false);
+            assert!(
+                with_dng > without_dng,
+                "a DNG file only adds bytes, never removes them ({profile:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn estimated_bytes_per_shot_ranks_profiles_by_their_known_relative_sizes() {
+        // MasterArchive (full-resolution, DNG on by default) must be the
+        // largest, Binning2k (JPEG-only, quarter resolution) the
+        // smallest — a regression here (e.g. transposed constants) would
+        // silently produce a wildly wrong storage-fill warning.
+        let master_archive = estimated_bytes_per_shot(CaptureProfile::MasterArchive, true);
+        let dci4k_with_dng = estimated_bytes_per_shot(CaptureProfile::Dci4k, true);
+        let binning2k = estimated_bytes_per_shot(CaptureProfile::Binning2k, false);
+        assert!(master_archive > dci4k_with_dng);
+        assert!(dci4k_with_dng > binning2k);
+    }
+
+    #[tokio::test]
+    async fn list_timezones_includes_known_real_iana_zones() {
+        let Json(zones) = list_timezones().await;
+        assert!(zones.contains(&"America/Vancouver"));
+        assert!(zones.contains(&"UTC"));
+        // Sanity bound, not a precise count — the real IANA database has
+        // several hundred zones; a regression that returned e.g. an empty
+        // or truncated list would still pass a bare non-empty check.
+        assert!(
+            zones.len() > 300,
+            "expected the full IANA zone list, got {}",
+            zones.len()
+        );
+    }
+
+    #[test]
+    fn is_valid_timezone_accepts_real_zones_and_rejects_garbage() {
+        assert!(is_valid_timezone("America/Vancouver"));
+        assert!(is_valid_timezone("UTC"));
+        assert!(!is_valid_timezone("Not/A/Zone"));
+        assert!(!is_valid_timezone(""));
+    }
+
+    #[tokio::test]
+    async fn celestial_preview_finds_real_sun_and_milky_way_events_for_vancouver() {
+        let params = Query(CelestialPreviewParams {
+            latitude: 49.2827,
+            longitude: -123.1207,
+            elevation_m: 70.0,
+        });
+        let Json(response) = celestial_preview(params).await.unwrap();
+
+        let find = |label: &str| response.items.iter().find(|item| item.label == label);
+        let sunrise = find("Sunrise").unwrap().at;
+        let sunset = find("Sunset").unwrap().at;
+        assert!(sunrise.is_some(), "expected a sunrise within 48h");
+        assert!(sunset.is_some(), "expected a sunset within 48h");
+
+        // Milky Way core rise/transit/set should all be found too — daily
+        // cadence events, same as the Sun, well within the 48h horizon.
+        assert!(find("Core rise").unwrap().at.is_some());
+        assert!(find("Core transit (highest point)").unwrap().at.is_some());
+        assert!(find("Core set").unwrap().at.is_some());
+
+        assert!((0.0..=100.0).contains(&response.moon_illumination_pct));
+    }
+
+    #[tokio::test]
+    async fn celestial_preview_rejects_out_of_range_coordinates() {
+        let params = Query(CelestialPreviewParams {
+            latitude: 200.0,
+            longitude: 0.0,
+            elevation_m: 0.0,
+        });
+        let error = celestial_preview(params).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
   <script src="/scheduler.js" defer></script>
+  <script src="/footer.js" defer></script>
 </head>
 <body>
   <header class="site-header">
@@ -19,10 +20,16 @@
       </div>
     </div>
     <div class="status-row" aria-live="polite">
-      <a class="nav-link" href="/">&larr; Back to dashboard</a>
       <span id="run-state" class="pill neutral">Loading</span>
     </div>
   </header>
+
+  <nav class="app-tabs" aria-label="Primary">
+    <a href="/">Dashboard</a>
+    <a href="/scheduler.html" aria-current="page">Scheduler</a>
+    <a href="/capture-history.html">Capture History</a>
+    <a href="/config.html">Config</a>
+  </nav>
 
   <main class="scheduler-main">
     <section class="rules-card" aria-labelledby="rules-title">
@@ -67,6 +74,7 @@
             <select id="rule-trigger-kind">
               <option value="Interval">Fixed interval</option>
               <option value="RecurringTime">Recurring time of day</option>
+              <option value="Ephemeris">Sun / Moon / Milky Way event</option>
             </select>
           </label>
 
@@ -104,12 +112,41 @@
               <label class="check"><input type="checkbox" value="Sun"> Sun</label>
             </fieldset>
           </div>
+
+          <div id="ephemeris-fields" class="trigger-fields" hidden>
+            <label>
+              <span>Celestial body</span>
+              <select id="rule-ephemeris-body">
+                <option value="Solar">Sun</option>
+                <option value="Lunar">Moon</option>
+                <option value="MilkyWay">Milky Way core</option>
+              </select>
+            </label>
+            <label>
+              <span>Event</span>
+              <select id="rule-ephemeris-event"></select>
+            </label>
+            <label id="ephemeris-degrees-field" hidden>
+              <span id="ephemeris-degrees-label">Elevation (degrees)</span>
+              <input id="rule-ephemeris-degrees" type="number" step="0.1" value="0">
+            </label>
+            <label id="ephemeris-direction-field" hidden>
+              <span>Direction</span>
+              <select id="rule-ephemeris-direction">
+                <option value="Rising">Rising</option>
+                <option value="Setting">Setting</option>
+                <option value="Both">Both</option>
+              </select>
+            </label>
+            <label>
+              <span>Offset from event (minutes, +/-)</span>
+              <input id="rule-ephemeris-offset" type="number" step="1" value="0">
+            </label>
+            <p class="muted full-width">Requires a Station to be set on the <a class="nav-link" href="/config.html">Config page</a> — a rule using this trigger produces no shots without one.</p>
+          </div>
         </div>
 
-        <!-- One `.constraint-box` per Constraint in rule.constraints. Only
-             `TimeWindow` exists today (Phase 1), so there is exactly one —
-             a future Phase 2+ constraint (SunElevationWindow etc.) gets its
-             own sibling `.constraint-box`, not fields added to this one. -->
+        <!-- One `.constraint-box` per Constraint in rule.constraints. -->
         <div class="constraint-box">
           <label class="check">
             <input id="rule-window-enabled" type="checkbox">
@@ -142,6 +179,50 @@
               <label class="check"><input type="checkbox" value="Sat"> Sat</label>
               <label class="check"><input type="checkbox" value="Sun"> Sun</label>
             </fieldset>
+          </div>
+        </div>
+
+        <div class="constraint-box">
+          <label class="check">
+            <input id="rule-sun-elevation-enabled" type="checkbox">
+            <span>Restrict to a Sun elevation window</span>
+          </label>
+          <div id="sun-elevation-fields" class="constraint-fields" hidden>
+            <label><span>Min elevation (°)</span><input id="rule-sun-elevation-min" type="number" step="0.1" min="-90" max="90" value="-90"></label>
+            <label><span>Max elevation (°)</span><input id="rule-sun-elevation-max" type="number" step="0.1" min="-90" max="90" value="90"></label>
+          </div>
+        </div>
+
+        <div class="constraint-box">
+          <label class="check">
+            <input id="rule-moon-elevation-enabled" type="checkbox">
+            <span>Restrict to a Moon elevation window</span>
+          </label>
+          <div id="moon-elevation-fields" class="constraint-fields" hidden>
+            <label><span>Min elevation (°)</span><input id="rule-moon-elevation-min" type="number" step="0.1" min="-90" max="90" value="-90"></label>
+            <label><span>Max elevation (°)</span><input id="rule-moon-elevation-max" type="number" step="0.1" min="-90" max="90" value="90"></label>
+          </div>
+        </div>
+
+        <div class="constraint-box">
+          <label class="check">
+            <input id="rule-moon-illumination-enabled" type="checkbox">
+            <span>Restrict to a Moon illumination window</span>
+          </label>
+          <div id="moon-illumination-fields" class="constraint-fields" hidden>
+            <label><span>Min illumination (%)</span><input id="rule-moon-illumination-min" type="number" step="1" min="0" max="100" value="0"></label>
+            <label><span>Max illumination (%)</span><input id="rule-moon-illumination-max" type="number" step="1" min="0" max="100" value="100"></label>
+          </div>
+        </div>
+
+        <div class="constraint-box">
+          <label class="check">
+            <input id="rule-milky-way-elevation-enabled" type="checkbox">
+            <span>Restrict to a Milky Way core elevation window</span>
+          </label>
+          <div id="milky-way-elevation-fields" class="constraint-fields" hidden>
+            <label><span>Min elevation (°)</span><input id="rule-milky-way-elevation-min" type="number" step="0.1" min="-90" max="90" value="10"></label>
+            <label><span>Max elevation (°)</span><input id="rule-milky-way-elevation-max" type="number" step="0.1" min="-90" max="90" value="90"></label>
           </div>
         </div>
         <p id="rule-form-notice" class="notice" role="status"></p>
@@ -182,7 +263,11 @@
         <div><dt>Frames (48h)</dt><dd id="forecast-count">—</dd></div>
         <div><dt>Avg. interval</dt><dd id="forecast-avg-interval">—</dd></div>
         <div><dt>Next 48h window</dt><dd id="forecast-window">—</dd></div>
+        <div><dt>Est. storage (48h)</dt><dd id="forecast-storage">—</dd></div>
+        <div><dt>Capture queue (now)</dt><dd id="forecast-queue-now">—</dd></div>
       </dl>
+      <p id="forecast-storage-warning" class="notice" role="status" hidden></p>
+      <div id="forecast-advisories"></div>
       <table class="forecast-table">
         <thead>
           <tr><th>When</th><th>Rules</th></tr>
@@ -194,6 +279,12 @@
     </section>
   </main>
 
-  <footer>Local network control plane</footer>
+  <footer class="system-footer">
+    <span id="footer-summary" class="muted">Loading system status&hellip;</span>
+    <div class="button-row">
+      <button id="footer-restart-daemon" type="button">Restart daemon</button>
+      <button id="footer-reboot" class="bad" type="button">Reboot Pi</button>
+    </div>
+  </footer>
 </body>
 </html>

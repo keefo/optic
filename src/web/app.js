@@ -29,18 +29,6 @@ const elements = {
   schedulerRunState: document.querySelector("#scheduler-run-state"),
   schedulerNextCapture: document.querySelector("#scheduler-next-capture"),
   schedulerRuleCount: document.querySelector("#scheduler-rule-count"),
-  systemMemoryBar: document.querySelector("#system-memory-bar"),
-  systemMemoryLabel: document.querySelector("#system-memory-label"),
-  systemDiskRootBar: document.querySelector("#system-disk-root-bar"),
-  systemDiskRootLabel: document.querySelector("#system-disk-root-label"),
-  systemDiskCaptureBar: document.querySelector("#system-disk-capture-bar"),
-  systemDiskCaptureLabel: document.querySelector("#system-disk-capture-label"),
-  systemTemp: document.querySelector("#system-temp"),
-  systemUptime: document.querySelector("#system-uptime"),
-  systemNetwork: document.querySelector("#system-network"),
-  systemCaptureHealth: document.querySelector("#system-capture-health"),
-  systemRestartDaemon: document.querySelector("#system-restart-daemon"),
-  systemReboot: document.querySelector("#system-reboot"),
 };
 
 const defaults = {
@@ -115,7 +103,7 @@ let mjpegGeneration = 0;
 let measurementRevision = 0;
 let lastFrameMetadata = null;
 const controlChanges = new Map();
-let baselineSettings = { ...defaults };
+let cameraFieldsInitialized = false;
 const activeMeasurements = new Map();
 const firstVisibleSamples = [];
 const MAX_MEASUREMENT_SAMPLES = 10;
@@ -163,15 +151,20 @@ function setPreviewAspect(profileName) {
   elements.previewFrame.style.aspectRatio = `${profile.previewWidth} / ${profile.previewHeight}`;
 }
 
+// Only forces `checked` for Binning2k (the one profile with a hard policy
+// — `validate_raw_policy` rejects a companion DNG for it outright).
+// MasterArchive/Dci4k leave `checked` exactly as it was: `save_dng` is a
+// persistent setting like rotation/gain, not reset on every profile
+// switch — it's staged via `stageSaveDng` (see below) and read back from
+// real server config on load (see `applyServerConfig`), same as every
+// other camera setting.
 function updateProfile() {
   const profile = selectedProfile();
   setPreviewAspect(profile);
   if (profile === "master_archive") {
-    elements.saveDng.checked = true;
-    elements.saveDng.disabled = true;
-    elements.dngHelp.textContent = "Required for Master Archive";
+    elements.saveDng.disabled = false;
+    elements.dngHelp.textContent = "Recommended for Master Archive";
   } else if (profile === "dci_4k") {
-    elements.saveDng.checked = false;
     elements.saveDng.disabled = false;
     elements.dngHelp.textContent = "Optional for 4K DCI";
   } else {
@@ -208,23 +201,38 @@ function showNotice(message, kind = "normal") {
   elements.notice.textContent = message;
   elements.notice.dataset.kind = kind;
 }
-checkSettingsModified();
 
-function checkSettingsModified() {
-  const current = settings();
-  const profileChanged =
-    document.querySelector('input[name="capture-profile"]:checked').value !==
-    baselineSettings.profile;
-  const isModified =
-    profileChanged ||
-    Object.keys(defaults).some((key) => {
-      // metering, exposure, ev are bypassed in UI, skip them
-      if (key === "metering" || key === "exposure" || key === "ev") return false;
-      return current[key] !== baselineSettings.settings[key];
+// Applies the server's current committed-or-staged profile/settings to the
+// form fields. Only called once per page load (see `cameraFieldsInitialized`
+// in `refreshStatus`) or right after a discard — never on every status
+// poll, which would otherwise fight an in-progress edit the user is
+// actively dragging a slider on.
+function applyServerConfig(config) {
+  applySettings(config.settings);
+  for (const btn of document.querySelectorAll('input[name="capture-profile"]')) {
+    btn.checked = btn.value === config.profile;
+  }
+  // Set before updateProfile() so Binning2k's forced-off policy (inside
+  // updateProfile()) still wins if that's the committed/staged profile.
+  elements.saveDng.checked = config.save_dng;
+  updateProfile();
+}
+
+// Stages the DNG checkbox as a real, persistent, saveable setting — see
+// `POST /api/config/save-dng` in web.rs for why this is its own endpoint
+// rather than riding along on the live-preview reconfigure request.
+async function stageSaveDng() {
+  try {
+    await api("/api/config/save-dng", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ save_dng: elements.saveDng.checked }),
     });
-
-  elements.discardConfig.disabled = !isModified;
-  elements.saveConfig.disabled = !isModified;
+  } catch (error) {
+    showNotice(`Failed to stage DNG preference: ${error.message}`, "error");
+  } finally {
+    refreshStatus();
+  }
 }
 
 async function fnCommitConfig() {
@@ -233,16 +241,11 @@ async function fnCommitConfig() {
     const response = await api("/api/config/commit", { method: "POST" });
     const result = await response.json();
     showNotice(result.message, "success");
-    // Snapshot the new baseline
-    baselineSettings = {
-      profile: selectedProfile(),
-      settings: settings(),
-    };
-    checkSettingsModified();
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
     setBusy(false);
+    refreshStatus();
   }
 }
 
@@ -252,20 +255,14 @@ async function fnDiscardConfig() {
     const response = await api("/api/config/discard", { method: "POST" });
     const result = await response.json();
     showNotice(result.message, "success");
-    // Roll back UI settings to the persistent baseline configuration state
-    applySettings(baselineSettings.settings);
-    const profileButtons = document.querySelectorAll('input[name="capture-profile"]');
-    for (const btn of profileButtons) {
-      if (btn.value === baselineSettings.profile) {
-        btn.checked = true;
-      }
-    }
-    updateProfile();
-    checkSettingsModified();
   } catch (error) {
     showNotice(error.message, "error");
   } finally {
     setBusy(false);
+    // Force the next refreshStatus() to re-populate camera fields from the
+    // just-reverted server state.
+    cameraFieldsInitialized = false;
+    refreshStatus();
   }
 }
 
@@ -787,6 +784,12 @@ async function refreshStatus() {
     document.querySelector("#sensor").textContent = status.camera.sensor || "Not detected";
     renderSync(status.sync);
     renderSchedulerSummary(status.schedule, status.config.schedule.rules);
+    if (!cameraFieldsInitialized) {
+      applyServerConfig(status.config);
+      cameraFieldsInitialized = true;
+    }
+    elements.saveConfig.disabled = !status.config_staged;
+    elements.discardConfig.hidden = !status.config_staged;
     if (!pageActive || captureRunning || reconfigureRunning) return;
     if (!status.camera.streaming && livePreview) {
       livePreview = false;
@@ -861,92 +864,6 @@ async function syncAction(path) {
   }
 }
 
-async function refreshSystemStatus() {
-  try {
-    const response = await api("/api/system/status");
-    const data = await response.json();
-    renderSystemStatus(data);
-  } catch {
-    resetUsageBar(elements.systemMemoryBar, elements.systemMemoryLabel);
-    resetUsageBar(elements.systemDiskRootBar, elements.systemDiskRootLabel);
-    resetUsageBar(elements.systemDiskCaptureBar, elements.systemDiskCaptureLabel);
-    elements.systemTemp.textContent = "—";
-    elements.systemUptime.textContent = "—";
-    elements.systemNetwork.textContent = "—";
-    elements.systemCaptureHealth.textContent = "—";
-  }
-}
-
-// Sets the bar width via the `style` DOM property rather than an HTML
-// `style="..."` attribute (e.g. via innerHTML) — the dashboard's CSP is
-// `style-src 'self'` with no `unsafe-inline`, which silently drops inline
-// style attributes parsed from markup. Assigning `.style.width` in JS is
-// exempt (it's CSSOM manipulation, governed by script-src, not style-src).
-function setUsageBar(barEl, labelEl, usedBytes, totalBytes) {
-  const pct = totalBytes > 0 ? Math.min(100, (usedBytes / totalBytes) * 100) : 0;
-  barEl.style.width = `${pct.toFixed(1)}%`;
-  barEl.classList.toggle("warn", pct >= 70 && pct < 90);
-  barEl.classList.toggle("danger", pct >= 90);
-  labelEl.textContent = `${formatBytes(usedBytes)} / ${formatBytes(totalBytes)} (${pct.toFixed(0)}%)`;
-}
-
-function resetUsageBar(barEl, labelEl) {
-  barEl.style.width = "0%";
-  barEl.classList.remove("warn", "danger");
-  labelEl.textContent = "—";
-}
-
-function renderSystemStatus(data) {
-  const { system, capture_health: health } = data;
-
-  setUsageBar(
-    elements.systemMemoryBar,
-    elements.systemMemoryLabel,
-    system.memory.total_bytes - system.memory.available_bytes,
-    system.memory.total_bytes,
-  );
-
-  const setDiskBar = (label, barEl, labelEl) => {
-    const entry = system.disks.find((disk) => disk.label === label);
-    if (!entry) {
-      resetUsageBar(barEl, labelEl);
-      return;
-    }
-    setUsageBar(barEl, labelEl, entry.total_bytes - entry.available_bytes, entry.total_bytes);
-  };
-  setDiskBar("root", elements.systemDiskRootBar, elements.systemDiskRootLabel);
-  setDiskBar("capture", elements.systemDiskCaptureBar, elements.systemDiskCaptureLabel);
-
-  elements.systemTemp.textContent =
-    system.cpu_temp_celsius != null ? `${system.cpu_temp_celsius.toFixed(1)}°C` : "—";
-  elements.systemUptime.textContent = formatDuration(system.uptime_seconds);
-  elements.systemNetwork.textContent =
-    system.network_interfaces.length > 0
-      ? system.network_interfaces
-          .map((iface) => `${iface.name}: ${iface.addresses.join(", ")}`)
-          .join(" · ")
-      : "No network interfaces";
-
-  elements.systemCaptureHealth.textContent =
-    health.total > 0
-      ? `${health.successful}/${health.total} succeeded` +
-        (health.average_duration_ms != null
-          ? ` · avg ${(health.average_duration_ms / 1000).toFixed(1)}s`
-          : "") +
-        (health.last_capture_success === false ? " · last capture failed" : "")
-      : "No captures in the last 24h";
-}
-
-async function systemAction(path, confirmMessage) {
-  if (!window.confirm(confirmMessage)) return;
-  try {
-    await api(path, { method: "POST" });
-    showNotice("Command sent.");
-  } catch (error) {
-    showNotice(`System action failed: ${error.message}`, "error");
-  }
-}
-
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`;
@@ -984,8 +901,13 @@ document.querySelectorAll('input[name="capture-profile"]').forEach((control) => 
     controlRevision += 1;
     beginMeasurement("Capture profile", false, false);
     updateProfile();
+    // Binning2k's forced-off policy inside updateProfile() may just have
+    // changed `checked` out from under a previously-staged value — keep
+    // the server in sync with whatever the checkbox now actually shows.
+    void stageSaveDng();
   });
 });
+elements.saveDng.addEventListener("change", stageSaveDng);
 elements.preview.addEventListener("error", () => {
   if (livePreview) {
     showNotice("Waiting for camera frames…");
@@ -1004,26 +926,11 @@ window.addEventListener("pageshow", (event) => {
   hidePreview();
   void ensurePreview();
 });
-elements.systemRestartDaemon.addEventListener("click", () =>
-  systemAction(
-    "/api/system/restart-daemon",
-    "Restart the optic-daemon service? The dashboard will briefly disconnect.",
-  ),
-);
-elements.systemReboot.addEventListener("click", () =>
-  systemAction(
-    "/api/system/reboot",
-    "Reboot the Raspberry Pi? This takes it offline for about a minute.",
-  ),
-);
-
 applySettings(defaults);
 updateProfile();
 hidePreview();
 refreshStatus();
-refreshSystemStatus();
 setInterval(refreshStatus, 3000);
-setInterval(refreshSystemStatus, 15000);
 elements.discardConfig.addEventListener("click", fnDiscardConfig);
 elements.saveConfig.addEventListener("click", fnCommitConfig);
 elements.syncToggle.addEventListener("click", () =>

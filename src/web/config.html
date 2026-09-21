@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Config — Project Optic</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/config.js" defer></script>
+  <script src="/footer.js" defer></script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="brand">
+      <img class="brand-icon" src="/icon.svg" alt="" width="48" height="48">
+      <div>
+        <p class="eyebrow">PROJECT OPTIC</p>
+        <h2>Config</h2>
+      </div>
+    </div>
+  </header>
+
+  <nav class="app-tabs" aria-label="Primary">
+    <a href="/">Dashboard</a>
+    <a href="/scheduler.html">Scheduler</a>
+    <a href="/capture-history.html">Capture History</a>
+    <a href="/config.html" aria-current="page">Config</a>
+  </nav>
+
+  <main class="config-main">
+    <section class="station-card" aria-labelledby="station-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">GLOBAL</p>
+          <h2 id="station-title">Station</h2>
+        </div>
+        <span class="muted">Used by sunrise/moon/Milky Way scheduler rules</span>
+      </div>
+      <p class="controls-help">Location and timezone for Solar/Lunar/Milky Way triggers and constraints on the <a class="nav-link" href="/scheduler.html">Scheduler page</a>. Not needed for interval/recurring-time rules.</p>
+      <div class="station-grid">
+        <label>
+          <span>Latitude</span>
+          <input id="station-latitude" type="number" step="0.0001" min="-90" max="90" placeholder="e.g. 49.2827">
+        </label>
+        <label>
+          <span>Longitude</span>
+          <input id="station-longitude" type="number" step="0.0001" min="-180" max="180" placeholder="e.g. -123.1207">
+        </label>
+        <label>
+          <span>Elevation (m)</span>
+          <input id="station-elevation" type="number" step="1" placeholder="e.g. 70">
+        </label>
+        <label>
+          <span>Timezone</span>
+          <select id="station-timezone">
+            <option value="">Loading&hellip;</option>
+          </select>
+        </label>
+      </div>
+      <p class="controls-help">Saving also sets the Pi's system clock timezone to match, so both stay in sync.</p>
+      <div class="button-row margin-top-10">
+        <button id="save-station" class="accent good" type="button" disabled>Save station</button>
+        <button id="discard-station" class="text-button bad" type="button" hidden>Discard changes</button>
+      </div>
+      <p id="station-notice" class="notice" role="status"></p>
+    </section>
+
+    <section class="celestial-card" aria-labelledby="celestial-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">PREVIEW</p>
+          <h2 id="celestial-title">Celestial times</h2>
+        </div>
+        <span class="muted">Reflects the Station fields above, unsaved edits included</span>
+      </div>
+      <p id="celestial-empty" class="empty-state">Set latitude and longitude above to preview celestial times.</p>
+      <div id="celestial-groups" hidden></div>
+    </section>
+
+    <section class="time-card" aria-labelledby="time-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SYSTEM</p>
+          <h2 id="time-title">Time &amp; NTP</h2>
+        </div>
+        <span class="muted">Syncs automatically every ~30 min</span>
+      </div>
+      <dl>
+        <div><dt>Current time</dt><dd id="time-now">&mdash;</dd></div>
+        <div><dt>System timezone</dt><dd id="time-timezone">&mdash;</dd></div>
+        <div><dt>NTP enabled</dt><dd><span id="time-ntp-enabled" class="pill neutral">&mdash;</span></dd></div>
+        <div><dt>Clock synchronized</dt><dd><span id="time-synchronized" class="pill neutral">&mdash;</span></dd></div>
+      </dl>
+      <div class="button-row margin-top-10">
+        <button id="ntp-sync-now" type="button">Sync now</button>
+      </div>
+      <p id="time-notice" class="notice" role="status"></p>
+    </section>
+  </main>
+
+  <footer class="system-footer">
+    <span id="footer-summary" class="muted">Loading system status&hellip;</span>
+    <div class="button-row">
+      <button id="footer-restart-daemon" type="button">Restart daemon</button>
+      <button id="footer-reboot" class="bad" type="button">Reboot Pi</button>
+    </div>
+  </footer>
+</body>
+</html>
