@@ -1,9 +1,9 @@
 # Dated Worklog: 2026-09-20 - Mac-Side Timelapse Builder
 
-Status: **implemented and tested on the iMac** (unit, integration, and a real
-end-to-end encode). Committed, pushed, and opened as PR #5 (rebased onto
-`main` on 2026-09-21). Awaiting user acceptance. The CI job for the tool is
-in `worklogs/2026-09-21-ci-timelapse-macos.md`.
+Status: **user-accepted** (2026-09-21). Implemented and tested on the iMac
+(unit, integration, and a real end-to-end encode), and merged to `main` via
+PR #5 (`b8ecbed`, with CI green on `main`). The CI job for the tool is in
+`worklogs/2026-09-21-ci-timelapse-macos.md`.
 
 ## Objective
 
@@ -335,6 +335,10 @@ The folder now holds only the two final outputs listed above.
    or stretched geometry, and deflicker smoothing the auto-exposure.
 2. Try a dry run:
    `cd tools/timelapse && cargo run --release -- --date 2026-09-20 --dry-run`.
+
+**User acceptance (2026-09-21):** the user watched
+`every1min_master-archive_20260920-1922_20260920-2034.mp4` and reported
+"it looks good". Step 2 (the dry run) wasn't separately reported.
 
 ## Parallel-Session Coordination (applies to all four tracks)
 
