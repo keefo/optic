@@ -24,8 +24,47 @@ defaults:
     shell: bash
 
 jobs:
+  # Docs-only changes skip the build jobs below. GitHub counts a required
+  # check whose job was skipped by `if:` as passing, so the ruleset's two
+  # required checks still resolve. Fails open: if this job fails, its output
+  # is empty and both build jobs run.
+  changes:
+    name: Detect changed scope
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          range=""
+          case "$EVENT" in
+            pull_request) range="$PR_BASE...$PR_HEAD" ;;
+            push) [[ -n $BEFORE && ! $BEFORE =~ ^0+$ ]] && range="$BEFORE..$SHA" ;;
+          esac
+          if [[ -n $range ]] && files=$(git diff --name-only "$range"); then
+            printf '%s\n' "$files"
+            result=$(printf '%s\n' "$files" | scripts/ci-changed-scope.sh)
+          else
+            echo "No usable diff range for $EVENT; running full CI."
+            result="docs_only=false"
+          fi
+          echo "$result" | tee -a "$GITHUB_OUTPUT"
+
   web-lint:
     name: Biome (web assets)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -40,6 +79,8 @@ jobs:
 
   rust-arm64:
     name: Rust (Debian 13 arm64)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04-arm
     container: debian:trixie
     timeout-minutes: 60
