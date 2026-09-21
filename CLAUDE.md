@@ -1,5 +1,6 @@
 # CLAUDE.md
-@AGENTS.md
+
+`AGENTS.md` is a symlink to this file, so every agent reads the same rules.
 
 # Claude-specific notes
 
@@ -166,3 +167,14 @@ deployed, hardware-validated, soak-tested, and user-accepted.
   - Append to the list cleanly; never overwrite, reorder, or delete existing project rules or structure definitions.
 - **Consult Prior Learnings:** Always inspect `## Environment and Tooling Constraints` in `AGENTS.md` before invoking unfamiliar CLI tools to prevent repeating previously logged errors.
 
+## Environment and Tooling Constraints
+
+- Do not use `orca worktree set --comment ...` without a selector (`orca worktree set --help` lists `--worktree <selector>` as required); use `orca worktree set --worktree current --comment ...` instead.
+- Do not use `git push origin main` (GitHub ruleset GH013: changes to `main` must go through a pull request with 2 required status checks); push a branch and open a pull request instead.
+
+## Orca Worktree Completion Rules
+- When the task, PR, or assigned scope is finished:
+  1. Kill all background watchers, servers, or lingering subshells immediately (never leave dangling PTY processes).
+  2. Use the Orca CLI to update the worktree status:
+     `orca worktree set --worktree current --comment "Completed: <one-line summary>"`
+  3. Cleanly exit your turn and yield execution with exit code 0.
