@@ -71,7 +71,7 @@ for command in ssh tar; do
 done
 
 if [[ $MODE == full ]]; then
-    for path in Cargo.toml Cargo.lock README.md biome.json docs/optic-daemon-build-environment.md \
+    for path in Cargo.toml Cargo.lock rust-toolchain.toml README.md biome.json docs/optic-daemon-build-environment.md \
         docs/optic-daemon-camera.md docs/optic-daemon.md setup.md src systemd \
         scripts/setup-optic-daemon-phase-01.sh; do
         [[ -e $PROJECT_ROOT/$path ]] || {
@@ -96,6 +96,7 @@ if [[ $MODE == full ]]; then
     COPYFILE_DISABLE=1 tar -czf "$ARCHIVE" -C "$PROJECT_ROOT" \
         Cargo.toml \
         Cargo.lock \
+        rust-toolchain.toml \
         README.md \
         biome.json \
         docs/optic-daemon-build-environment.md \
@@ -148,8 +149,10 @@ OPTIC_SYSROOT="$HOME/.local/optic-sysroot"
 OPTIC_NATIVE_LIB="$OPTIC_SYSROOT/usr/lib/aarch64-linux-gnu"
 DEB_CACHE="$HOME/.cache/optic-debs"
 CARGO_TARGET_DIR="$HOME/.cache/optic-daemon-target"
-RUST_VERSION=1.98.1
+RUST_VERSION=
 
+# Also parsed by scripts/ci-install-build-deps.sh for GitHub Actions CI; keep
+# the `required_packages=(` / `)` lines and one single-quoted pin per line.
 required_packages=(
     'libcamera0.7=0.7.2+rpt20260817-1'
     'libcamera-dev=0.7.2+rpt20260817-1'
@@ -187,6 +190,11 @@ if [[ $MODE == full ]]; then
     [[ -r /lib/aarch64-linux-gnu/libcamera.so.0.7 ]] || \
         fail 'system libcamera.so.0.7 is missing; install the Raspberry Pi libcamera runtime first'
     source_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$SOURCE_DIR/Cargo.toml" | head -n 1)
+    # rust-toolchain.toml is the single source of the pinned toolchain; CI
+    # (.github/workflows/ci.yml) reads the same file.
+    RUST_VERSION=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' "$SOURCE_DIR/rust-toolchain.toml" | head -n 1)
+    [[ $RUST_VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || \
+        fail "rust-toolchain.toml does not pin an exact Rust version: ${RUST_VERSION:-<empty>}"
     [[ $source_version == "$VERSION" ]] || \
         fail "staged source version $source_version does not match requested version $VERSION"
 else
@@ -341,9 +349,8 @@ fi
 printf '%s\n' '==> Linting web assets with Biome'
 [[ -x $HOME/biome ]] || fail "Biome binary is missing: $HOME/biome"
 cd "$SOURCE_DIR"
-"$HOME/biome" check src/web/app.js src/web/index.html src/web/scheduler.js src/web/scheduler.html \
-    src/web/capture-history.js src/web/capture-history.html src/web/config.js src/web/config.html \
-    src/web/footer.js || \
+# The checked file list lives in biome.json `files.includes`, shared with CI.
+"$HOME/biome" check || \
     fail 'Web assets failed Biome validation'
 
 if [[ $MODE == full ]]; then
