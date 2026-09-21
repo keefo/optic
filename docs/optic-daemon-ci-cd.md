@@ -106,9 +106,14 @@ Mac (human) ─► ./scripts/build-deploy-optic-daemon.sh --release X.Y.Z
   `Rust (Debian 13 arm64)`) need no change and docs-only PRs merge
   without a build. Workflow-level `paths-ignore` is deliberately not used:
   the required checks would never report and block the PR. The step fails
-  open: a new branch, `workflow_dispatch`, an unknown `before` commit, or
+  open: `workflow_dispatch`, an unknown `before` commit, an empty diff, or
   a failed `changes` job all run the full CI (added 2026-09-21,
-  `worklogs/2026-09-21-ci-skip-docs-only.md`). The script also prints
+  `worklogs/2026-09-21-ci-skip-docs-only.md`). A new branch's first push
+  (all-zero `before`) is classified against the default branch
+  (`origin/<default>...sha`, the changes since the fork), so a new
+  docs-only branch also skips the builds. It falls back to the full CI only
+  if that ref is missing (added 2026-09-21,
+  `worklogs/2026-09-21-ci-new-branch-diff-base.md`). The script also prints
   `timelapse=true|false`, which gates `timelapse-macos` below. It is true
   when any non-`.md` path is under `tools/timelapse/`, or is
   `.github/workflows/ci.yml`, `scripts/ci-changed-scope.sh`, or
