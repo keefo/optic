@@ -2,8 +2,9 @@
 
 Status (2026-09-20):
 
-- Phase 1 (CI gates) is **implemented and statically validated** but has
-  **not yet run on GitHub**.
+- Phase 1 (CI gates) is **implemented and tested on GitHub Actions**.
+  The cold run took 4m35s and a warm run 1m45s; 116 Linux tests pass. The
+  CI binary has not been hardware-validated yet (phase 2).
 - Phases 2–4 are planned.
 
 Worklogs:
@@ -99,9 +100,11 @@ Mac (human) ─► ./scripts/build-deploy-optic-daemon.sh --release X.Y.Z
   1. `runs-on: ubuntu-24.04-arm`, `container: debian:trixie`.
   2. Run `scripts/ci-install-build-deps.sh`. It:
      - installs the base tools;
-     - adds the Raspberry Pi archive with its key fingerprint pinned to
-       `CF8A1AF502A2AA2D763BAE7E82B129927FA3303E` (checked, not trusted on
-       first use);
+     - adds the Raspberry Pi archive, with its key taken from the
+       `raspberrypi-archive-keyring` `.deb` (pinned by SHA-256) and checked
+       against the fingerprint `CF8A1AF502A2AA2D763BAE7E82B129927FA3303E`.
+       The loose `raspberrypi.gpg.key` cannot be used: its SHA-1 binding
+       signatures are rejected by Debian 13's `sqv` since 2026-02-01;
      - installs **exactly** the `required_packages` pins parsed from
        `scripts/build-deploy-optic-daemon.sh`, so the pins exist in one
        place.
@@ -213,9 +216,9 @@ Each phase gets its own dated worklog, per `CLAUDE.md`.
 - **O2**: The RPi archive may remove `0.7.2+rpt20260817-1`. CI would then
   fail loudly, just as the Pi bootstrap does. The mitigation is phase 4
   (GHCR image, or cached `.deb`s).
-- **O3**: A cold LTO build with `codegen-units = 1` on 2 vCPU could take
-  roughly 10–20 minutes. This is an unmeasured estimate. Measure it in
-  phase 1 and check it against the plan's monthly minutes.
+- **O3** (measured 2026-09-20): a Rust job takes about 4.6 min on a cold
+  cache and about 1.8 min on a warm one, plus about 5 s for Biome. That is
+  roughly 2–5 billed minutes per push.
 - **O4**: `CLAUDE.md` imports `@AGENTS.md`, but no `AGENTS.md` exists in
   this checkout, so the tooling-constraints section it references is
   missing.

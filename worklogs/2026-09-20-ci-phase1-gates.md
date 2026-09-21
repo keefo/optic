@@ -1,10 +1,11 @@
 # Dated Worklog: 2026-09-20 - CI Phase 1: GitHub Actions Gates
 
-Status: **implemented and statically validated locally**.
+Status: **implemented and tested on GitHub Actions**. All acceptance
+criteria (AC1–AC6) passed.
 
-- **Not yet run on GitHub.** AC5 and AC6 need this branch to be committed
-  and pushed, which is waiting on user approval.
 - Nothing was deployed. The Pi was not touched.
+- The CI-built binary has **not** been hardware-validated; that is phase 2.
+- Awaiting user acceptance.
 
 Plan: [`docs/optic-daemon-ci-cd.md`](../docs/optic-daemon-ci-cd.md) §7 phase 1.
 Research: [`2026-09-20-github-ci-cd-plan.md`](2026-09-20-github-ci-cd-plan.md).
@@ -99,7 +100,9 @@ Files changed:
   - adds a comment documenting that CI parses `required_packages`.
 - `scripts/ci-install-build-deps.sh` (new): the root-only installer for the
   arm64 trixie container. It:
-  - pins the Raspberry Pi archive key fingerprint;
+  - takes the Raspberry Pi archive key from the
+    `raspberrypi-archive-keyring_2025.1+rpt1_all.deb` package, pinned by
+    SHA-256, then checks the key fingerprint;
   - writes a deb822 source with `Signed-By`;
   - installs the parsed pins with `--print-packages` available for dry runs;
   - uses a read loop instead of `mapfile`, because macOS bash 3.2 has no
@@ -142,8 +145,41 @@ without qemu-user.
 | AC3 | Each pin is present in the Debian trixie and RPi trixie arm64 `Packages` indexes | 9/9 OK |
 | AC4 | `sed` parse of `rust-toolchain.toml` | `1.98.1` |
 | AC4 | Local `cargo fmt --check`, `cargo test --locked --all-targets`, `cargo clippy … -D warnings` (Homebrew cargo 1.98.1, which ignores `rust-toolchain.toml`) | fmt OK; `109 passed; 0 failed`; Clippy clean |
-| AC5 | GitHub Actions run | **Not run.** Needs commit and push approval |
-| AC6 | Negative CI run | **Not run** |
+| AC5 | Run `35567448224` (commit `e04a755`) | **Failed** at "Install pinned native build dependencies". See Failures Encountered |
+| AC5 | Run `35567649875` (commit `b09f7c4`, cold cache) | **Success.** Biome 5s; the Rust job took 4m35s in total |
+| AC6 | Run `35568071487` (commit `64dabda`, a deliberate extra space in `src/main.rs` `fn main`) | **Failure** at the `cargo fmt` step (`Diff in …/src/main.rs:32`). Biome still passed. Reverted in `acc0002` |
+| AC5 | Run `35568193008` (commit `acc0002`, warm cache) | **Success.** The Rust job took 1m45s in total |
+
+AC5 details from run `35567649875`:
+
+- Step times on a cold cache:
+  - dependency install: 20s;
+  - toolchain: 6s;
+  - `cargo test`: 64s;
+  - Clippy: 28s;
+  - release build (LTO, `codegen-units = 1`): 100s;
+  - cache save: 41s.
+- Step times on a warm cache (run `35568193008`):
+  - dependency install: 20s;
+  - cache restore: 11s;
+  - test: 9s;
+  - Clippy: 3s;
+  - release build: 39s.
+- Linux tests: `112 passed; 0 failed` in the main target, plus
+  `4 passed; 0 failed` in `libcamera_probe`. That is 116 in total, vs 109
+  on macOS; the difference is the `cfg(target_os = "linux")` tests.
+- Clippy `-D warnings` passed **without** the Pi's LLVM-isolating
+  compiler wrapper, as expected, because the container installs libclang
+  system-wide.
+- `ldd` resolved every library with no `not found`. The binary links
+  `/lib/aarch64-linux-gnu/libcamera.so.0.7`, `libcamera-base.so.0.7` and
+  `libturbojpeg.so.0`. The embedded-version check for `0.1.29` passed.
+- The artifact `optic-daemon-0.1.29-aarch64-linux-gnu-b09f7c437246` is
+  about 2.0 MB and expires 2026-10-05. It was downloaded with
+  `gh run download`, and `shasum -a 256 -c SHA256SUMS` reported 15/15 OK.
+  `file` reports `ELF 64-bit LSB pie executable, ARM aarch64 … stripped`;
+  it is 5,331,752 bytes, and the executable bit survived the round trip.
+  `VERSION` is `0.1.29` and `COMMIT` is `b09f7c43…`.
 
 The RPi archive key fingerprint was computed from
 `raspberrypi.gpg.key` (sha256 `76603890…6d56`) with a Python OpenPGP v4
@@ -159,18 +195,30 @@ VM. Primary key: `CF8A1AF502A2AA2D763BAE7E82B129927FA3303E`, uid
   the finding is recorded here instead.
 - Biome's config-file check exposed the missing trailing newline in
   `biome.json`. Fixed as described above.
+- **First CI run failed:** apt refused the Raspberry Pi archive.
+  - The error from `sqv` was `Signing key on CF8A1AF5…7FA3303E is not
+    bound … SHA1 is not considered secure since 2026-02-01`. The key served
+    at `raspberrypi.gpg.key` carries SHA-1 self-signatures (checked locally:
+    the uid and subkey bindings are both SHA-1).
+  - The `raspberrypi-archive-keyring 2025.1+rpt1` package ships the **same**
+    key, with SHA-512 bindings, as `usr/share/keyrings/raspberrypi-archive-keyring.pgp`.
+    The package's SHA-256 (`2e727149…60e4`) matched the RPi `Packages`
+    index.
+  - Fix (commit `b09f7c4`): download that `.deb`, check its pinned SHA-256
+    and the key fingerprint, and use the `.pgp` as `Signed-By`.
+  - The pinned fingerprint check itself had passed, which confirms it was
+    matching the correct key.
+- Command mistake: `git revert -q` does not exist (`git revert` has no
+  quiet flag). Used `git revert --no-edit HEAD >/dev/null` instead. As
+  with `mapfile`, this is recorded here because there is no `AGENTS.md`.
 
 ## Limitations and Next Steps
 
-- **AC5 and AC6 are unverified.** The whole Linux path is exercised only by
-  a real GitHub run:
-  - installing the container dependencies;
-  - bindgen;
-  - whether the Clippy LLVM wrapper is needed;
-  - the Linux test count;
-  - `ldd`.
-  Next: commit and push this branch (user approval), watch the run, record
-  the durations, and fix any failures.
+- Pinning `raspberrypi-archive-keyring` means CI fails loudly if the RPi
+  archive rotates its key or withdraws that package version. That is the
+  intended behaviour; update the pin deliberately.
+- The branch history includes the AC6 negative-test commit and its revert
+  (`64dabda`, `acc0002`), by design.
 - The deploy-script edits (reading `RUST_VERSION` from the file, Biome with
   no paths) have **not** run on the Pi. The next real `build-deploy` run,
   full or `--assets`, will exercise them. Plan item O1: check that the Pi's
