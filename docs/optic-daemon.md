@@ -4,7 +4,7 @@
 
 It organizes the operational lifecycle of a 365-day autonomous timelapse into **three strictly decoupled subsystems** that communicate primarily via the persistent filesystem (`/mnt/capture`) and a single shared hardware mutex.
 
-> **Implementation status:** The three-subsystem design below is the target architecture. The deployment validated on 2026-09-16 implements **Phase 1 (`optic_web`) only**. `optic_scheduler` is not yet implemented. `optic_sync` (Data Sync Manager) **is now implemented in-process** (see [section 6](#6-subsystem-3-data-sync-manager-optic_sync)) — but its actual protocol and configuration differ from the target design below: it reuses the existing restricted-SSH `ping`/`put` transport (`scripts/optic-capture-receiver.sh`, unchanged) rather than `scp`/`rsync` to `imac.local`, and is configured via `OPTIC_SYNC_*` environment variables rather than `config.toml` (which does not exist — see `worklogs/2026-09-18-data-sync-manager.md` for the full rationale). The independent Phase 6 systemd timer (`scripts/optic-capture-transfer.sh`) still runs in parallel pending a separate, explicit cutover decision; both are safe to run concurrently since `optic_sync` only ever touches `optic-web-*.jpg`/`.dng` files.
+> **Implementation status:** The three-subsystem design below is the target architecture. All three subsystems are now implemented and deployed, but in places differ from the target design below. `optic_web` was validated on 2026-09-16. `optic_scheduler` is implemented as the composable-rules design in [`docs/optic-daemon-scheduler.md`](optic-daemon-scheduler.md), which supersedes §5's single-mode design (see `worklogs/2026-09-19-timelapse-scheduler-phase1*.md` and `worklogs/2026-09-20-scheduler-phase2*.md`). `optic_sync` (Data Sync Manager) **is now implemented in-process** (see [section 6](#6-subsystem-3-data-sync-manager-optic_sync)) — but its actual protocol and configuration differ from the target design below: it reuses the existing restricted-SSH `ping`/`put` transport (`scripts/optic-capture-receiver.sh`, unchanged) rather than `scp`/`rsync` to `imac.local`, and is configured via `OPTIC_SYNC_*` environment variables rather than `config.toml` (which does not exist — see `worklogs/2026-09-18-data-sync-manager.md` for the full rationale). The older Phase 6 transfer script (`scripts/optic-capture-transfer.sh`) remains in the repository, but as of 2026-09-20 no systemd timer or service for it is installed on the Pi (`worklogs/2026-09-20-stale-iMac-ip-beszel-and-sync.md`), so `optic_sync` is the only live transfer path.
 
 ## Deployed Phase 1
 
@@ -682,9 +682,9 @@ Validated on the Raspberry Pi 5 on 2026-09-16 UTC:
 | Capture and transfer | `optic-web-1789542088039.jpg`, 1,343,700 bytes, transferred and verified to `/Users/admin/Pictures/Optic` |
 | Idle resources | 4.0 MiB RSS, 6 tasks |
 | Port 80 | Not configured; canonical endpoint is TCP `8000` |
-| Reboot persistence | Unit is enabled and `Linger=yes`; an actual reboot test is pending because PolicyKit required interactive authorization |
+| Reboot persistence | Unit is enabled and `Linger=yes`. Pending on 2026-09-16; later passed on real reboots (`worklogs/2026-09-19-reboot-nonewprivileges-fix.md`, `worklogs/2026-09-19-timelapse-scheduler-phase1b.md`) |
 
-An administrator can complete the final persistence check by rebooting the Pi, then confirming `systemctl --user is-active optic-daemon.service` and `curl http://127.0.0.1:8000/healthz` as `liam`.
+To re-check persistence after future changes, reboot the Pi, then confirm `systemctl --user is-active optic-daemon.service` and `curl http://127.0.0.1:8000/healthz` as `liam`.
 
 ---
 

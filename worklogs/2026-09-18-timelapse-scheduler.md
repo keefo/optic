@@ -1,5 +1,10 @@
 # Dated Worklog: 2026-09-18 - Timelapse Scheduler (`optic_scheduler`)
 
+Update 2026-09-20: superseded. The scheduler was implemented to the
+composable-rules design in `docs/optic-daemon-scheduler.md`; see
+`worklogs/2026-09-19-timelapse-scheduler-phase1*.md` and
+`worklogs/2026-09-20-scheduler-phase2*.md`. The original status follows.
+
 Status: planned, not implemented. Pre-implementation plan only, per the
 required workflow (scope, current-state findings, design proposal, test
 plan, before writing code). Unlike the Data Sync Manager worklog earlier

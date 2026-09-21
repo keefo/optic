@@ -1,5 +1,11 @@
 # Dated Worklog: 2026-09-18 - System Control Panel (Pi Management via Web Dashboard)
 
+Update 2026-09-20: the Reboot button (B) was later fixed and
+user-verified on real hardware (`worklogs/2026-09-19-reboot-nonewprivileges-fix.md`).
+No worklog records a verified press of the Restart-daemon button, so that
+part remains untested. Dashboard auth is still deferred. The original
+status follows.
+
 Status: **A (read-only health) implemented, deployed (`optic-daemon`
 0.1.21), and empirically verified correct on real hardware** across three
 bug-fix rounds (see Validation). **B (reboot/restart-daemon) implemented

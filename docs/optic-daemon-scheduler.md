@@ -1,9 +1,13 @@
 # Design Note: Timelapse Scheduler (`optic_scheduler`) — Composable Rules
 
-> **Status:** Design proposal, not implemented. Written at the user's
-> request before any code, per this repo's workflow (design goes in
-> `docs/`; the dated implementation record goes in a `worklogs/` entry
-> once the open decisions below are confirmed).
+> **Status:** Implemented and deployed. Phase 1 (core engine, reboot-durable
+> config, live wiring, rules editor) and Phase 2 (ephemeris triggers and
+> constraints, storage forecaster, overlap/dead-rule advisories, capture
+> history page, config page) are recorded in
+> `worklogs/2026-09-19-timelapse-scheduler-phase1*.md` and
+> `worklogs/2026-09-20-scheduler-phase2*.md`. Every decision in §14 is
+> resolved. This doc was first written as a design proposal before any
+> code; the text below keeps that framing where it explains why.
 >
 > **Relationship to prior work:** supersedes `docs/optic-daemon.md` §5's
 > single-mode design (fixed interval *or* solar-adaptive bands as one
@@ -17,9 +21,9 @@
 > profile/settings an autonomous shot uses) is confirmed here: **whatever
 > the currently committed profile/settings are** — no scheduler-specific
 > override, including for DNG (§6). Decision #4 (full-disk runtime
-> behavior) is still open; a recommendation is proposed in §7 but needs
-> explicit confirmation, same as before. Decision #6 (UI placement as a
-> nested section) is likely superseded — see §10. Also new since the
+> behavior) is resolved in §7 (skip the tick and report it). Decision #6
+> (UI placement as a nested section) is superseded by a dedicated page
+> (§10). Also new since the
 > original worklog: rule-conflict resolution (merge simultaneous
 > occurrences into one tagged capture, §3.1) — the user's own proposal,
 > made in response to this doc's first draft lacking it entirely.

@@ -1,6 +1,12 @@
 # Dated Worklog: 2026-09-20 - Stale iMac IP Broke Beszel Monitoring (and Silently Threatened Capture Sync)
 
-Status: **diagnosed, fixed, and verified for Beszel. For `optic_sync`:
+Status: **fully resolved and verified** (Beszel, `optic_sync`'s
+hostname config, and the receiver's bind address; a real transfer of 15
+queued files succeeded). See "Second Addendum" at the end. The status
+text below was written earlier the same day and is kept as the record of
+the intermediate state.
+
+Earlier status: **diagnosed, fixed, and verified for Beszel. For `optic_sync`:
 diagnosed, repo source updated. UPDATE: a later, unrelated full deploy
 (`worklogs/2026-09-20-rule-editor-polish.md`) installed the entire tracked
 `systemd/optic-daemon.service`, including this pending

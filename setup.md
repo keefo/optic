@@ -529,7 +529,7 @@ Proceed only when the Phase 8 checks pass and the transferred image has been vis
 
 ### F. Deploy the Phase 1 Camera Dashboard
 
-The current `optic-daemon` Phase 1 is the camera control plane; scheduler and in-process sync workers are not yet implemented. Build it natively on the Pi so the release artifact matches the installed AArch64 system:
+`optic-daemon` runs the camera control plane (`optic_web`), the timelapse scheduler (`optic_scheduler`), and the in-process sync worker (`optic_sync`). Build it natively on the Pi so the release artifact matches the installed AArch64 system:
 
 Every change to daemon source or web assets (`src/web/index.html`, `app.js`, `styles.css`, now loaded from disk rather than compiled in) requires a package version bump and a new Pi deployment. Work is complete only after the restarted service reports that version from `/api/status` and the deployed web assets are verified over HTTP.
 
@@ -585,7 +585,7 @@ open http://optic.local:8000/
 
 TCP `8000` is the canonical endpoint. The validated Pi reserves ports below `1024` for privileged processes, nothing listens on port `80`, and the user service intentionally remains unprivileged. Do not document `http://optic.local/` unless an administrator later installs and validates a port-80 proxy or redirect.
 
-The deployed unit is enabled and `Linger=yes`, and a controlled user-service restart was validated. A full reboot validation remains pending because the current SSH session has neither passwordless sudo nor noninteractive PolicyKit reboot authorization.
+The deployed unit is enabled and `Linger=yes`, and a controlled user-service restart was validated. Full reboot persistence was later confirmed: the dashboard's Reboot button (backed by a scoped PolicyKit rule) rebooted the Pi and the daemon came back automatically (`worklogs/2026-09-19-reboot-nonewprivileges-fix.md`, `worklogs/2026-09-19-timelapse-scheduler-phase1b.md`).
 
 ---
 
