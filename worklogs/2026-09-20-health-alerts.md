@@ -1,9 +1,10 @@
 # Dated Worklog: 2026-09-20 - Health Alerts for Unattended Operation
 
-Status: **implemented, tested locally, deployed to the Pi, and live ntfy
-delivery from the Pi observed (ntfy.sh accepted the request, 2026-09-21);
-phone receipt confirmed by the user ("my phone see a FIRING capture tmpfs
-low"); not soak-tested; not user-accepted.**
+Status: **complete — merged to `main` in PR #6 (a56e01a, 2026-09-21) with
+CI green; live ntfy delivery from the Pi confirmed on the user's phone;
+header UI accepted by the user; marked complete by the user 2026-09-21.**
+Not soak-tested. At closure the Pi still runs the pre-merge branch test
+build (0.1.29 base); the user will deploy `main` (0.1.30) themselves.
 
 ## Objective
 
@@ -355,6 +356,21 @@ since the Run control card already shows it.
   clippy, release build, ldd/version check, artifact) ✅ on both runs.
 - Not merged. Deploy-script stale-binary fix deferred to a separate PR
   (user decision).
+
+## Closure (2026-09-21)
+
+- PR #6 merged by the user (merge commit a56e01a); CI on `main` started
+  automatically.
+- User acceptance: phone received the real test alert; header pills
+  "look good"; user asked to mark the work complete.
+- Handover for the `main` deploy (user-run): `git pull` in the main
+  checkout first (it was at a6e1509), then
+  `./scripts/build-deploy-optic-daemon.sh`; confirm ~151 tests ran (not
+  ~114), `/api/status` version 0.1.30, `/api/alerts` returns JSON with
+  `channel: "ntfy"`. `alerts.json` on the Pi is unaffected by deploys.
+- Open follow-ups: deploy-script stale-binary fix (separate PR, not
+  started); optional 0.1.31 bump; external dead-man's-switch heartbeat;
+  optional priority-5 for FIRING notifications; soak observation.
 
 ## Out-of-Scope File
 
