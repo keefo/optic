@@ -587,11 +587,36 @@ TCP `8000` is the canonical endpoint. The validated Pi reserves ports below `102
 
 The deployed unit is enabled and `Linger=yes`, and a controlled user-service restart was validated. Full reboot persistence was later confirmed: the dashboard's Reboot button (backed by a scoped PolicyKit rule) rebooted the Pi and the daemon came back automatically (`worklogs/2026-09-19-reboot-nonewprivileges-fix.md`, `worklogs/2026-09-19-timelapse-scheduler-phase1b.md`).
 
+### G. Grant the Daemon's Host Access
+
+The daemon's sandbox cannot use `sudo`, so the dashboard's **Reboot Pi**, the Config page's **NTP Sync now**, and the Station timezone save call systemd, logind, and timedated over D-Bus. PolicyKit authorizes each call through one narrow rule for `liam`:
+
+| Rule in `/etc/polkit-1/rules.d/` | Action allowed without a password |
+|----------------------------------|-----------------------------------|
+| `60-optic-daemon-reboot.rules` | `org.freedesktop.login1.reboot` |
+| `61-optic-daemon-ntp-sync.rules` | `org.freedesktop.systemd1.manage-units`, only `restart` of `systemd-timesyncd.service` |
+| `62-optic-daemon-set-timezone.rules` | `org.freedesktop.timedate1.set-timezone` |
+
+The same script enables `Linger=yes` for `liam` and ensures `video` and `render` membership. It changes only what differs, backs up any rule it replaces to `/var/backups/optic-hardening/`, and needs no service restart because `polkitd` reloads its rules on change. After applying, it confirms with `pkcheck` that each action is authorized and that restarting a different unit still is not. Run it before §F on a fresh Pi:
+
+```bash
+scp /Users/admin/Documents/projects/optic/scripts/setup-phase-08-daemon-host-access.sh liam@optic.local:/home/liam/.local/bin/optic-setup-phase-08-daemon-host-access
+ssh liam@optic.local 'chmod 700 /home/liam/.local/bin/optic-setup-phase-08-daemon-host-access'
+ssh -t liam@optic.local 'sudo /home/liam/.local/bin/optic-setup-phase-08-daemon-host-access --dry-run'
+ssh -t liam@optic.local '/home/liam/.local/bin/optic-setup-phase-08-daemon-host-access'
+```
+
+The dry run needs `sudo` only to read the rules (on Debian 13, `rules.d` is `root:polkitd 0750`); it writes nothing. `verify.sh --phase 8` checks lingering and the reboot and timezone decisions as `liam`, and uses non-interactive `sudo -n` for the checks that need root (`pkcheck --detail` for the NTP rule's unit scope, and the rule files' mode).
+
+The blanket `/etc/sudoers.d/liam-nopasswd` grant and `/etc/systemd/system.conf.d/90-watchdog-headroom.conf` are also hand-installed on the current Pi. Neither is provisioned by a script: the daemon does not use the sudoers grant, and the watchdog override contradicts Phase 3 (`worklogs/2026-09-20-provisioning.md`).
+
 ---
 
 ## 9. Immutable Protection: Read-Only Root (OverlayFS)
 
 > ⚠️ **Run this step ONLY after confirming your capture scripts, Wi-Fi networks, SSH keys, and systemd units operate reliably.**
+
+> ⚠️ **Not enabled, and do not enable it with the steps below alone.** With `optic-daemon` installed, the raspi-config overlay keeps root writable in RAM: capture history, scheduler rules, Station settings, deployed builds, and the persistent journal would all silently revert at every reboot. Follow the staged plan in [`docs/phase9-readonly-root.md`](docs/phase9-readonly-root.md), which adds a persistent data volume first and covers deploys and rollback. The steps below are the raspi-config mechanics that plan uses in its Stage 3.
 
 OverlayFS mounts the underlying SD card root filesystem as read-only. All runtime writes are redirected to a temporary RAM scratch space. Power loss or unexpected resets will never corrupt the operating system.
 
