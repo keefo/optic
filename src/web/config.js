@@ -15,6 +15,7 @@ const elements = {
   celestialEmpty: document.querySelector("#celestial-empty"),
   celestialGroups: document.querySelector("#celestial-groups"),
   timeNow: document.querySelector("#time-now"),
+  timeSyncCue: document.querySelector("#time-sync-cue"),
   timeTimezone: document.querySelector("#time-timezone"),
   timeNtpEnabled: document.querySelector("#time-ntp-enabled"),
   timeSynchronized: document.querySelector("#time-synchronized"),
@@ -285,13 +286,66 @@ function estimatedSystemNow() {
   return new Date(anchor + (Date.now() - clockPollClientTime));
 }
 
+// Set while a "Sync now" request waits for systemd-timesyncd's next
+// successful reply: `baseline` is `last_synced_at` read just before the
+// request, so any newer value proves a fresh sync happened.
+let pendingNtpSync = null;
+const NTP_SYNC_TIMEOUT_MS = 15000;
+
+function formatSystemTime(date, options) {
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone: clockSystemStatus?.time_sync?.timezone,
+    ...options,
+  }).format(date);
+}
+
+// "just now" / "N min ago" / "N h ago". Both ends are Pi timestamps
+// (last_synced_at and the ticking estimate of the Pi's `now`), so a
+// browser clock that is off doesn't skew it.
+function formatSyncAge(lastSyncedAt) {
+  const seconds = Math.max(0, (estimatedSystemNow() - new Date(lastSyncedAt)) / 1000);
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  return `${Math.floor(seconds / 3600)} h ago`;
+}
+
+function renderSyncCue() {
+  const cue = elements.timeSyncCue;
+  const timeSync = clockSystemStatus?.time_sync;
+  if (!timeSync) {
+    cue.hidden = true;
+    return;
+  }
+  cue.hidden = false;
+  if (pendingNtpSync) {
+    cue.textContent = "Syncing…";
+    cue.className = "pill neutral";
+    cue.title = "Waiting for a time server reply";
+  } else if (!timeSync.synchronized) {
+    cue.textContent = "Not synced";
+    cue.className = "pill bad";
+    cue.title = "The system clock is not synchronized to a time server";
+  } else if (timeSync.last_synced_at) {
+    cue.textContent = `✓ Synced ${formatSyncAge(timeSync.last_synced_at)}`;
+    cue.className = "pill good";
+    cue.title = `Last time server reply: ${formatSystemTime(new Date(timeSync.last_synced_at), {
+      dateStyle: "medium",
+      timeStyle: "medium",
+    })}`;
+  } else {
+    cue.textContent = "✓ Synced";
+    cue.className = "pill good";
+    cue.title = "Synchronized to a time server";
+  }
+}
+
 function tickCurrentTime() {
   if (!clockSystemStatus) return;
-  elements.timeNow.textContent = new Intl.DateTimeFormat(undefined, {
-    timeZone: clockSystemStatus.time_sync?.timezone,
+  elements.timeNow.textContent = formatSystemTime(estimatedSystemNow(), {
     dateStyle: "medium",
     timeStyle: "medium",
-  }).format(estimatedSystemNow());
+  });
+  renderSyncCue();
 }
 
 // `now`/timezone-aware clock is always present (a plain server-side
@@ -324,22 +378,62 @@ async function refreshTimeSync() {
     clockSystemStatus = data.system;
     clockPollClientTime = Date.now();
     renderTimeSync(data.system);
+    checkPendingNtpSync();
   } catch (error) {
     showTimeNotice(`Failed to load time status: ${error.message}`, "error");
   }
+}
+
+function isNewerSync(lastSyncedAt, baseline) {
+  if (!lastSyncedAt) return false;
+  return baseline === null || new Date(lastSyncedAt) > new Date(baseline);
+}
+
+// Second state of "Sync now": settles to "Synchronized" once timesyncd
+// reports a reply newer than the baseline, or to a warning after
+// NTP_SYNC_TIMEOUT_MS. Never claims success from the request alone.
+function checkPendingNtpSync() {
+  if (!pendingNtpSync) return;
+  const lastSyncedAt = clockSystemStatus?.time_sync?.last_synced_at ?? null;
+  if (isNewerSync(lastSyncedAt, pendingNtpSync.baseline)) {
+    finishNtpSync();
+    const at = formatSystemTime(new Date(lastSyncedAt), { timeStyle: "medium" });
+    showTimeNotice(`Synchronized with the time server at ${at}.`, "success");
+  } else if (Date.now() > pendingNtpSync.deadline) {
+    finishNtpSync();
+    showTimeNotice(
+      "Sync requested, but no time server reply yet. The clock keeps its last sync; check the Pi's network.",
+      "warning",
+    );
+  }
+}
+
+function finishNtpSync() {
+  clearInterval(pendingNtpSync.poll);
+  pendingNtpSync = null;
+  elements.ntpSyncNow.disabled = false;
+  renderSyncCue();
 }
 
 elements.ntpSyncNow.addEventListener("click", async () => {
   elements.ntpSyncNow.disabled = true;
   showTimeNotice("Syncing…");
   try {
+    // Fresh baseline, not the up-to-15s-old poll, so a routine sync that
+    // happened meanwhile isn't mistaken for this one.
+    await refreshTimeSync();
+    const baseline = clockSystemStatus?.time_sync?.last_synced_at ?? null;
     await api("/api/system/ntp-sync", { method: "POST" });
-    showTimeNotice("NTP sync requested.", "success");
+    showTimeNotice("Sync requested — waiting for a time server reply…");
+    pendingNtpSync = {
+      baseline,
+      deadline: Date.now() + NTP_SYNC_TIMEOUT_MS,
+      poll: setInterval(refreshTimeSync, 1000),
+    };
+    renderSyncCue();
   } catch (error) {
     showTimeNotice(`Failed to sync: ${error.message}`, "error");
-  } finally {
     elements.ntpSyncNow.disabled = false;
-    await refreshTimeSync();
   }
 });
 

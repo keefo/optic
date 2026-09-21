@@ -3,8 +3,8 @@
 Status: **Part 1 implemented and verified read-only against the live Pi**:
 the script's rules are byte-identical to the installed ones, its sudo dry run
 reports `[OK]` for everything, and `verify.sh` Phases 1 and 8 pass on the Pi.
-**Not applied**: the approved apply and idempotence re-run have not
-happened. **Part 2 design written**, with its host facts confirmed
+**Applied on the Pi with user approval (2026-09-20)**: two runs, both no-op
+and exit 0, no files written. Awaiting user acceptance. **Part 2 design written**, with its host facts confirmed
 read-only; not yet reviewed. No host was changed.
 
 ## Objective
@@ -249,12 +249,39 @@ sizes (`~/.cache` 8.2G, `~/.local/src` 2.3G), the state directory (372K,
 106 rows, average `detail_json` 753 B), and the disk (238 GB SD card, root 7%
 used).
 
+### Apply on the Pi (user-approved, 2026-09-20)
+
+1. Baseline (read-only): `/var/backups/optic-hardening/` held four older
+   backups and no polkit ones. Rule mtimes: 60 `2026-09-19 12:53:10`, 61
+   `2026-09-20 19:15:40`, 62 `2026-09-20 19:46:09`.
+2. Copy: the first `scp -4` hung (no connect timeout) and was killed; the
+   file had not been written. The retry,
+   `ssh … 'umask 077; cat > ~/.local/bin/optic-setup-phase-08-daemon-host-access && chmod 700 …'`,
+   timed out once during the banner exchange, then succeeded. The remote
+   sha256 `3a032e83…286ea` matches the repo file.
+3. Run 1 and run 2 of `~/.local/bin/optic-setup-phase-08-daemon-host-access`
+   (as `liam`; it re-ran itself through sudo): both printed "already matches
+   the plan" ×3, lingering already enabled, already in video/render, then
+   "setup complete". Both exited 0.
+4. After: backup directory unchanged (same four files), rule mtimes
+   unchanged, no leftover `sleep` helper owned by `liam`.
+5. `verify.sh --phase 8` on the Pi: PASS=13 WARN=0 FAIL=0 INFO=1.
+
+The SSH link to the Pi was unreliable during this step: occasional banner
+timeouts over IPv4, on top of the IPv6 link-local failures noted above. All
+commands used `ConnectTimeout` and retries.
+
+## User Verification
+
+- Click **Reboot Pi** (reboots the Pi), **NTP Sync now**, and save Station
+  on the Config page. Nothing changed on the host, so behaviour should be
+  exactly as before.
+- Optional: `ssh liam@optic.local 'bash -s -- --phase 8' < verify.sh`.
+
 ## Remaining Limitations and Next Steps
 
 1. ~~Live read-only comparison~~: done, see Live Validation.
-2. **Approved apply + second run** on the Pi to prove idempotence.
-   Expected write set: empty, since the dry run already reports `[OK]` for
-   everything. Not run: it writes to the host and needs explicit approval.
+2. ~~Approved apply + second run~~: done, see Apply on the Pi.
 3. **Phase 3 watchdog:** 15s decided. Removing the Pi's 90s override
    (and accepting the build-time watchdog risk) is a separate, approved host
    change; Phase 3 FAILs on the live Pi until then.
@@ -276,6 +303,114 @@ used).
 - `setup.md` (§8G new; §9 warning)
 - `docs/phase9-readonly-root.md` (new)
 - `worklogs/2026-09-20-provisioning.md` (this file)
+
+## Scope Addition: NTP Sync Feedback (user request, 2026-09-20)
+
+Status: **implemented, deployed as 0.1.30, verified on the Pi, and
+user-accepted (2026-09-20: "this 2 states works").** The user also
+confirmed NTP Sync now and the Station timezone save work under the new
+rules; the Reboot Pi check is still pending.
+
+During acceptance of the NTP button, the user saw only "NTP sync
+requested." and asked for a second state, "Synchronized", once the sync has
+really happened, plus a visual cue on **Current time** showing it is synced.
+**User chose to build it on this branch.** This breaks the track's
+"no `src/`" rule, which is recorded here as instructed. None of the other
+three branches has committed changes to `src/system_status.rs`,
+`src/web/config.{html,js}`, or `src/web/styles.css` (checked with
+`git diff --name-only main...<branch>`), so the merge-conflict risk is low.
+
+Signal (observed on the Pi, read-only): `systemd-timesyncd` touches
+`/run/systemd/timesync/synchronized` (`644`, world-readable) on every
+successful sync. Its mtime moved from the restart at 22:48:03 to the next
+poll at 22:51:16. "Clock synchronized" (`NTPSynchronized`) was already
+`yes` before the click and stays `yes`, so it cannot show that a *new*
+sync happened.
+
+Acceptance criteria:
+
+1. `/api/system/status` `time_sync` gains `last_synced_at` (RFC 3339 UTC,
+   or `null` when the marker is missing). Existing fields are unchanged.
+2. Clicking **Sync now** shows "Sync requested — waiting for a time server
+   reply…", then "Synchronized with the time server at <time>." once
+   `last_synced_at` is newer than the value read just before the click. If
+   no newer sync arrives within 15 s, it shows a warning instead of claiming
+   success. The comparison uses only Pi timestamps, so browser and Pi clock
+   differences don't matter.
+3. **Current time** shows a cue: a green "Synced N min ago" pill when
+   synchronized, red "Not synced" when not, and "Syncing…" while a
+   requested sync is pending. It updates every second.
+4. No change to the PolicyKit rules, the unit, or other pages.
+
+Test plan (before implementation):
+
+- Rust unit tests for the marker reader: missing file → `None`; a file
+  with its mtime set to a known time → exactly that time. The existing
+  `parse_timedatectl_show` tests still pass.
+- `cargo fmt --check`, `cargo test --locked --all-targets`, `cargo clippy
+  --locked --all-targets -- -D warnings` on the Mac.
+- `node --check` and Biome on `config.js`; Biome on `config.html` and
+  `styles.css`, matching the deploy script's gate.
+- On the Pi (needs a deploy, which needs a version bump; both need user
+  approval because this branch doesn't bump `Cargo.toml`): `/api/system/status`
+  shows `last_synced_at` equal to the marker's mtime; clicking Sync now shows
+  both states; the Current time cue matches `timedatectl`.
+
+### Implementation
+
+- `src/system_status.rs`: `TimeSyncStatus.last_synced_at`, filled on Linux
+  from the mtime of `/run/systemd/timesync/synchronized`
+  (`TIMESYNC_MARKER`, `modified_at()`). Two new tests. No change to
+  `parse_timedatectl_show`'s behaviour; it leaves the new field `None`.
+- `src/web/config.html`: Current time is now `<span id="time-now">` plus a
+  `<span id="time-sync-cue" class="pill">` (existing pill styles; no CSS
+  change).
+- `src/web/config.js`: "Sync now" reads a fresh baseline, POSTs, shows
+  "Sync requested — waiting for a time server reply…", polls every 1 s, and
+  settles to "Synchronized with the time server at <time>." once
+  `last_synced_at` is newer, or to a warning after 15 s. The Current time
+  cue is updated every second: "✓ Synced N min ago" / "Not synced" /
+  "Syncing…", with the absolute last-reply time in its tooltip.
+
+### Validation (Mac)
+
+| Check | Result |
+|-------|--------|
+| `cargo fmt --all -- --check` | clean |
+| `cargo test --locked --all-targets` | 111 passed, 0 failed (includes the 2 new marker tests) |
+| `cargo clippy --locked --all-targets -- -D warnings` | clean |
+| `node --check src/web/config.js` | clean |
+| Biome 2.5.14 (`npx @biomejs/biome@2.5.14 check`, the deploy gate's exact 9-file list) | clean, no fixes |
+| Node harness (scratchpad; runs `config.js` in `vm` with stubbed DOM, mocked `/api/*`, controllable timers and `Date.now`) | 8/8: cue age before click; requested state; settles to Synchronized when `last_synced_at` moves; button re-enabled; still waiting without a newer sync; 15 s timeout → warning, not success; 1 s poller removed; plain "✓ Synced" when the marker is missing |
+
+Not covered: the red "Not synced" branch (not exercised by the harness)
+and a real browser (the user checks that).
+
+### Deploy (user-approved, 2026-09-20)
+
+- **User chose "bump + deploy now"**, overriding the coordination rule
+  "bump only at merge time". `Cargo.toml` 0.1.29 → 0.1.30;
+  `cargo update --workspace --offline` changed only the package's own
+  entry in `Cargo.lock`. **Merge note:** the other three branches must not
+  also claim 0.1.30.
+- Before deploying (23:33): no cargo/rustc/deploy processes on the Pi, load
+  0.10, scheduler `Paused`, running 0.1.29.
+- `./scripts/build-deploy-optic-daemon.sh` (full) exited 0: Biome clean,
+  remote `cargo fmt --check` clean, remote tests 114 passed plus 4 in a
+  second test binary (Linux-only suites included), strict Clippy clean,
+  release build, installed with rollback protection (no rollback), and
+  "SUCCESS: optic-daemon 0.1.30 is active". Service restarted at
+  23:38:19; camera detected; `optic_sync` started; history log ready;
+  scheduler `Paused`.
+- Live checks on the Pi:
+  - `last_synced_at` in `/api/system/status` = `2026-09-21T06:21:08.836142945Z`,
+    identical to `date -u -r /run/systemd/timesync/synchronized`.
+  - `POST /api/system/ntp-sync` at `06:38:35.856Z` → 200; one second later
+    `last_synced_at` = `06:38:35.979735256Z`, again identical to the marker.
+    This is the change the page waits for.
+  - Served `config.js` contains the new code (5 matches for the new
+    identifiers); served `config.html` has `time-sync-cue`;
+    `/api/status` version `0.1.30`.
 
 ## Parallel-Session Coordination (applies to all four tracks)
 
