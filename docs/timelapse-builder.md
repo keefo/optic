@@ -1,9 +1,9 @@
 # Design Note: Mac-Side Timelapse Builder (`optic-timelapse`)
 
-> **Status:** Implemented and tested on the iMac 2026-09-20 (unit and
-> integration tests, plus a real end-to-end encode of the 2026-09-20
-> `every1min` captures). Awaiting user acceptance. The validation record is
-> in `worklogs/2026-09-20-timelapse-builder.md`.
+> **Status:** User-accepted 2026-09-21 and merged to `main` (PR #5).
+> Implemented and tested on the iMac (unit and integration tests, plus a
+> real end-to-end encode of the 2026-09-20 `every1min` captures). The
+> validation record is in `worklogs/2026-09-20-timelapse-builder.md`.
 
 ## 1. Purpose
 
