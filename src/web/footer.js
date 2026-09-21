@@ -138,6 +138,111 @@ footerElements.reboot.addEventListener("click", () =>
   ),
 );
 
+// Shared header status pills — Daemon version, Camera, and health Alerts
+// (docs/optic-daemon-alerts.md §8) — on every page, followed by any
+// page-specific pills already in the header (e.g. the Scheduler's run
+// state). Built here, the one script every page loads, so the page HTML
+// stays untouched. On the dashboard, index.html already has the Daemon and
+// Camera pills and app.js keeps updating them; this script only fills in
+// the ones it had to create itself.
+const headerStatusRow = (() => {
+  const header = document.querySelector(".site-header");
+  let row = header.querySelector(".status-row");
+  if (!row) {
+    row = document.createElement("div");
+    row.className = "status-row";
+    row.setAttribute("aria-live", "polite");
+    header.append(row);
+  }
+  return row;
+})();
+
+function headerPill(id, text) {
+  const existing = document.querySelector(`#${id}`);
+  if (existing) return { element: existing, owned: false };
+  const element = document.createElement("span");
+  element.id = id;
+  element.className = "pill neutral";
+  element.textContent = text;
+  return { element, owned: true };
+}
+
+const headerDaemon = headerPill("daemon-status", "Connecting");
+const headerCamera = headerPill("camera-status", "Camera unknown");
+// Hidden until the first successful poll, and stays hidden against an
+// older daemon without GET /api/alerts.
+const headerAlerts = document.createElement("span");
+headerAlerts.id = "alerts-status";
+headerAlerts.hidden = true;
+headerStatusRow.prepend(headerDaemon.element, headerCamera.element, headerAlerts);
+
+// Same wording as app.js's refreshStatus, for the pages that don't run it.
+async function refreshHeaderStatus() {
+  try {
+    const response = await footerApi("/api/status");
+    const status = await response.json();
+    if (headerDaemon.owned) {
+      headerDaemon.element.textContent = `Daemon ${status.version}`;
+      headerDaemon.element.className = "pill good";
+    }
+    if (headerCamera.owned) {
+      headerCamera.element.textContent = status.camera.detected
+        ? status.camera.streaming
+          ? "Camera streaming"
+          : status.camera.busy
+            ? "Camera busy"
+            : "Camera ready"
+        : "Camera unavailable";
+      headerCamera.element.className = status.camera.detected ? "pill good" : "pill bad";
+    }
+  } catch {
+    if (headerDaemon.owned) {
+      headerDaemon.element.textContent = "Daemon offline";
+      headerDaemon.element.className = "pill bad";
+    }
+  }
+}
+
+function renderHeaderAlerts(alerts) {
+  const active = alerts.conditions.filter(
+    (condition) => condition.state === "firing" || condition.state === "recovering",
+  );
+  if (active.length > 0) {
+    headerAlerts.className = "pill bad";
+    headerAlerts.textContent =
+      `${active.length} alert${active.length === 1 ? "" : "s"}: ` +
+      active.map((condition) => condition.condition.replaceAll("_", " ")).join(", ");
+    headerAlerts.title = active.map((condition) => condition.detail || "").join("\n");
+  } else if (alerts.channel === "dry_run") {
+    headerAlerts.className = "pill neutral";
+    headerAlerts.textContent = "Alerts: dry-run";
+    headerAlerts.title = alerts.config_error || "No notification channel configured.";
+  } else {
+    headerAlerts.className = "pill good";
+    headerAlerts.textContent = "Alerts OK";
+    headerAlerts.title = alerts.last_delivery_error
+      ? `Last delivery failed: ${alerts.last_delivery_error}`
+      : "No active health alerts.";
+  }
+  headerAlerts.hidden = false;
+}
+
+async function refreshHeaderAlerts() {
+  try {
+    const response = await footerApi("/api/alerts");
+    renderHeaderAlerts(await response.json());
+  } catch (_) {
+    headerAlerts.hidden = true;
+  }
+}
+
 void refreshFooterStatus();
 setInterval(refreshFooterStatus, 5000);
 setInterval(renderFooterSummary, 1000);
+if (headerDaemon.owned || headerCamera.owned) {
+  void refreshHeaderStatus();
+  setInterval(refreshHeaderStatus, 5000);
+}
+// 15s is plenty: the daemon itself only evaluates alerts every 30s.
+void refreshHeaderAlerts();
+setInterval(refreshHeaderAlerts, 15000);

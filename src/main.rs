@@ -4,6 +4,7 @@ mod ephemeris;
 mod native_camera;
 #[cfg(target_os = "linux")]
 mod native_codec;
+mod optic_alerts;
 mod optic_camera;
 mod optic_capture_log;
 mod optic_scheduler;
@@ -138,6 +139,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_run_state,
     );
 
+    // Passive health monitor (docs/optic-daemon-alerts.md): reads the
+    // handles above, never changes them.
+    let alerts = optic_alerts::AlertsHandle::spawn(
+        optic_alerts::load_config(&optic_alerts::resolve_config_path()),
+        optic_alerts::AlertSources {
+            scheduler: scheduler.clone(),
+            sync: sync.clone(),
+            capture_log: capture_log.clone(),
+            system_status: system_status.clone(),
+            config_cache_path: config_cache_path.clone(),
+        },
+    );
+
     let state = AppState::new(
         camera.clone(),
         sync.clone(),
@@ -153,9 +167,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(bind).await?;
     info!(address = %bind, "optic_web listening");
 
-    axum::serve(listener, web::router(state))
-        .with_graceful_shutdown(shutdown_signal(camera, sync, scheduler))
-        .await?;
+    axum::serve(
+        listener,
+        web::router(state).merge(web::alerts_router(alerts)),
+    )
+    .with_graceful_shutdown(shutdown_signal(camera, sync, scheduler))
+    .await?;
 
     Ok(())
 }

@@ -78,7 +78,6 @@ function ephemerisEventMeta(body, eventName) {
 }
 
 const elements = {
-  runState: document.querySelector("#run-state"),
   runStateDetail: document.querySelector("#run-state-detail"),
   nextCapture: document.querySelector("#next-capture"),
   nextCaptureRules: document.querySelector("#next-capture-rules"),
@@ -227,8 +226,6 @@ async function loadInitial() {
 
 function renderRunState(schedule) {
   const running = schedule.run_state === "Running";
-  elements.runState.textContent = running ? "Running" : "Paused";
-  elements.runState.className = `pill ${running ? "good" : "neutral"}`;
   elements.runStateDetail.textContent = schedule.run_state;
   elements.nextCapture.textContent = schedule.next_capture_at
     ? new Date(schedule.next_capture_at).toLocaleString()

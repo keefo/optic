@@ -22,6 +22,7 @@ use crate::{
         StreamRequest,
     },
     durable_state,
+    optic_alerts::{AlertsHandle, AlertsStatus},
     optic_camera::{CameraBackendKind, OpticCamera},
     optic_capture_log::{CaptureHealthStatus, CaptureLog, CaptureLogEntry, CaptureQueryFilter},
     optic_scheduler::{
@@ -121,6 +122,18 @@ pub fn router(state: AppState) -> Router {
         .route("/api/timezones", get(list_timezones))
         .route("/api/celestial-preview", get(celestial_preview))
         .with_state(state)
+}
+
+/// Read-only health-alert state (`docs/optic-daemon-alerts.md` §8). Its own
+/// small router, merged in `main.rs`, so `AppState` doesn't change.
+pub fn alerts_router(alerts: AlertsHandle) -> Router {
+    Router::new()
+        .route("/api/alerts", get(alerts_status))
+        .with_state(alerts)
+}
+
+async fn alerts_status(State(alerts): State<AlertsHandle>) -> Json<AlertsStatus> {
+    Json(alerts.status())
 }
 
 async fn index(State(state): State<AppState>) -> Response {
