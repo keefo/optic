@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
 };
 use bytes::{Bytes, BytesMut};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     camera::{
@@ -54,6 +54,12 @@ pub struct AppState {
     /// (status polling, discard) uses this, never `config_path` directly.
     config_cache_path: Arc<PathBuf>,
     preview_config_path: Arc<PathBuf>,
+    /// Durable `preview_state.json` plus its tmpfs mirror, the same
+    /// write-through pair as the scheduler's run state; see `PreviewState`.
+    preview_state_path: Arc<PathBuf>,
+    preview_state_cache_path: Arc<PathBuf>,
+    /// Serializes read-modify-write updates of the preview state.
+    preview_state_lock: Arc<tokio::sync::Mutex<()>>,
     asset_dir: Arc<PathBuf>,
     sensor: Option<String>,
     started: Instant,
@@ -70,6 +76,8 @@ impl AppState {
         capture_dir: PathBuf,
         config_path: PathBuf,
         config_cache_path: PathBuf,
+        preview_state_path: PathBuf,
+        preview_state_cache_path: PathBuf,
         asset_dir: PathBuf,
         sensor: Option<String>,
     ) -> Self {
@@ -84,6 +92,9 @@ impl AppState {
             config_path: Arc::new(config_path),
             config_cache_path: Arc::new(config_cache_path),
             preview_config_path: Arc::new(preview_config_path),
+            preview_state_path: Arc::new(preview_state_path),
+            preview_state_cache_path: Arc::new(preview_state_cache_path),
+            preview_state_lock: Arc::new(tokio::sync::Mutex::new(())),
             asset_dir: Arc::new(asset_dir),
             sensor,
             started: Instant::now(),
@@ -101,6 +112,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stream/reconfigure", post(reconfigure_stream))
         .route("/api/stream/stop", post(stop_stream))
         .route("/api/stream/mjpeg", get(mjpeg_stream))
+        .route("/api/preview", post(update_preview_state))
         .route("/api/capture", post(capture))
         .route("/api/config/commit", post(commit_config))
         .route("/api/config/discard", post(discard_config))
@@ -252,6 +264,7 @@ struct StatusResponse {
     sync: SyncStatus,
     schedule: SchedulerStatus,
     config: AppConfig,
+    preview: PreviewState,
     /// Whether `config` above is a staged-but-uncommitted preview rather
     /// than the committed config — lets a freshly loaded page (e.g. after
     /// a refresh mid-edit) tell the two apart and restore its own "unsaved
@@ -357,8 +370,65 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
         sync: state.sync.status(),
         schedule: state.scheduler.status(),
         config,
+        preview: read_preview_state(&state.preview_state_cache_path).await,
         config_staged,
     }))
+}
+
+/// Operator preview preferences that must outlive the page and the daemon.
+/// The live preview itself is browser-driven; every tab consults this, and
+/// `start_stream` refuses to start while `stopped`, so one tab's Stop isn't
+/// undone by another tab's auto-start.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+struct PreviewState {
+    stopped: bool,
+    downsample: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviewStateUpdate {
+    stopped: Option<bool>,
+    downsample: Option<bool>,
+}
+
+impl PreviewState {
+    fn apply(self, update: &PreviewStateUpdate) -> Self {
+        Self {
+            stopped: update.stopped.unwrap_or(self.stopped),
+            downsample: update.downsample.unwrap_or(self.downsample),
+        }
+    }
+}
+
+/// Missing or unreadable state means defaults: preview running, full size.
+async fn read_preview_state(cache_path: &Path) -> PreviewState {
+    match durable_state::read_cached(cache_path).await {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+        Err(_) => PreviewState::default(),
+    }
+}
+
+async fn update_preview_state(
+    State(state): State<AppState>,
+    Json(update): Json<PreviewStateUpdate>,
+) -> Result<Json<PreviewState>, AppError> {
+    let _guard = state.preview_state_lock.lock().await;
+    let next = read_preview_state(&state.preview_state_cache_path)
+        .await
+        .apply(&update);
+    let content = serde_json::to_string_pretty(&next).map_err(std::io::Error::other)?;
+    durable_state::write_through(
+        &state.preview_state_path,
+        &state.preview_state_cache_path,
+        &content,
+    )
+    .await?;
+    if next.stopped {
+        state.camera.stop_stream().await?;
+    }
+    Ok(Json(next))
 }
 
 async fn sync_pause(State(state): State<AppState>) -> Result<Json<SyncStatus>, AppError> {
@@ -974,8 +1044,16 @@ async fn celestial_preview(
 
 async fn start_stream(
     State(state): State<AppState>,
-    Json(request): Json<StreamRequest>,
+    Json(mut request): Json<StreamRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    let preview = read_preview_state(&state.preview_state_cache_path).await;
+    if preview.stopped {
+        return Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: "preview is stopped; resume it first".to_owned(),
+        });
+    }
+    request.downsample = preview.downsample;
     let accepted = request.clone();
 
     // Reconfigure and Start streams exclusively write to the preview staging
@@ -1004,8 +1082,11 @@ async fn start_stream(
 
 async fn reconfigure_stream(
     State(state): State<AppState>,
-    Json(request): Json<StreamRequest>,
+    Json(mut request): Json<StreamRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    request.downsample = read_preview_state(&state.preview_state_cache_path)
+        .await
+        .downsample;
     let accepted = request.clone();
 
     // See `start_stream`'s comment: preserve save_dng/schedule, only
@@ -1375,6 +1456,57 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp asset dir");
         dir
+    }
+
+    #[tokio::test]
+    async fn preview_state_defaults_when_missing_or_corrupt() {
+        let dir = unique_temp_dir("preview-state-defaults");
+        let cache = dir.join("preview_state.json");
+        assert_eq!(read_preview_state(&cache).await, PreviewState::default());
+        tokio::fs::write(&cache, "{not json").await.unwrap();
+        assert_eq!(read_preview_state(&cache).await, PreviewState::default());
+    }
+
+    #[test]
+    fn preview_state_partial_update_keeps_other_fields() {
+        let current = PreviewState {
+            stopped: false,
+            downsample: true,
+        };
+        let update: PreviewStateUpdate = serde_json::from_str(r#"{"stopped":true}"#).unwrap();
+        assert_eq!(
+            current.apply(&update),
+            PreviewState {
+                stopped: true,
+                downsample: true,
+            }
+        );
+        assert!(serde_json::from_str::<PreviewStateUpdate>(r#"{"paused":true}"#).is_err());
+    }
+
+    #[tokio::test]
+    async fn preview_state_survives_a_simulated_reboot() {
+        let durable_dir = unique_temp_dir("preview-state-durable");
+        let durable = durable_dir.join("preview_state.json");
+        let old_cache = unique_temp_dir("preview-state-cache-before").join("preview_state.json");
+        let state = PreviewState {
+            stopped: true,
+            downsample: true,
+        };
+        durable_state::write_through(
+            &durable,
+            &old_cache,
+            &serde_json::to_string(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // A reboot wipes the tmpfs cache; startup re-hydrates a fresh one.
+        let new_cache = unique_temp_dir("preview-state-cache-after").join("preview_state.json");
+        durable_state::hydrate_cache(&durable, &new_cache)
+            .await
+            .unwrap();
+        assert_eq!(read_preview_state(&new_cache).await, state);
     }
 
     async fn body_string(response: Response) -> String {

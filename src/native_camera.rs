@@ -16,7 +16,10 @@ mod imp {
 
     use bytes::Bytes;
     use libcamera::{
-        camera::{ActiveCamera, CameraConfiguration, CameraConfigurationStatus, Orientation},
+        camera::{
+            ActiveCamera, CameraConfiguration, CameraConfigurationStatus, Orientation,
+            SensorConfiguration,
+        },
         camera_manager::CameraManager,
         control::ControlList,
         controls,
@@ -78,6 +81,7 @@ mod imp {
         profile: CaptureProfile,
         settings: CameraSettings,
         streaming: bool,
+        downsample: bool,
         streams: Vec<Stream>,
         preview_index: Option<usize>,
         still_index: usize,
@@ -310,6 +314,7 @@ mod imp {
                         request.control_revision,
                         true,
                         false,
+                        request.downsample,
                     )
                     .map(|active| {
                         *pipeline = Some(active);
@@ -321,12 +326,13 @@ mod imp {
             NativeCommand::ReconfigureStream(request, reply) => {
                 let is_streaming = pipeline.as_ref().is_some_and(|active| active.streaming);
                 let controls_only = pipeline.as_ref().is_some_and(|active| {
-                    !stream_configuration_changed(
-                        active.profile,
-                        &active.settings,
-                        request.profile,
-                        &request.settings,
-                    )
+                    active.downsample == request.downsample
+                        && !stream_configuration_changed(
+                            active.profile,
+                            &active.settings,
+                            request.profile,
+                            &request.settings,
+                        )
                 });
                 let result = if is_streaming && controls_only {
                     let active = pipeline.as_mut().expect("streaming pipeline disappeared");
@@ -342,6 +348,7 @@ mod imp {
                             request.control_revision,
                             true,
                             false,
+                            request.downsample,
                         )
                         .map(|active| {
                             *pipeline = Some(active);
@@ -430,6 +437,7 @@ mod imp {
         control_revision: u64,
         streaming: bool,
         save_dng: bool,
+        downsample: bool,
     ) -> Result<Pipeline, CameraError> {
         let roles: &[StreamRole] = if streaming {
             &[StreamRole::ViewFinder]
@@ -442,9 +450,18 @@ mod imp {
             .generate_configuration(roles)
             .ok_or_else(|| backend_error("camera rejected requested stream roles"))?;
         config.set_orientation(orientation(&settings));
+        if let Some((width, height)) = streaming
+            .then(|| profile.preview_spec(downsample).sensor_mode)
+            .flatten()
+        {
+            let mut sensor = SensorConfiguration::new();
+            sensor.set_bit_depth(12);
+            sensor.set_output_size(width, height);
+            config.set_sensor_configuration(sensor);
+        }
 
         let output = if streaming {
-            let spec = profile.preview_spec();
+            let spec = profile.preview_spec(downsample);
             (spec.width, spec.height, 4)
         } else {
             let spec = profile.spec();
@@ -546,7 +563,7 @@ mod imp {
             apply_controls(
                 &mut request,
                 &settings,
-                streaming.then_some(profile.preview_spec().fps),
+                streaming.then_some(profile.preview_spec(downsample).fps),
             )?;
             requests.push(request);
         }
@@ -582,6 +599,7 @@ mod imp {
             profile,
             settings,
             streaming,
+            downsample,
             streams,
             preview_index: streaming.then_some(0),
             still_index: 0,
@@ -749,7 +767,7 @@ mod imp {
         model: &str,
     ) -> Result<CapturedFrame, CameraError> {
         let pipeline_started = Instant::now();
-        let mut pipeline = start_pipeline(camera, profile, settings, 0, false, save_dng)?;
+        let mut pipeline = start_pipeline(camera, profile, settings, 0, false, save_dng, false)?;
         info!(
             stage = "pipeline_start",
             elapsed_ms = pipeline_started.elapsed().as_millis(),
@@ -928,7 +946,7 @@ mod imp {
             &pipeline.settings,
             pipeline
                 .streaming
-                .then_some(pipeline.profile.preview_spec().fps),
+                .then_some(pipeline.profile.preview_spec(pipeline.downsample).fps),
         )?;
         pipeline.request_revisions[request_index] = pipeline.control_revision;
         camera.queue_request(request).map_err(|(_, error)| error)?;

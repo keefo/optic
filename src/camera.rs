@@ -152,22 +152,38 @@ impl CaptureProfile {
         }
     }
 
-    pub(crate) fn preview_spec(self) -> PreviewSpec {
+    /// `downsample` only changes Master Archive, whose full-resolution
+    /// preview is ~2.7 MB per frame; the other previews are already small.
+    pub(crate) fn preview_spec(self, downsample: bool) -> PreviewSpec {
         match self {
+            // Force the full-resolution mode and let the ISP scale down: left
+            // to itself libcamera picks the IMX477's 1332x990 mode, a centre
+            // crop that frames tighter than the capture, and the 2028x1520
+            // binned mode looked visibly softer than full-size frames scaled
+            // by the browser. Full mode still allows 8 fps (85 ms minimum).
+            Self::MasterArchive if downsample => PreviewSpec {
+                width: 1352,
+                height: 1014,
+                fps: 8,
+                sensor_mode: Some((4056, 3040)),
+            },
             Self::MasterArchive => PreviewSpec {
                 width: 4056,
                 height: 3040,
                 fps: 2,
+                sensor_mode: None,
             },
             Self::Dci4k => PreviewSpec {
                 width: 1352,
                 height: 720,
                 fps: 8,
+                sensor_mode: None,
             },
             Self::Binning2k => PreviewSpec {
                 width: 1014,
                 height: 760,
                 fps: 8,
+                sensor_mode: None,
             },
         }
     }
@@ -221,6 +237,9 @@ pub(crate) struct PreviewSpec {
     pub width: u32,
     pub height: u32,
     pub fps: u8,
+    /// Sensor mode to force, as (width, height). `None` lets libcamera
+    /// choose, which for small outputs can pick a cropped mode.
+    pub sensor_mode: Option<(u32, u32)>,
 }
 
 /// What triggered a capture — feeds the filename `native_camera.rs`
@@ -290,6 +309,10 @@ pub struct StreamRequest {
     pub profile: CaptureProfile,
     #[serde(default)]
     pub control_revision: u64,
+    /// Filled in by the web layer from the persisted preview state; clients
+    /// don't need to send it.
+    #[serde(default)]
+    pub downsample: bool,
 }
 
 impl StreamRequest {
@@ -391,8 +414,43 @@ mod tests {
             serde_json::from_str(r#"{"settings": {}, "profile": "dci_4k"}"#).unwrap();
         assert_eq!(request.profile, CaptureProfile::Dci4k);
         assert_eq!(request.control_revision, 0);
-        let preview = request.profile.preview_spec();
+        assert!(!request.downsample);
+        let preview = request.profile.preview_spec(request.downsample);
         assert_eq!((preview.width, preview.height), (1352, 720));
+    }
+
+    #[test]
+    fn downsample_only_shrinks_the_master_archive_preview() {
+        let sizes = |downsample| {
+            [
+                CaptureProfile::MasterArchive,
+                CaptureProfile::Dci4k,
+                CaptureProfile::Binning2k,
+            ]
+            .map(|profile| {
+                let spec = profile.preview_spec(downsample);
+                (spec.width, spec.height, spec.fps)
+            })
+        };
+        assert_eq!(
+            sizes(false),
+            [(4056, 3040, 2), (1352, 720, 8), (1014, 760, 8)]
+        );
+        assert_eq!(
+            sizes(true),
+            [(1352, 1014, 8), (1352, 720, 8), (1014, 760, 8)]
+        );
+        // Full-resolution mode, not the IMX477's cropped 1332x990 one.
+        assert_eq!(
+            CaptureProfile::MasterArchive.preview_spec(true).sensor_mode,
+            Some((4056, 3040))
+        );
+        assert_eq!(
+            CaptureProfile::MasterArchive
+                .preview_spec(false)
+                .sensor_mode,
+            None
+        );
     }
 
     #[test]

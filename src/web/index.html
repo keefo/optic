@@ -45,12 +45,17 @@
         <img id="preview" alt="HQ Camera preview">
         <div id="preview-placeholder" class="preview-placeholder">
           <span>IMX477</span>
-          <strong>Live preview starts automatically</strong>
+          <strong id="preview-placeholder-title">Live preview starts automatically</strong>
           <small>Focus and aperture are adjusted manually on the 6 mm lens.</small>
         </div>
       </div>
+      <label class="check preview-option">
+        <input id="downsample-preview" type="checkbox">
+        <span>Downsample preview <small>Master Archive previews at 1352 × 1014, 8 fps instead of full 4056 × 3040, 2 fps. Other profiles already preview small. Captures are unaffected.</small></span>
+      </label>
       <div class="button-row">
         <button id="capture" class="accent" type="button">Capture &amp; transfer</button>
+        <button id="preview-toggle" type="button">Stop preview</button>
       </div>
       <section class="responsiveness-panel" aria-labelledby="responsiveness-title">
         <div class="responsiveness-heading">

@@ -13,6 +13,9 @@ const elements = {
   firstVisibleLatency: document.querySelector("#first-visible-latency"),
   medianVisibleLatency: document.querySelector("#median-visible-latency"),
   medianSampleCount: document.querySelector("#median-sample-count"),
+  downsamplePreview: document.querySelector("#downsample-preview"),
+  previewToggle: document.querySelector("#preview-toggle"),
+  placeholderTitle: document.querySelector("#preview-placeholder-title"),
   captureLatency: document.querySelector("#capture-latency"),
   captureLatencyDetail: document.querySelector("#capture-latency-detail"),
   measurementSample: document.querySelector("#measurement-sample"),
@@ -75,6 +78,9 @@ const profiles = {
 
 let objectUrl = null;
 let livePreview = false;
+// Operator's persisted Stop preview choice (daemon `preview_state.json`);
+// while set, nothing on this page auto-starts the preview.
+let previewStopped = false;
 // Fill in default placeholders if we deleted elements to support pure manual focus
 if (!document.querySelector("#ev")) {
   const hiddenForm = document.createElement("div");
@@ -608,6 +614,62 @@ function formatLatency(milliseconds) {
   return `${Math.round(milliseconds)} ms`;
 }
 
+function applyPreviewState(preview) {
+  previewStopped = preview.stopped;
+  elements.downsamplePreview.checked = preview.downsample;
+  elements.previewToggle.textContent = preview.stopped ? "Resume preview" : "Stop preview";
+  elements.placeholderTitle.textContent = preview.stopped
+    ? "Preview stopped"
+    : "Live preview starts automatically";
+}
+
+function stopLivePreview() {
+  livePreview = false;
+  previewGeneration += 1;
+  cancelPreviewUpdate();
+  hidePreview("Preview stopped");
+}
+
+async function postPreviewState(update) {
+  const response = await api("/api/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  applyPreviewState(await response.json());
+}
+
+async function togglePreview() {
+  const stopping = !previewStopped;
+  elements.previewToggle.disabled = true;
+  try {
+    await postPreviewState({ stopped: stopping });
+    if (stopping) {
+      stopLivePreview();
+      showNotice("Preview stopped. It stays off, even after a reboot, until you resume it.");
+    } else {
+      hidePreview();
+      await ensurePreview();
+    }
+  } catch (error) {
+    showNotice(`Could not ${stopping ? "stop" : "resume"} preview: ${error.message}`, "error");
+  } finally {
+    elements.previewToggle.disabled = false;
+  }
+}
+
+async function setPreviewDownsample() {
+  const downsample = elements.downsamplePreview.checked;
+  try {
+    await postPreviewState({ downsample });
+    // The daemon applies the persisted choice on the next reconfigure.
+    if (livePreview) schedulePreviewUpdate();
+  } catch (error) {
+    elements.downsamplePreview.checked = !downsample;
+    showNotice(`Could not change preview size: ${error.message}`, "error");
+  }
+}
+
 function cancelPreviewUpdate() {
   if (reconfigureTimer !== null) {
     clearTimeout(reconfigureTimer);
@@ -685,7 +747,7 @@ async function api(path, options = {}) {
 }
 
 async function ensurePreview(streamAlreadyRunning = null, announce = true) {
-  if (!pageActive || livePreview || previewStarting || captureRunning) return;
+  if (!pageActive || livePreview || previewStarting || captureRunning || previewStopped) return;
 
   const generation = previewGeneration;
   const profileName = selectedProfile();
@@ -743,7 +805,9 @@ function prepareForStillCapture() {
   livePreview = false;
   previewGeneration += 1;
   cancelPreviewUpdate();
-  freezePreviewForCapture("Still capture · preview resumes automatically");
+  freezePreviewForCapture(
+    previewStopped ? "Still capture" : "Still capture · preview resumes automatically",
+  );
 }
 
 async function captureAndTransfer() {
@@ -784,10 +848,17 @@ async function captureAndTransfer() {
     // instant the request completes. captureRunning stays true through the
     // wait so refreshStatus()'s own auto-resume logic doesn't race this.
     const captureDoneAt = performance.now();
-    await new Promise((resolve) => setTimeout(resolve, POST_CAPTURE_FREEZE_MS));
+    // No live view to return to while stopped, so nothing to hold for.
+    if (!previewStopped) {
+      await new Promise((resolve) => setTimeout(resolve, POST_CAPTURE_FREEZE_MS));
+    }
     const holdDoneAt = performance.now();
     captureRunning = false;
-    await ensurePreview(null, false);
+    if (previewStopped) {
+      elements.streamState.textContent = "Preview stopped";
+    } else {
+      await ensurePreview(null, false);
+    }
     setBusy(false);
     traceButtonReady(captureDoneAt, holdDoneAt, performance.now());
     refreshStatus();
@@ -825,7 +896,15 @@ async function refreshStatus() {
     }
     elements.saveConfig.disabled = !status.config_staged;
     elements.discardConfig.hidden = !status.config_staged;
+    applyPreviewState(status.preview);
     if (!pageActive || captureRunning || reconfigureRunning) return;
+    if (previewStopped) {
+      // Stopped here or in another tab: drop any local stream, and stop a
+      // server stream that slipped through a start already in flight.
+      if (livePreview) stopLivePreview();
+      if (status.camera.streaming) navigator.sendBeacon("/api/stream/stop");
+      return;
+    }
     if (!status.camera.streaming && livePreview) {
       livePreview = false;
       previewGeneration += 1;
@@ -913,6 +992,8 @@ function formatDuration(seconds) {
 }
 
 elements.capture.addEventListener("click", captureAndTransfer);
+elements.previewToggle.addEventListener("click", togglePreview);
+elements.downsamplePreview.addEventListener("change", setPreviewDownsample);
 elements.reset.addEventListener("click", () => {
   applySettings(defaults);
   controlRevision += 1;

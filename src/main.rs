@@ -128,6 +128,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(_) => optic_scheduler::ScheduleRunState::default(),
     };
     info!(?initial_run_state, "scheduler starting");
+
+    // Preview stop/downsample preferences survive a reboot the same way.
+    let preview_state_path = state_dir.join("preview_state.json");
+    let preview_state_cache_path = cache_dir.join("preview_state.json");
+    if let Err(error) =
+        durable_state::hydrate_cache(&preview_state_path, &preview_state_cache_path).await
+    {
+        warn!(%error, path = %preview_state_path.display(), "failed to hydrate the preview state cache from its durable copy at startup");
+    }
     let scheduler = optic_scheduler::SchedulerHandle::spawn(
         camera.clone(),
         capture_log.clone(),
@@ -147,6 +156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         capture_dir,
         config_path,
         config_cache_path,
+        preview_state_path,
+        preview_state_cache_path,
         asset_dir,
         sensor,
     );

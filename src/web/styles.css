@@ -85,6 +85,8 @@ h3 { margin: 0; font-size: 1rem; }
 
 .status-row, .button-row { display: flex; flex-wrap: wrap; gap: 10px; }
 .preview-card > .button-row { margin-bottom: 16px; }
+.preview-option { margin: 10px 0 12px; }
+.preview-option small { color: var(--muted); }
 .pill { padding: 8px 12px; border: 1px solid var(--line); border-radius: 100px; font-size: 0.82rem; }
 .pill.good { color: var(--green); background: rgba(92, 225, 167, 0.08); border-color: rgba(92, 225, 167, 0.32); }
 .pill.bad { color: var(--red); background: rgba(255, 107, 107, 0.08); border-color: rgba(255, 107, 107, 0.32); }
