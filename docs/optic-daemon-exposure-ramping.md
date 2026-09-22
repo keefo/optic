@@ -33,7 +33,7 @@ follows the sun, and per-frame step limits.
 | Max shutter | Keep the existing 5 s validation cap. The f/1.2 lens gathers at 5 s what an f/2.4 lens gathers at 20 s. Longer needs a separate hardware test. |
 | Night look | **Brightened night.** The target stays at the day level down to sun +6°, then eases 2 EV darker by −18° (astronomical dusk). |
 | Scope | **Global only.** One exposure mode for all scheduled captures: `Dashboard` (unchanged behaviour) or `AutoRamp`. No per-rule presets (§3.1). |
-| White balance | **Eased grey-world**, seeded from AWB, at most ~3% change per frame. |
+| White balance | **Locked** (revised 2026-09-22): seeded once from AWB, then held for the run. Optional slow easing stays in Advanced. |
 | Metering | **Trimmed log-mean luma** over a 1/16 sample grid, darkest/brightest 2% dropped. |
 
 ### 3.1 Why there are no per-rule exposure presets
@@ -87,7 +87,7 @@ deserializes as `Dashboard`.
 | `night_drop_ev` | 0 ..= 6 | How much darker the night target is than the day target. |
 | `max_step_ev` | 0.05 ..= 2 | Largest exposure change between two consecutive ramped frames. |
 | `smoothing` | 0 ..= 0.95 | Weight of the previous scene estimate (0 = react fully to each frame). |
-| `wb_max_step_pct` | 0 ..= 20 | Largest colour-gain change per frame, in percent. |
+| `wb_max_step_pct` | 0 ..= 20 | Largest colour-gain change per **captured** frame, in percent. Default `0`: white balance is locked for the run. |
 
 `POST /api/schedule/exposure` (and `/api/schedule/preview`) reject
 out-of-range values with 422. At run
@@ -179,26 +179,33 @@ Example: a 30 s night interval caps the shutter at about 2.0 s, and a
 ramped frames would remove most of this cost, but changes camera behaviour,
 so it needs an on-Pi test first (§9).
 
-## 6. White Balance
+## 6. White Balance (revised 2026-09-22: locked by default)
 
 Per-frame AWB (`AwbEnable(true)`, today's default) re-estimates colour on
 every capture and is a known flicker source. In `AutoRamp`:
 
-- The seed frame runs AWB; its reported `ColourGains` become the starting
-  gains.
+- The first frame (a seed capture, or the first metered preview frame) runs
+  AWB; its reported `ColourGains` become the gains for the run.
+- **With the default `wb_max_step_pct: 0` nothing moves them afterwards.**
+  That removes per-frame AWB flicker, which was the actual goal, without
+  neutralizing a strongly coloured scene. The day-to-night colour shift is
+  left to post-processing, as timelapse workflows normally do. Easing (below)
+  is opt-in through *Advanced*.
 - Every later frame is captured with `AwbEnable(false)` and explicit
   `ColourGains` from the ramp state.
-- After each frame, the grey-world estimate (linear mid-tone R, G, B means)
-  suggests `gains × (G/R, G/B)`. The ramp moves toward it with the same
-  `smoothing`, at most `wb_max_step_pct` per frame, clamped to 0.5..8.
+- When easing is enabled, after each **captured** frame the grey-world
+  estimate (linear mid-tone R, G, B means) suggests `gains × (G/R, G/B)`,
+  and the ramp moves toward it with the same `smoothing`, at most
+  `wb_max_step_pct` per frame, clamped to 0.5..8. Live preview frames never
+  move the gains: they arrive up to 8× a second, and easing at that rate
+  drifted the colour temperature visibly within seconds (§11).
 - WB is held unchanged when the frame is too dark to judge
   (`L < 0.01` or fewer than 1% of samples usable). This avoids chasing
   sensor noise at night.
 
-Known limitation: grey-world pulls strongly coloured scenes, such as a vivid
-sunset or sodium-lit streets, toward neutral. The per-frame limit makes that
-drift slow and smooth rather than preventing it. The DNG keeps the raw data
-for fixing colour in post.
+This is why easing is off by default: grey-world pulls strongly coloured
+scenes, such as a vivid sunset or sodium-lit streets, toward neutral. The
+DNG keeps the raw data for fixing colour in post either way.
 
 ## 7. Integration
 

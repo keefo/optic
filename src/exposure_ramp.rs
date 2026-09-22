@@ -77,7 +77,8 @@ pub struct RampSettings {
     pub max_step_ev: f64,
     /// Weight of the previous scene estimate; 0 reacts fully to each frame.
     pub smoothing: f64,
-    /// Largest colour-gain change per frame, in percent.
+    /// Largest colour-gain change per captured frame, in percent.
+    /// `0` (the default) holds white balance for the whole run.
     pub wb_max_step_pct: f64,
 }
 
@@ -91,7 +92,13 @@ impl Default for RampSettings {
             night_drop_ev: 2.0,
             max_step_ev: 1.0 / 3.0,
             smoothing: 0.5,
-            wb_max_step_pct: 3.0,
+            // Locked by default: seed the gains from AWB once, then hold
+            // them. Easing neutralizes a strongly coloured scene (a sunset
+            // is the point of the shot), and per-frame AWB flicker is
+            // already solved by fixing the gains at all. Post-processing
+            // handles the day-to-night colour shift, as timelapse
+            // workflows normally do (user decision, 2026-09-22).
+            wb_max_step_pct: 0.0,
         }
     }
 }
@@ -993,8 +1000,43 @@ mod tests {
     }
 
     #[test]
-    fn white_balance_eases_toward_neutral_in_bounded_steps() {
+    fn white_balance_is_locked_by_default() {
+        // Default: gains are seeded once and then held (user decision).
         let settings = RampSettings::default();
+        assert_eq!(settings.wb_max_step_pct, 0.0);
+        let state = RampState {
+            planned_log2_exposure: Some(10.0),
+            ..seeded(-12.0, at(0))
+        };
+        let step = RampPlan::Manual {
+            shutter_us: 1_000,
+            gain: 1.0,
+            colour_gains: state.colour_gains,
+            log2_exposure: 10.0,
+        };
+        let next = observe(
+            Some(&state),
+            &step,
+            &FrameObservation {
+                exposure_us: 1_000.0,
+                analogue_gain: 1.0,
+                colour_gains: Some(state.colour_gains),
+                meter: meter(0.18, Some([0.30, 0.18, 0.05])),
+            },
+            at(1),
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(next.colour_gains, state.colour_gains);
+    }
+
+    #[test]
+    fn white_balance_eases_toward_neutral_in_bounded_steps() {
+        // Opt-in easing (Advanced): still bounded per frame.
+        let settings = RampSettings {
+            wb_max_step_pct: 3.0,
+            ..RampSettings::default()
+        };
         let mut state = RampState {
             planned_log2_exposure: Some(10.0),
             ..seeded(-12.0, at(0))
@@ -1057,7 +1099,11 @@ mod tests {
             next = observe_preview(Some(&next), &strong_cast, at(frame), &settings).unwrap();
             assert_eq!(next.colour_gains, state.colour_gains, "frame {frame}");
         }
-        // A captured frame still eases, as designed (§6).
+        // A captured frame still eases when easing is enabled (§6).
+        let easing = RampSettings {
+            wb_max_step_pct: 3.0,
+            ..settings
+        };
         let captured = observe(
             Some(&next),
             &RampPlan::Manual {
@@ -1068,7 +1114,7 @@ mod tests {
             },
             &strong_cast,
             at(21),
-            &settings,
+            &easing,
         )
         .unwrap();
         assert_ne!(captured.colour_gains, state.colour_gains);

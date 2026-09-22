@@ -18,7 +18,7 @@
     night_drop_ev: 2,
     max_step_ev: 1 / 3,
     smoothing: 0.5,
-    wb_max_step_pct: 3,
+    wb_max_step_pct: 0,
   };
   // The Night look slider runs Dark (0) to Bright (NIGHT_LOOK_MAX); the
   // ramp's `night_drop_ev` is its mirror image.
