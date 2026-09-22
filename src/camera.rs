@@ -188,6 +188,34 @@ pub(crate) struct CaptureSpec {
     pub jpeg_quality: u8,
 }
 
+/// Shortest frame duration requested for still-capture warmup frames. libcamera
+/// clamps it up to the selected sensor mode's minimum. Without an explicit
+/// limit, still captures inherited the previous preview's limit (~500 ms per
+/// frame after the 2 FPS Master Archive preview;
+/// `docs/optic-daemon-capture-performance.md` §7).
+pub(crate) const STILL_MIN_FRAME_DURATION_US: i64 = 33_333;
+
+/// Longest frame duration allowed when the shutter is auto (`0`). Auto
+/// exposure still runs in that case and is capped by the maximum frame
+/// duration, so this must not undercut it; 500 ms matches the slowest
+/// preview limit that still captures used to inherit.
+pub(crate) const STILL_AUTO_MAX_FRAME_DURATION_US: i64 = 500_000;
+
+/// `FrameDurationLimits` for still-capture requests: as fast as the sensor
+/// mode and the exposure allow. Auto shutter leaves auto exposure its old
+/// headroom; a manual shutter is never truncated by the limit.
+pub(crate) fn still_frame_duration_limits_us(shutter_us: u64) -> [i64; 2] {
+    let max = if shutter_us == 0 {
+        STILL_AUTO_MAX_FRAME_DURATION_US
+    } else {
+        i64::try_from(shutter_us).unwrap_or(i64::MAX)
+    };
+    [
+        STILL_MIN_FRAME_DURATION_US,
+        max.max(STILL_MIN_FRAME_DURATION_US),
+    ]
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PreviewSpec {
     pub width: u32,
@@ -457,6 +485,39 @@ mod tests {
             CaptureSource::Scheduler {
                 rule_slugs: vec!["weekday-daytime".to_owned()]
             }
+        );
+    }
+
+    #[test]
+    fn still_frame_duration_limits_leave_auto_exposure_its_headroom() {
+        // Regression: [33 ms, 33 ms] capped auto exposure at 33 ms on the Pi
+        // (baseline scenes auto-exposed at 66.7 ms), darkening captures.
+        assert_eq!(
+            still_frame_duration_limits_us(0),
+            [
+                STILL_MIN_FRAME_DURATION_US,
+                STILL_AUTO_MAX_FRAME_DURATION_US
+            ]
+        );
+    }
+
+    #[test]
+    fn still_frame_duration_limits_use_the_floor_for_short_manual_shutters() {
+        assert_eq!(
+            still_frame_duration_limits_us(10_000),
+            [STILL_MIN_FRAME_DURATION_US, STILL_MIN_FRAME_DURATION_US]
+        );
+        assert_eq!(
+            still_frame_duration_limits_us(100_000),
+            [STILL_MIN_FRAME_DURATION_US, 100_000]
+        );
+    }
+
+    #[test]
+    fn still_frame_duration_limits_never_truncate_long_shutters() {
+        assert_eq!(
+            still_frame_duration_limits_us(5_000_000),
+            [STILL_MIN_FRAME_DURATION_US, 5_000_000]
         );
     }
 }

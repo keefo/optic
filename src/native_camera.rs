@@ -36,6 +36,7 @@ mod imp {
         camera::{
             CameraError, CameraSettings, CaptureFile, CaptureProfile, CaptureRequest,
             CaptureResult, CaptureSource, PreviewFrame, StreamRequest, format_rule_tags,
+            still_frame_duration_limits_us,
         },
         native_codec::{DngMetadata, decode_pisp_comp1, encode_bayer16_dng, encode_yuv420_jpeg},
     };
@@ -562,11 +563,19 @@ mod imp {
             }
         }
 
+        // The configured sensor mode bounds the achievable frame rate; logged
+        // per role to compare StillCapture against ViewFinder timing.
+        let frame_duration_range = camera
+            .controls()
+            .find(controls::ControlId::FrameDurationLimits as u32)
+            .ok()
+            .map(|info| format!("{:?}..{:?}", info.min(), info.max()));
         info!(
             ?profile,
             streaming,
             processed = %format!("{}x{}", still_info.width, still_info.height),
             raw = raw_info.as_ref().map(|value| value.format.as_str()),
+            frame_duration_range_us = frame_duration_range.as_deref(),
             "native camera pipeline started"
         );
         Ok(Pipeline {
@@ -689,6 +698,14 @@ mod imp {
             controls
                 .set(controls::FrameDurationLimits([frame_us, frame_us]))
                 .map_err(backend_error)?;
+        } else {
+            // Still capture: never leave the frame duration to libcamera's
+            // default or a previous preview's limit (~500 ms/frame observed).
+            controls
+                .set(controls::FrameDurationLimits(
+                    still_frame_duration_limits_us(settings.shutter_us),
+                ))
+                .map_err(backend_error)?;
         }
         Ok(())
     }
@@ -771,10 +788,30 @@ mod imp {
                     .get::<controls::ExposureTime>()
                     .ok()
                     .map(|value| value.0);
+                let frame_duration_us = request
+                    .metadata()
+                    .get::<controls::FrameDuration>()
+                    .ok()
+                    .map(|value| value.0);
+                // AWB and (with auto shutter) exposure still converge during
+                // warmup; these show how many warmup frames they need.
+                let colour_gains = request
+                    .metadata()
+                    .get::<controls::ColourGains>()
+                    .ok()
+                    .map(|value| value.0);
+                let analogue_gain = request
+                    .metadata()
+                    .get::<controls::AnalogueGain>()
+                    .ok()
+                    .map(|value| value.0);
                 info!(
                     stage = "warmup_frame",
                     frame_index = pipeline.frame_count,
                     exposure_us,
+                    analogue_gain,
+                    frame_duration_us,
+                    ?colour_gains,
                     since_previous_ms,
                     "capture perf"
                 );
@@ -812,7 +849,7 @@ mod imp {
         })();
         info!(
             stage = "warmup_and_capture",
-            frames = CAPTURE_WARMUP_FRAMES + 1,
+            frames = pipeline.frame_count,
             elapsed_ms = warmup_started.elapsed().as_millis(),
             "capture perf"
         );
