@@ -22,7 +22,7 @@ follows the sun, and per-frame step limits.
 |---|---|---|
 | Shutter | `ExposureTime` (manual) | Yes, first |
 | Analogue gain | `AnalogueGain` (manual) | Yes, after shutter reaches its limit |
-| White balance | `AwbEnable(false)` + `ColourGains` | Yes, eased (§6) |
+| White balance | `AwbEnable(false)` + `ColourGains`, or AWB modes | No — the operator's own setting (§6) |
 | Aperture | none (manual 6 mm f/1.2 CS lens) | No |
 | Focus | none (manual) | No |
 
@@ -33,7 +33,7 @@ follows the sun, and per-frame step limits.
 | Max shutter | Keep the existing 5 s validation cap. The f/1.2 lens gathers at 5 s what an f/2.4 lens gathers at 20 s. Longer needs a separate hardware test. |
 | Night look | **Brightened night.** The target stays at the day level down to sun +6°, then eases 2 EV darker by −18° (astronomical dusk). |
 | Scope | **Global only.** One exposure mode for all scheduled captures: `Dashboard` (unchanged behaviour) or `AutoRamp`. No per-rule presets (§3.1). |
-| White balance | **Locked** (revised 2026-09-22): seeded once from AWB, then held for the run. Optional slow easing stays in Advanced. |
+| White balance | **Not part of the ramp** (revised 2026-09-22, twice). Scheduled captures use the dashboard's own White balance control, exactly like a manual capture. |
 | Metering | **Trimmed log-mean luma** over a 1/16 sample grid, darkest/brightest 2% dropped. |
 
 ### 3.1 Why there are no per-rule exposure presets
@@ -73,8 +73,7 @@ deserializes as `Dashboard`.
   "day_bias_ev": 0.0,
   "night_drop_ev": 2.0,
   "max_step_ev": 0.333,
-  "smoothing": 0.5,
-  "wb_max_step_pct": 3.0
+  "smoothing": 0.5
 }
 ```
 
@@ -87,7 +86,6 @@ deserializes as `Dashboard`.
 | `night_drop_ev` | 0 ..= 6 | How much darker the night target is than the day target. |
 | `max_step_ev` | 0.05 ..= 2 | Largest exposure change between two consecutive ramped frames. |
 | `smoothing` | 0 ..= 0.95 | Weight of the previous scene estimate (0 = react fully to each frame). |
-| `wb_max_step_pct` | 0 ..= 20 | Largest colour-gain change per **captured** frame, in percent. Default `0`: white balance is locked for the run. |
 
 `POST /api/schedule/exposure` (and `/api/schedule/preview`) reject
 out-of-range values with 422. At run
@@ -153,7 +151,7 @@ With no ramp state (daemon start, or switching to `AutoRamp`), or when more
 than 30 minutes have passed since the last ramped frame, the next capture is
 a **seed frame**. It uses libcamera auto exposure and AWB (shutter 0,
 gain 0, `awb: auto`), as `Dashboard` defaults do. Its measurement
-initializes `Ŝ` and the colour gains. The first planned frame after a seed
+initializes `Ŝ`. The first planned frame after a seed
 may jump straight to the desired exposure (no step limit), because there is
 no smooth sequence to protect yet. Every frame after that is step-limited.
 The seed frame is a normal output frame.
@@ -179,33 +177,32 @@ Example: a 30 s night interval caps the shutter at about 2.0 s, and a
 ramped frames would remove most of this cost, but changes camera behaviour,
 so it needs an on-Pi test first (§9).
 
-## 6. White Balance (revised 2026-09-22: locked by default)
+## 6. White Balance Is Not Ramped (revised 2026-09-22)
 
-Per-frame AWB (`AwbEnable(true)`, today's default) re-estimates colour on
-every capture and is a known flicker source. In `AutoRamp`:
+The ramp controls exposure only. Scheduled captures use whatever the
+dashboard's **White balance** control says — the same control a manual
+capture uses — and that field stays editable while *Scheduled exposure* is
+on.
 
-- The first frame (a seed capture, or the first metered preview frame) runs
-  AWB; its reported `ColourGains` become the gains for the run.
-- **With the default `wb_max_step_pct: 0` nothing moves them afterwards.**
-  That removes per-frame AWB flicker, which was the actual goal, without
-  neutralizing a strongly coloured scene. The day-to-night colour shift is
-  left to post-processing, as timelapse workflows normally do. Easing (below)
-  is opt-in through *Advanced*.
-- Every later frame is captured with `AwbEnable(false)` and explicit
-  `ColourGains` from the ramp state.
-- When easing is enabled, after each **captured** frame the grey-world
-  estimate (linear mid-tone R, G, B means) suggests `gains × (G/R, G/B)`,
-  and the ramp moves toward it with the same `smoothing`, at most
-  `wb_max_step_pct` per frame, clamped to 0.5..8. Live preview frames never
-  move the gains: they arrive up to 8× a second, and easing at that rate
-  drifted the colour temperature visibly within seconds (§11).
-- WB is held unchanged when the frame is too dark to judge
-  (`L < 0.01` or fewer than 1% of samples usable). This avoids chasing
-  sensor noise at night.
+Two earlier designs were tried and dropped:
 
-This is why easing is off by default: grey-world pulls strongly coloured
-scenes, such as a vivid sunset or sodium-lit streets, toward neutral. The
-DNG keeps the raw data for fixing colour in post either way.
+1. **Eased grey-world:** colour gains seeded from AWB and nudged toward
+   neutral each frame. Grey-world pulls a strongly coloured scene toward
+   grey, which removes the sunset the timelapse exists to capture. It also
+   drifted visibly once live preview frames fed the loop at frame rate
+   (§11).
+2. **Locked gains:** seed once from AWB, then hold. That fixed the drift but
+   still replaced the operator's choice with a number the camera happened to
+   pick at an arbitrary moment.
+
+What "locked" should mean is *the operator's setting, held*: choose a fixed
+preset (Daylight, Cloudy, …) and every scheduled frame uses it, which also
+removes the per-frame AWB flicker that motivated the original design.
+Leaving the control on Auto keeps libcamera's per-frame AWB, flicker
+included — the operator's choice to make. The UI note says so.
+
+`CameraSettings.colour_gains` and `ExposureOverride.colour_gains` remain as a
+manual-white-balance capability, but nothing sets them today.
 
 ## 7. Integration
 
@@ -257,13 +254,15 @@ exposure already lives:
   stages `ScheduleConfig.exposure` through `POST /api/schedule/exposure` and
   is saved or discarded with the dashboard's Save Settings / Discard
   Changes.
-- **Locked, live fields.** With the toggle on, Shutter, Gain and White
-  balance are read-only and show the *next planned exposure* from
+- **Locked, live fields.** With the toggle on, Shutter and Gain are
+  read-only and show the *next planned exposure* from (White balance stays
+  editable — §6)
   `GET /api/status` → `exposure_plan`. This is recomputed on every poll from
   the ramp state, the settings, and the current sun elevation, so it drifts
   as the night target changes and jumps when a scheduled frame is observed.
   An amber style marks ramp-driven values, and a brief pulse marks a change.
-  "Auto (seeding)" means the next frame is a seed.
+  While the ramp is still seeding they show the preview's own live auto
+  exposure instead.
 - **Brightness-equivalent preview.** The live preview can't run a 4 s
   shutter, so the stream request carries a preview-only `exposure_override`:
   the plan's total `shutter × gain`, with the shutter clamped to the preview

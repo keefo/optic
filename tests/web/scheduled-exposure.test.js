@@ -7,22 +7,16 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const ramp = require("../../src/web/scheduled-exposure.js");
 
-const manualPlan = (shutter_us, gain, colour_gains = [2.6, 1.8]) => ({
-  seeding: false,
-  shutter_us,
-  gain,
-  colour_gains,
-});
+const manualPlan = (shutter_us, gain) => ({ seeding: false, shutter_us, gain });
 
 test("no plan means no preview override", () => {
   assert.equal(ramp.previewEquivalent(null, 8), null);
 });
 
-test("a seeding plan previews with auto exposure and AWB", () => {
+test("a seeding plan previews with auto exposure", () => {
   assert.deepEqual(ramp.previewEquivalent({ seeding: true }, 8), {
     shutter_us: 0,
     gain: 0,
-    colour_gains: null,
     shortfall_ev: 0,
   });
 });
@@ -31,7 +25,6 @@ test("a short shutter passes through unchanged", () => {
   const preview = ramp.previewEquivalent(manualPlan(10000, 1), 8);
   assert.equal(preview.shutter_us, 10000);
   assert.equal(preview.gain, 1);
-  assert.deepEqual(preview.colour_gains, [2.6, 1.8]);
   assert.equal(preview.shortfall_ev, 0);
 });
 
@@ -86,32 +79,30 @@ test("plan descriptions for the locked fields", () => {
   assert.deepEqual(ramp.describePlan({ seeding: true }), {
     shutter: "Auto",
     gain: "Auto",
-    whiteBalance: "AWB",
   });
-  assert.deepEqual(ramp.describePlan(manualPlan(4226589, 1.1454139, [2.6337, 1.8228])), {
+  // White balance is not part of the ramp, so it is not described here.
+  assert.deepEqual(ramp.describePlan(manualPlan(4226589, 1.1454139)), {
     shutter: "4.2 s",
     gain: "1.15×",
-    whiteBalance: "Eased · R 2.63 / B 1.82",
   });
 });
 
 test("while seeding, the locked fields show the preview's live auto exposure", () => {
-  const preview = { exposureUs: 66654, analogueGain: 15.515152, colourGains: [2.6476793, 1.8268075] };
+  const preview = { exposureUs: 66654, analogueGain: 15.515152 };
   assert.deepEqual(ramp.describePlan({ seeding: true }, preview), {
     shutter: "1/15 s",
     gain: "15.5×",
-    whiteBalance: "AWB · R 2.65 / B 1.83",
   });
   // Partial or missing metadata falls back per field.
   assert.deepEqual(
-    ramp.describePlan({ seeding: true }, { exposureUs: 8000, analogueGain: null, colourGains: null }),
-    { shutter: "1/125 s", gain: "Auto", whiteBalance: "AWB" },
+    ramp.describePlan({ seeding: true }, { exposureUs: 8000, analogueGain: null }),
+    { shutter: "1/125 s", gain: "Auto" },
   );
   assert.equal(ramp.describePlan({ seeding: true }, { exposureUs: 0 }).shutter, "Auto");
 });
 
 test("a ramped plan ignores the preview's (override) values", () => {
-  const preview = { exposureUs: 118750, analogueGain: 16, colourGains: [2.6, 1.8] };
+  const preview = { exposureUs: 118750, analogueGain: 16 };
   assert.equal(ramp.describePlan(manualPlan(3843022, 1), preview).shutter, "3.8 s");
   assert.equal(ramp.describePlan(manualPlan(3843022, 1), preview).gain, "1.00×");
 });

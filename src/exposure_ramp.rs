@@ -13,10 +13,7 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::camera::{
-    COLOUR_GAIN_MAX, COLOUR_GAIN_MIN, MAX_GAIN, MAX_SHUTTER_US, MIN_GAIN, MIN_SHUTTER_US,
-    STILL_CAPTURE_FRAMES,
-};
+use crate::camera::{MAX_GAIN, MAX_SHUTTER_US, MIN_GAIN, MIN_SHUTTER_US, STILL_CAPTURE_FRAMES};
 
 /// Photographic mid-grey as linear luminance; `bias_ev = 0` targets it.
 pub const MID_GREY: f64 = 0.18;
@@ -39,11 +36,9 @@ const GAMMA: f64 = 2.2;
 const CLIPPED_LUMA: u8 = 250;
 /// Luma range whose chroma is trusted for the grey-world estimate.
 const GREY_WORLD_LUMA: std::ops::RangeInclusive<u8> = 16..=235;
-/// White balance is held on frames darker than this (sensor noise, not
-/// scene colour, dominates there).
-const WB_MIN_LUMINANCE: f64 = 0.01;
-/// ...or when fewer than this fraction of samples are usable mid-tones.
-const WB_MIN_SAMPLE_FRACTION: f64 = 0.01;
+/// Frames need at least this fraction of usable mid-tone samples before
+/// their colour means are reported at all.
+const MIN_COLOUR_SAMPLE_FRACTION: f64 = 0.01;
 /// Share of the gap to the next shot a capture may use.
 const GAP_BUDGET_FRACTION: f64 = 0.8;
 /// Pipeline start/stop, encode and write time on top of the frames.
@@ -77,9 +72,6 @@ pub struct RampSettings {
     pub max_step_ev: f64,
     /// Weight of the previous scene estimate; 0 reacts fully to each frame.
     pub smoothing: f64,
-    /// Largest colour-gain change per captured frame, in percent.
-    /// `0` (the default) holds white balance for the whole run.
-    pub wb_max_step_pct: f64,
 }
 
 impl Default for RampSettings {
@@ -92,13 +84,6 @@ impl Default for RampSettings {
             night_drop_ev: 2.0,
             max_step_ev: 1.0 / 3.0,
             smoothing: 0.5,
-            // Locked by default: seed the gains from AWB once, then hold
-            // them. Easing neutralizes a strongly coloured scene (a sunset
-            // is the point of the shot), and per-frame AWB flicker is
-            // already solved by fixing the gains at all. Post-processing
-            // handles the day-to-night colour shift, as timelapse
-            // workflows normally do (user decision, 2026-09-22).
-            wb_max_step_pct: 0.0,
         }
     }
 }
@@ -115,7 +100,7 @@ impl RampSettings {
         if !(MIN_GAIN..=MAX_GAIN).contains(&self.max_gain) {
             return Err("max gain must be between 1 and 16");
         }
-        let checks: [(f64, f64, f64, &'static str); 5] = [
+        let checks: [(f64, f64, f64, &'static str); 4] = [
             (
                 self.day_bias_ev,
                 -3.0,
@@ -139,12 +124,6 @@ impl RampSettings {
                 0.0,
                 0.95,
                 "smoothing must be between 0 and 0.95",
-            ),
-            (
-                self.wb_max_step_pct,
-                0.0,
-                20.0,
-                "white-balance step must be between 0 and 20 percent",
             ),
         ];
         for (value, min, max, message) in checks {
@@ -180,7 +159,6 @@ impl RampSettings {
             night_drop_ev: clamp(self.night_drop_ev, 0.0, 6.0, defaults.night_drop_ev),
             max_step_ev: clamp(self.max_step_ev, 0.05, 2.0, defaults.max_step_ev),
             smoothing: clamp(self.smoothing, 0.0, 0.95, defaults.smoothing),
-            wb_max_step_pct: clamp(self.wb_max_step_pct, 0.0, 20.0, defaults.wb_max_step_pct),
         }
     }
 }
@@ -259,7 +237,7 @@ pub fn meter_yuv420(data: &[u8], width: u32, height: u32, stride: u32) -> Option
     let clipped: u64 = histogram[usize::from(CLIPPED_LUMA)..].iter().sum();
 
     let grey_world = (rgb_samples > 0
-        && rgb_samples as f64 >= samples as f64 * WB_MIN_SAMPLE_FRACTION)
+        && rgb_samples as f64 >= samples as f64 * MIN_COLOUR_SAMPLE_FRACTION)
         .then(|| rgb_sum.map(|sum| sum / rgb_samples as f64));
     Some(FrameMeter {
         luminance,
@@ -354,7 +332,6 @@ pub enum RampPlan {
     Manual {
         shutter_us: u64,
         gain: f32,
-        colour_gains: [f32; 2],
         /// `log2(shutter_us × gain)` actually planned, after clamping.
         log2_exposure: f64,
     },
@@ -366,7 +343,6 @@ pub enum RampPlan {
 pub struct FrameObservation {
     pub exposure_us: f64,
     pub analogue_gain: f64,
-    pub colour_gains: Option<[f32; 2]>,
     pub meter: FrameMeter,
 }
 
@@ -378,7 +354,6 @@ pub struct RampState {
     /// The previous frame's planned exposure. `None` right after a seed,
     /// which lets the first planned frame jump without a step limit.
     pub planned_log2_exposure: Option<f64>,
-    pub colour_gains: [f32; 2],
 }
 
 /// Plans the next ramped capture (design doc §5.3/§5.4).
@@ -412,13 +387,15 @@ pub fn plan(
     RampPlan::Manual {
         shutter_us,
         gain,
-        colour_gains: state.colour_gains,
         log2_exposure: (shutter_us as f64 * f64::from(gain)).log2(),
     }
 }
 
-/// Folds a completed capture into the ramp state. Returns `None` (keep
-/// seeding) when a seed frame reports no AWB colour gains to start from.
+/// Folds a completed capture into the ramp state.
+///
+/// White balance is deliberately not part of the ramp: scheduled captures
+/// use whatever the dashboard's White balance control says, exactly like a
+/// manual capture (user decision, 2026-09-22 — see design doc §6).
 pub fn observe(
     state: Option<&RampState>,
     plan: &RampPlan,
@@ -431,43 +408,25 @@ pub fn observe(
     match (plan, state) {
         (RampPlan::Manual { log2_exposure, .. }, Some(state)) => {
             let blend = 1.0 - settings.smoothing;
-            let applied = observation
-                .colour_gains
-                .unwrap_or(state.colour_gains)
-                .map(f64::from);
             Some(RampState {
                 updated_at: now,
                 scene_ev: state.scene_ev + blend * (scene_ev - state.scene_ev),
                 planned_log2_exposure: Some(*log2_exposure),
-                colour_gains: ease_colour_gains(
-                    state.colour_gains,
-                    applied,
-                    &observation.meter,
-                    settings,
-                ),
             })
         }
-        _ => observation.colour_gains.map(|colour_gains| RampState {
+        _ => Some(RampState {
             updated_at: now,
             scene_ev,
             planned_log2_exposure: None,
-            colour_gains: colour_gains.map(|gain| gain.clamp(COLOUR_GAIN_MIN, COLOUR_GAIN_MAX)),
         }),
     }
 }
 
 /// Folds a *live preview* frame into the ramp state (design doc §11).
 ///
-/// Brightness only. Two things are deliberately left alone:
-///
-/// - `planned_log2_exposure`, the anchor for the capture sequence's
-///   per-frame step limit, so a preview restart or a passing cloud can't
-///   jump a running timelapse.
-/// - `colour_gains`. White balance eases per *frame*, which is sized for
-///   captures arriving about once a minute. Preview frames arrive up to 8
-///   times a second, so easing here drifted the colour temperature visibly
-///   within seconds (2026-09-22 bug report). The gains are seeded once from
-///   the preview's AWB and then only ever eased by captured frames.
+/// Brightness only. `planned_log2_exposure` is deliberately left alone: it
+/// anchors the capture sequence's per-frame step limit, so a preview restart
+/// or a passing cloud can't jump a running timelapse.
 pub fn observe_preview(
     state: Option<&RampState>,
     observation: &FrameObservation,
@@ -477,11 +436,10 @@ pub fn observe_preview(
     let exposure = (observation.exposure_us.max(1.0) * observation.analogue_gain.max(1.0)).log2();
     let scene_ev = observation.meter.luminance.max(MIN_LUMINANCE).log2() - exposure;
     let Some(state) = state else {
-        return observation.colour_gains.map(|colour_gains| RampState {
+        return Some(RampState {
             updated_at: now,
             scene_ev,
             planned_log2_exposure: None,
-            colour_gains: colour_gains.map(|gain| gain.clamp(COLOUR_GAIN_MIN, COLOUR_GAIN_MAX)),
         });
     };
     let blend = 1.0 - settings.smoothing;
@@ -489,32 +447,6 @@ pub fn observe_preview(
         updated_at: now,
         scene_ev: state.scene_ev + blend * (scene_ev - state.scene_ev),
         planned_log2_exposure: state.planned_log2_exposure,
-        colour_gains: state.colour_gains,
-    })
-}
-
-/// Moves colour gains toward the grey-world suggestion `applied × (G/R,
-/// G/B)`, smoothed and limited to `wb_max_step_pct` per frame (design doc
-/// §6). Holds them on frames too dark to judge.
-fn ease_colour_gains(
-    current: [f32; 2],
-    applied: [f64; 2],
-    meter: &FrameMeter,
-    settings: &RampSettings,
-) -> [f32; 2] {
-    let Some([red, green, blue]) = meter.grey_world else {
-        return current;
-    };
-    if meter.luminance < WB_MIN_LUMINANCE || red <= 0.0 || green <= 0.0 || blue <= 0.0 {
-        return current;
-    }
-    let suggested = [applied[0] * green / red, applied[1] * green / blue];
-    let limit = (1.0 + settings.wb_max_step_pct / 100.0).ln();
-    let blend = 1.0 - settings.smoothing;
-    std::array::from_fn(|channel| {
-        let from = f64::from(current[channel]);
-        let delta = (blend * (suggested[channel].ln() - from.ln())).clamp(-limit, limit);
-        ((from * delta.exp()) as f32).clamp(COLOUR_GAIN_MIN, COLOUR_GAIN_MAX)
     })
 }
 
@@ -743,10 +675,6 @@ mod tests {
                 ..RampSettings::default()
             },
             RampSettings {
-                wb_max_step_pct: 25.0,
-                ..RampSettings::default()
-            },
-            RampSettings {
                 day_bias_ev: f64::NAN,
                 ..RampSettings::default()
             },
@@ -766,7 +694,6 @@ mod tests {
             night_drop_ev: f64::INFINITY,
             max_step_ev: 0.0,
             smoothing: 2.0,
-            wb_max_step_pct: -5.0,
         };
         let clean = wild.sanitized();
         assert!(clean.validate().is_ok(), "{clean:?}");
@@ -794,7 +721,6 @@ mod tests {
             updated_at,
             scene_ev,
             planned_log2_exposure: None,
-            colour_gains: [2.0, 1.6],
         }
     }
 
@@ -817,24 +743,17 @@ mod tests {
     }
 
     #[test]
-    fn seed_observation_starts_the_ramp_from_awb_gains() {
+    fn a_seed_observation_starts_the_ramp() {
         let settings = RampSettings::default();
         let observation = FrameObservation {
             exposure_us: 1_000.0,
             analogue_gain: 1.0,
-            colour_gains: Some([2.1, 1.7]),
             meter: meter(MID_GREY, None),
         };
         let state = observe(None, &RampPlan::Seed, &observation, at(0), &settings).unwrap();
         assert!((state.scene_ev - (MID_GREY.log2() - 1_000_f64.log2())).abs() < 1e-9);
-        assert_eq!(state.colour_gains, [2.1, 1.7]);
+        // No capture anchor yet, so the next plan may jump to the target.
         assert_eq!(state.planned_log2_exposure, None);
-
-        let no_awb = FrameObservation {
-            colour_gains: None,
-            ..observation
-        };
-        assert!(observe(None, &RampPlan::Seed, &no_awb, at(0), &settings).is_none());
     }
 
     #[test]
@@ -897,7 +816,6 @@ mod tests {
             &FrameObservation {
                 exposure_us: seed_exposure.exp2(),
                 analogue_gain: 1.0,
-                colour_gains: Some([2.0, 1.6]),
                 meter: meter(simulated_luminance(scene, seed_exposure), None),
             },
             at(0),
@@ -952,7 +870,6 @@ mod tests {
                 &FrameObservation {
                     exposure_us: shutter_us as f64,
                     analogue_gain: f64::from(gain),
-                    colour_gains: Some([2.0, 1.6]),
                     meter: meter(luminance, None),
                 },
                 now,
@@ -982,7 +899,6 @@ mod tests {
             &FrameObservation {
                 exposure_us: 20_000.0,
                 analogue_gain: 1.0,
-                colour_gains: None,
                 meter: meter(MID_GREY * 8.0, None),
             },
             at(1),
@@ -1000,139 +916,16 @@ mod tests {
     }
 
     #[test]
-    fn white_balance_is_locked_by_default() {
-        // Default: gains are seeded once and then held (user decision).
-        let settings = RampSettings::default();
-        assert_eq!(settings.wb_max_step_pct, 0.0);
-        let state = RampState {
-            planned_log2_exposure: Some(10.0),
-            ..seeded(-12.0, at(0))
-        };
-        let step = RampPlan::Manual {
-            shutter_us: 1_000,
-            gain: 1.0,
-            colour_gains: state.colour_gains,
-            log2_exposure: 10.0,
-        };
-        let next = observe(
-            Some(&state),
-            &step,
-            &FrameObservation {
-                exposure_us: 1_000.0,
-                analogue_gain: 1.0,
-                colour_gains: Some(state.colour_gains),
-                meter: meter(0.18, Some([0.30, 0.18, 0.05])),
-            },
-            at(1),
-            &settings,
-        )
-        .unwrap();
-        assert_eq!(next.colour_gains, state.colour_gains);
-    }
-
-    #[test]
-    fn white_balance_eases_toward_neutral_in_bounded_steps() {
-        // Opt-in easing (Advanced): still bounded per frame.
-        let settings = RampSettings {
-            wb_max_step_pct: 3.0,
-            ..RampSettings::default()
-        };
-        let mut state = RampState {
-            planned_log2_exposure: Some(10.0),
-            ..seeded(-12.0, at(0))
-        };
-        // True neutral gains are [2.4, 1.4]; the frame's cast follows from
-        // the gains currently applied.
-        let truth = [2.4_f64, 1.4];
-        for frame in 1..=60 {
-            let gains = state.colour_gains.map(f64::from);
-            let cast = [gains[0] / truth[0], 1.0, gains[1] / truth[1]];
-            let step = RampPlan::Manual {
-                shutter_us: 1_000,
-                gain: 1.0,
-                colour_gains: state.colour_gains,
-                log2_exposure: 10.0,
-            };
-            let next = observe(
-                Some(&state),
-                &step,
-                &FrameObservation {
-                    exposure_us: 1_000.0,
-                    analogue_gain: 1.0,
-                    colour_gains: Some(state.colour_gains),
-                    meter: meter(0.18, Some([0.18 * cast[0], 0.18, 0.18 * cast[2]])),
-                },
-                at(frame),
-                &settings,
-            )
-            .unwrap();
-            for channel in 0..2 {
-                let ratio = f64::from(next.colour_gains[channel] / state.colour_gains[channel]);
-                assert!(
-                    (ratio.ln()).abs() <= (1.03_f64).ln() + 1e-6,
-                    "frame {frame}"
-                );
-            }
-            state = next;
-        }
-        assert!((f64::from(state.colour_gains[0]) - truth[0]).abs() < 0.02);
-        assert!((f64::from(state.colour_gains[1]) - truth[1]).abs() < 0.02);
-    }
-
-    #[test]
-    fn preview_frames_never_move_white_balance() {
-        // Regression (2026-09-22): easing WB at preview frame rate drifted
-        // the colour temperature visibly within seconds.
-        let settings = RampSettings::default();
-        let state = RampState {
-            planned_log2_exposure: Some(12.0),
-            ..seeded(-14.0, at(0))
-        };
-        let strong_cast = FrameObservation {
-            exposure_us: 4_000.0,
-            analogue_gain: 1.0,
-            colour_gains: Some([2.0, 1.6]),
-            meter: meter(MID_GREY, Some([0.30, 0.18, 0.05])),
-        };
-        let mut next = state;
-        for frame in 1..=20 {
-            next = observe_preview(Some(&next), &strong_cast, at(frame), &settings).unwrap();
-            assert_eq!(next.colour_gains, state.colour_gains, "frame {frame}");
-        }
-        // A captured frame still eases when easing is enabled (§6).
-        let easing = RampSettings {
-            wb_max_step_pct: 3.0,
-            ..settings
-        };
-        let captured = observe(
-            Some(&next),
-            &RampPlan::Manual {
-                shutter_us: 4_000,
-                gain: 1.0,
-                colour_gains: next.colour_gains,
-                log2_exposure: 12.0,
-            },
-            &strong_cast,
-            at(21),
-            &easing,
-        )
-        .unwrap();
-        assert_ne!(captured.colour_gains, state.colour_gains);
-    }
-
-    #[test]
     fn preview_frames_seed_the_ramp_and_keep_the_capture_step_anchor() {
         let settings = RampSettings::default();
         let observation = FrameObservation {
             exposure_us: 2_000.0,
             analogue_gain: 1.0,
-            colour_gains: Some([3.1, 1.4]),
             meter: meter(MID_GREY, None),
         };
         // No state: the preview seeds it, with no capture anchor.
         let seeded_state = observe_preview(None, &observation, at(0), &settings).unwrap();
         assert!((seeded_state.scene_ev - (MID_GREY.log2() - 2_000_f64.log2())).abs() < 1e-9);
-        assert_eq!(seeded_state.colour_gains, [3.1, 1.4]);
         assert_eq!(seeded_state.planned_log2_exposure, None);
 
         // With a capture-driven state, the anchor survives so a running
@@ -1160,7 +953,6 @@ mod tests {
         let observation = FrameObservation {
             exposure_us: 2_000.0,
             analogue_gain: 1.0,
-            colour_gains: Some([3.1, 1.4]),
             meter: meter(MID_GREY / 16.0, None),
         };
         let state = observe_preview(None, &observation, at(0), &settings).unwrap();
@@ -1174,29 +966,5 @@ mod tests {
             (log2_exposure - 32_000_f64.log2()).abs() < 1e-3,
             "{log2_exposure}"
         );
-    }
-
-    #[test]
-    fn white_balance_is_held_on_dark_frames() {
-        let settings = RampSettings::default();
-        let state = RampState {
-            planned_log2_exposure: Some(20.0),
-            ..seeded(-28.0, at(0))
-        };
-        let step = plan(Some(&state), at(1), None, &settings, 5_000_000);
-        let next = observe(
-            Some(&state),
-            &step,
-            &FrameObservation {
-                exposure_us: 5_000_000.0,
-                analogue_gain: 8.0,
-                colour_gains: Some([2.0, 1.6]),
-                meter: meter(0.005, Some([0.01, 0.005, 0.002])),
-            },
-            at(1),
-            &settings,
-        )
-        .unwrap();
-        assert_eq!(next.colour_gains, state.colour_gains);
     }
 }

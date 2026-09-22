@@ -174,7 +174,6 @@
         <div id="camera-control-grid" class="control-grid">
           <label>
             <span>White balance</span>
-            <output id="awb-ramp-value" class="ramp-value" hidden></output>
             <select id="awb">
               <option value="auto" selected>Auto</option>
               <option value="daylight">Daylight</option>
@@ -248,16 +247,12 @@
                     <input id="ramp-smoothing" type="number" min="0" max="0.95" step="0.05" value="0.5" data-ramp-input>
                   </label>
                   <label>
-                    <span>White-balance drift (%/frame, 0 = locked)</span>
-                    <input id="ramp-wb-step" type="number" min="0" max="20" step="0.5" value="0" data-ramp-input>
-                  </label>
-                  <label>
                     <span>Min shutter (ms)</span>
                     <input id="ramp-min-shutter" type="number" min="0.1" max="5000" step="0.1" value="0.1" data-ramp-input>
                   </label>
                 </div>
               </details>
-              <p class="ramp-note">Brightness compensation shifts the whole day-to-night curve; Night look sets how much darker night is than day. The live preview shows the next scheduled frame's brightness and colour. Capture &amp; transfer still uses your manual settings.</p>
+              <p class="ramp-note">Brightness compensation shifts the whole day-to-night curve; Night look sets how much darker night is than day. Scheduled captures keep your White balance setting above — pick a fixed preset rather than Auto to avoid colour flicker between frames. The live preview shows the next scheduled frame's brightness. Capture &amp; transfer still uses your manual settings.</p>
             </div>
           </div>
 

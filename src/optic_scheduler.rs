@@ -984,7 +984,6 @@ pub struct LiveExposurePlan {
     pub seeding: bool,
     pub shutter_us: Option<u64>,
     pub gain: Option<f32>,
-    pub colour_gains: Option<[f32; 2]>,
     pub target_bias_ev: f64,
     pub sun_elevation_deg: Option<f64>,
     pub max_shutter_us: u64,
@@ -1027,7 +1026,6 @@ pub fn live_exposure_plan(
         seeding: true,
         shutter_us: None,
         gain: None,
-        colour_gains: None,
         target_bias_ev,
         sun_elevation_deg,
         max_shutter_us,
@@ -1042,15 +1040,11 @@ pub fn live_exposure_plan(
     ) {
         RampPlan::Seed => Some(base),
         RampPlan::Manual {
-            shutter_us,
-            gain,
-            colour_gains,
-            ..
+            shutter_us, gain, ..
         } => Some(LiveExposurePlan {
             seeding: false,
             shutter_us: Some(shutter_us),
             gain: Some(gain),
-            colour_gains: Some(colour_gains),
             ..base
         }),
     }
@@ -1061,7 +1055,7 @@ pub fn live_exposure_plan(
 #[derive(Debug, Clone, Serialize)]
 pub struct RampSnapshot {
     pub at: DateTime<Utc>,
-    /// An auto-exposure/AWB seed frame rather than a ramped one.
+    /// An auto-exposure seed frame rather than a ramped one.
     pub seed: bool,
     pub exposure_us: Option<i32>,
     pub analogue_gain: Option<f32>,
@@ -1415,7 +1409,6 @@ async fn observe_preview_frames(
             let observation = FrameObservation {
                 exposure_us: f64::from(exposure_us),
                 analogue_gain: f64::from(analogue_gain),
-                colour_gains: frame.colour_gains,
                 meter,
             };
             let current = ramp_snapshot(&ramp);
@@ -1465,21 +1458,19 @@ fn build_capture_request(
     let mut settings = config.settings.clone();
     match plan {
         None => {}
+        // Auto exposure for the first frame; white balance is the
+        // dashboard's, untouched.
         Some(RampPlan::Seed) => {
             settings.shutter_us = 0;
             settings.gain = 0.0;
-            settings.awb = "auto".to_owned();
-            settings.colour_gains = None;
         }
+        // Exposure only: white balance stays whatever the dashboard's
+        // control says, like a manual capture (design doc §6).
         Some(RampPlan::Manual {
-            shutter_us,
-            gain,
-            colour_gains,
-            ..
+            shutter_us, gain, ..
         }) => {
             settings.shutter_us = *shutter_us;
             settings.gain = *gain;
-            settings.colour_gains = Some(*colour_gains);
         }
     }
     CaptureRequest {
@@ -1583,7 +1574,6 @@ async fn fire_capture(
             let observation = FrameObservation {
                 exposure_us: f64::from(exposure_us),
                 analogue_gain: f64::from(analogue_gain),
-                colour_gains: exposure.colour_gains,
                 meter,
             };
             if let Some(next) = exposure_ramp::observe(
@@ -2258,12 +2248,14 @@ mod actor_tests {
     }
 
     #[test]
-    fn ramp_plans_override_only_exposure_and_white_balance() {
+    fn ramp_plans_override_exposure_only_and_never_white_balance() {
+        // White balance belongs to the dashboard's own control, for
+        // scheduled captures too (user decision, 2026-09-22).
         let config = committed_config();
         let seed = build_capture_request(&config, &[], Some(&RampPlan::Seed));
         assert_eq!((seed.settings.shutter_us, seed.settings.gain), (0, 0.0));
-        assert_eq!(seed.settings.awb, "auto");
-        assert_eq!(seed.settings.colour_gains, None);
+        assert_eq!(seed.settings.awb, config.settings.awb);
+        assert_eq!(seed.settings.colour_gains, config.settings.colour_gains);
 
         let manual = build_capture_request(
             &config,
@@ -2271,13 +2263,13 @@ mod actor_tests {
             Some(&RampPlan::Manual {
                 shutter_us: 2_000_000,
                 gain: 3.5,
-                colour_gains: [2.1, 1.7],
                 log2_exposure: 22.7,
             }),
         );
         assert_eq!(manual.settings.shutter_us, 2_000_000);
         assert_eq!(manual.settings.gain, 3.5);
-        assert_eq!(manual.settings.colour_gains, Some([2.1, 1.7]));
+        assert_eq!(manual.settings.awb, config.settings.awb);
+        assert_eq!(manual.settings.colour_gains, config.settings.colour_gains);
         assert_eq!(manual.settings.rotation, 180);
         assert!(manual.save_dng);
         manual.validate().unwrap();
@@ -2294,7 +2286,6 @@ mod actor_tests {
             updated_at: now,
             scene_ev: -12.0,
             planned_log2_exposure: Some(10.0),
-            colour_gains: [2.0, 1.6],
         })));
         // Dashboard mode drops the state, so switching back to AutoRamp
         // starts from a fresh measurement.
@@ -2359,14 +2350,10 @@ mod actor_tests {
             updated_at: now - Duration::minutes(1),
             scene_ev: -26.0,
             planned_log2_exposure: Some(21.0),
-            colour_gains: [2.6, 1.8],
         };
         let live = live_exposure_plan(&schedule, Some(&state), now).unwrap();
         let RampPlan::Manual {
-            shutter_us,
-            gain,
-            colour_gains,
-            ..
+            shutter_us, gain, ..
         } = exposure_ramp::plan(
             Some(&state),
             now,
@@ -2380,7 +2367,6 @@ mod actor_tests {
         assert!(!live.seeding);
         assert_eq!(live.shutter_us, Some(shutter_us));
         assert_eq!(live.gain, Some(gain));
-        assert_eq!(live.colour_gains, Some(colour_gains));
         assert_eq!(live.ramp_updated_at, Some(state.updated_at));
     }
 

@@ -18,7 +18,6 @@
     night_drop_ev: 2,
     max_step_ev: 1 / 3,
     smoothing: 0.5,
-    wb_max_step_pct: 0,
   };
   // The Night look slider runs Dark (0) to Bright (NIGHT_LOOK_MAX); the
   // ramp's `night_drop_ev` is its mirror image.
@@ -44,7 +43,7 @@
   function previewEquivalent(plan, previewFps) {
     if (!plan) return null;
     if (plan.seeding) {
-      return { shutter_us: 0, gain: 0, colour_gains: null, shortfall_ev: 0 };
+      return { shutter_us: 0, gain: 0, shortfall_ev: 0 };
     }
     const frameUs = Math.floor((1e6 / previewFps) * PREVIEW_FRAME_FRACTION);
     const shutter = Math.max(100, Math.min(plan.shutter_us, frameUs));
@@ -53,7 +52,6 @@
     return {
       shutter_us: shutter,
       gain,
-      colour_gains: plan.colour_gains ?? null,
       // How much darker the preview is than the real frame when even 16×
       // gain can't make up for the shorter shutter.
       shortfall_ev: neededGain > MAX_PREVIEW_GAIN ? Math.log2(neededGain / MAX_PREVIEW_GAIN) : 0,
@@ -71,34 +69,29 @@
     return `${rounded > 0 ? "+" : rounded < 0 ? "−" : ""}${Math.abs(rounded).toFixed(1)} EV`;
   }
 
-  function formatGains(gains) {
-    return `R ${gains[0].toFixed(2)} / B ${gains[1].toFixed(2)}`;
-  }
-
   // Display strings for the locked fields; also used to detect changes.
   // A ramped plan shows its planned values. While seeding, the next frame
   // uses the camera's auto exposure, and so does the preview, so the fields
   // show what auto exposure is choosing right now: `preview` is the latest
   // preview frame's metadata ({ exposureUs, analogueGain, colourGains },
   // app.js `frameMetadata`), or null when no preview is running.
+  // White balance is not part of the ramp: scheduled captures use the
+  // dashboard's own White balance control, which stays editable, so nothing
+  // about it is shown here (user decision, 2026-09-22).
   function describePlan(plan, preview = null) {
     if (!plan) return null;
     if (plan.seeding) {
       const exposureUs = preview?.exposureUs > 0 ? preview.exposureUs : null;
       const gain = preview?.analogueGain > 0 ? preview.analogueGain : null;
-      const gains = preview?.colourGains ?? null;
       return {
         shutter: exposureUs ? formatShutter(exposureUs) : "Auto",
         // One decimal: auto exposure jitters, and the field shouldn't flicker.
         gain: gain ? `${gain.toFixed(1)}×` : "Auto",
-        whiteBalance: gains ? `AWB · ${formatGains(gains)}` : "AWB",
       };
     }
-    const gains = plan.colour_gains;
     return {
       shutter: formatShutter(plan.shutter_us),
       gain: `${plan.gain.toFixed(2)}×`,
-      whiteBalance: gains ? `Eased · ${formatGains(gains)}` : "Eased",
     };
   }
 
@@ -134,14 +127,11 @@
     dayBias: $("#ramp-day-bias"),
     maxStep: $("#ramp-max-step"),
     smoothing: $("#ramp-smoothing"),
-    wbStep: $("#ramp-wb-step"),
     minShutter: $("#ramp-min-shutter"),
     shutterLive: $("#shutter-ramp-value"),
     gainLive: $("#gain-ramp-value"),
-    awbLive: $("#awb-ramp-value"),
     shutter: $("#shutter"),
     gain: $("#gain"),
-    awb: $("#awb"),
   };
 
   // Each input writes only its own field, so display rounding never leaks
@@ -153,7 +143,6 @@
     [ui.dayBias, "day_bias_ev", (v) => Math.round(v * 3) / 3, (v) => Math.round(v * 3) / 3],
     [ui.maxStep, "max_step_ev", (v) => Math.round(v * 100) / 100, (v) => v],
     [ui.smoothing, "smoothing", (v) => v, (v) => v],
-    [ui.wbStep, "wb_max_step_pct", (v) => v, (v) => v],
     [ui.minShutter, "min_shutter_us", (us) => us / 1000, (ms) => Math.round(ms * 1000)],
   ];
 
@@ -202,7 +191,6 @@
     for (const [input, live] of [
       [ui.shutter, ui.shutterLive],
       [ui.gain, ui.gainLive],
-      [ui.awb, ui.awbLive],
     ]) {
       input.disabled = locked;
       input.hidden = locked;
@@ -227,15 +215,10 @@
       lastShown = null;
       return;
     }
-    const shown = describePlan(plan, previewMetadata) ?? {
-      shutter: "…",
-      gain: "…",
-      whiteBalance: "…",
-    };
+    const shown = describePlan(plan, previewMetadata) ?? { shutter: "…", gain: "…" };
     for (const [key, element] of [
       ["shutter", ui.shutterLive],
       ["gain", ui.gainLive],
-      ["whiteBalance", ui.awbLive],
     ]) {
       if (element.textContent !== shown[key]) {
         element.textContent = shown[key];
@@ -335,9 +318,7 @@
   function onStatus(status) {
     plan = autoRamp() ? (status.exposure_plan ?? null) : null;
     renderPlan();
-    const key = plan
-      ? JSON.stringify([plan.seeding, plan.shutter_us, plan.gain, plan.colour_gains])
-      : "null";
+    const key = plan ? JSON.stringify([plan.seeding, plan.shutter_us, plan.gain]) : "null";
     if (key !== lastPlanKey) {
       lastPlanKey = key;
       notifyChange();
