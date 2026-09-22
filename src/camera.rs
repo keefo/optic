@@ -355,11 +355,44 @@ pub struct StreamRequest {
     /// don't need to send it.
     #[serde(default)]
     pub downsample: bool,
+    /// Preview-only exposure from the dashboard's *Scheduled exposure*
+    /// toggle (`docs/optic-daemon-exposure-ramping.md` §10). It changes what
+    /// the live preview shows, never `settings`, which is what
+    /// `reconfigure_stream` stages, so it's never saved.
+    #[serde(default)]
+    pub exposure_override: Option<ExposureOverride>,
+}
+
+/// A brightness-equivalent stand-in for the next scheduled frame's
+/// exposure. `shutter_us`/`gain` `0` with no `colour_gains` means auto
+/// exposure and AWB, which is what a ramp seed frame uses.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposureOverride {
+    pub shutter_us: u64,
+    pub gain: f32,
+    #[serde(default)]
+    pub colour_gains: Option<[f32; 2]>,
 }
 
 impl StreamRequest {
     pub(crate) fn validate(&self) -> Result<(), CameraError> {
-        self.settings.validate()
+        self.effective_settings().validate()
+    }
+
+    /// The settings the camera actually runs the preview with: `settings`,
+    /// with `exposure_override` applied when present.
+    pub(crate) fn effective_settings(&self) -> CameraSettings {
+        let mut settings = self.settings.clone();
+        if let Some(exposure) = self.exposure_override {
+            settings.shutter_us = exposure.shutter_us;
+            settings.gain = exposure.gain;
+            settings.colour_gains = exposure.colour_gains;
+            if exposure.colour_gains.is_none() {
+                settings.awb = "auto".to_owned();
+            }
+        }
+        settings
     }
 }
 
@@ -547,6 +580,49 @@ mod tests {
             ..CameraSettings::default()
         };
         assert!(invalid_awb.validate().is_err());
+    }
+
+    #[test]
+    fn stream_request_exposure_override_is_optional_and_preview_only() {
+        let plain: StreamRequest =
+            serde_json::from_str(r#"{"settings": {"gain": 2.0}, "profile": "dci_4k"}"#).unwrap();
+        assert_eq!(plain.exposure_override, None);
+        assert_eq!(plain.effective_settings().gain, 2.0);
+
+        let ramped: StreamRequest = serde_json::from_str(
+            r#"{"settings": {"gain": 2.0, "shutter_us": 1000, "awb": "daylight"},
+                "profile": "dci_4k",
+                "exposure_override": {"shutter_us": 110000, "gain": 12.5,
+                                      "colour_gains": [2.1, 1.7]}}"#,
+        )
+        .unwrap();
+        let effective = ramped.effective_settings();
+        assert_eq!((effective.shutter_us, effective.gain), (110_000, 12.5));
+        assert_eq!(effective.colour_gains, Some([2.1, 1.7]));
+        // The staged settings keep the manual values.
+        assert_eq!(
+            (ramped.settings.shutter_us, ramped.settings.gain),
+            (1000, 2.0)
+        );
+        ramped.validate().unwrap();
+
+        // Seeding: auto exposure and AWB.
+        let seed: StreamRequest = serde_json::from_str(
+            r#"{"settings": {"awb": "daylight"}, "profile": "dci_4k",
+                "exposure_override": {"shutter_us": 0, "gain": 0.0}}"#,
+        )
+        .unwrap();
+        let effective = seed.effective_settings();
+        assert_eq!((effective.shutter_us, effective.gain), (0, 0.0));
+        assert_eq!(effective.awb, "auto");
+        assert_eq!(effective.colour_gains, None);
+
+        let invalid: StreamRequest = serde_json::from_str(
+            r#"{"settings": {}, "profile": "dci_4k",
+                "exposure_override": {"shutter_us": 1000, "gain": 40.0}}"#,
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

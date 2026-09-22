@@ -499,8 +499,35 @@ footer { padding: 0 0 36px; color: var(--muted); font-size: 0.78rem; text-align:
 
 /* Scheduler page: Scheduled exposure card (docs/optic-daemon-exposure-ramping.md). */
 .exposure-card { grid-column: 2; grid-row: 2 / span 2; align-self: start; }
-.exposure-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin: 12px 0; }
-.exposure-grid > .exposure-mode { grid-column: 1 / -1; }
-.exposure-grid > label { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 0.82rem; }
 @media (max-width: 820px) { .exposure-card { grid-column: auto; grid-row: auto; } }
-@media (max-width: 520px) { .exposure-grid { grid-template-columns: 1fr; } }
+
+/* Dashboard: Scheduled exposure toggle (scheduled-exposure.js,
+   docs/optic-daemon-exposure-ramping.md §10). The block sits inside
+   .control-grid, which shifts the nth-last-child span rule above, so Gain
+   keeps its full-width row explicitly. */
+#camera-control-grid > label:has(> #gain), .scheduled-exposure { grid-column: 1 / -1; }
+.scheduled-exposure { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; }
+.scheduled-exposure .check small { display: block; color: var(--muted); font-size: 0.78rem; }
+#scheduled-exposure-panel { display: grid; gap: 12px; }
+#scheduled-exposure-panel[hidden] { display: none; }
+.ramp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 15px; }
+.ramp-grid > label { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 0.82rem; }
+.ramp-grid > label:first-child { grid-column: 1 / -1; }
+.ramp-scale { display: flex; justify-content: space-between; font-size: 0.72rem; }
+.ramp-advanced summary { cursor: pointer; color: var(--muted); font-size: 0.82rem; }
+.ramp-advanced[open] summary { margin-bottom: 10px; }
+.ramp-caption, .ramp-note { margin: 0; color: var(--muted); font-size: 0.8rem; }
+.ramp-caption { color: var(--orange); }
+.ramp-caption[data-kind="error"] { color: var(--red); }
+/* Ramp-driven values replace the locked inputs: amber, dashed, and a short
+   glow whenever the value changes. */
+.ramp-value { padding: 8px 10px; border: 1px dashed rgba(255, 174, 87, 0.55); border-radius: 9px; color: var(--orange); background: rgba(255, 174, 87, 0.07); font-variant-numeric: tabular-nums; }
+.ramp-value[hidden] { display: none; }
+.control-grid.ramp-on #shutter-value, .control-grid.ramp-on #gain-value { display: none; }
+.ramp-pulse { animation: ramp-pulse 1.4s ease-out; }
+@keyframes ramp-pulse {
+  from { background: rgba(255, 174, 87, 0.32); box-shadow: 0 0 0 3px rgba(255, 174, 87, 0.25); }
+  to { background: rgba(255, 174, 87, 0.07); box-shadow: 0 0 0 0 rgba(255, 174, 87, 0); }
+}
+@media (prefers-reduced-motion: reduce) { .ramp-pulse { animation: none; } }
+@media (max-width: 520px) { .ramp-grid { grid-template-columns: 1fr; } }

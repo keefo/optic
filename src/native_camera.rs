@@ -312,7 +312,7 @@ mod imp {
                     start_pipeline(
                         camera,
                         request.profile,
-                        request.settings,
+                        request.effective_settings(),
                         request.control_revision,
                         true,
                         false,
@@ -333,12 +333,12 @@ mod imp {
                             active.profile,
                             &active.settings,
                             request.profile,
-                            &request.settings,
+                            &request.effective_settings(),
                         )
                 });
                 let result = if is_streaming && controls_only {
                     let active = pipeline.as_mut().expect("streaming pipeline disappeared");
-                    active.settings = request.settings;
+                    active.settings = request.effective_settings();
                     active.control_revision = request.control_revision;
                     Ok(())
                 } else if is_streaming {
@@ -346,7 +346,7 @@ mod imp {
                         start_pipeline(
                             camera,
                             request.profile,
-                            request.settings,
+                            request.effective_settings(),
                             request.control_revision,
                             true,
                             false,

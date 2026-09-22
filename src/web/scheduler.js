@@ -27,11 +27,10 @@
 //   representation (`SolarEvent`/`LunarEvent`/`MilkyWayEvent` have no
 //   `#[serde(tag=...)]`, unlike `CelestialTarget`/`Trigger` which do).
 //   `direction` is one of "Rising"|"Setting"|"Both".
-// - `exposure` (ScheduleConfig.exposure, one global mode for every scheduled
-//   capture) is INTERNALLY tagged: {mode:"Dashboard"} or {mode:"AutoRamp",
-//   min_shutter_us, max_shutter_us, max_gain, day_bias_ev, night_drop_ev,
-//   max_step_ev, smoothing, wb_max_step_pct} — see
-//   docs/optic-daemon-exposure-ramping.md §4.
+// - `exposure` (ScheduleConfig.exposure) is edited on the Dashboard (the
+//   Scheduled exposure toggle, scheduled-exposure.js); this page only shows
+//   it and never sends it, so staging rules can't overwrite it —
+//   docs/optic-daemon-exposure-ramping.md §10.
 
 // One entry per named event per body: [wire value, label]. `degrees` marks
 // events needing the elevation/azimuth-degrees input; `direction` marks
@@ -148,44 +147,11 @@ const elements = {
   forecastAdvisories: document.querySelector("#forecast-advisories"),
   forecastBody: document.querySelector("#forecast-body"),
   exposureMode: document.querySelector("#exposure-mode"),
-  rampFields: document.querySelector("#ramp-fields"),
-  rampHelp: document.querySelector("#ramp-help"),
   rampStatus: document.querySelector("#ramp-status"),
 };
 
-// Mirrors `RampSettings::default()` in src/exposure_ramp.rs.
-const RAMP_DEFAULTS = {
-  min_shutter_us: 100,
-  max_shutter_us: 5000000,
-  max_gain: 8,
-  day_bias_ev: 0,
-  night_drop_ev: 2,
-  max_step_ev: 1 / 3,
-  smoothing: 0.5,
-  wb_max_step_pct: 3,
-};
-
-// [input id, wire field, wire -> input value, input value -> wire]. Shutter
-// limits are edited in ms/s but stored in microseconds.
-const RAMP_INPUTS = [
-  ["#ramp-min-shutter", "min_shutter_us", (us) => us / 1000, (ms) => Math.round(ms * 1000)],
-  ["#ramp-max-shutter", "max_shutter_us", (us) => us / 1e6, (s) => Math.round(s * 1e6)],
-  ["#ramp-max-gain", "max_gain", (v) => v, (v) => v],
-  ["#ramp-day-bias", "day_bias_ev", (v) => v, (v) => v],
-  ["#ramp-night-drop", "night_drop_ev", (v) => v, (v) => v],
-  ["#ramp-max-step", "max_step_ev", (v) => Math.round(v * 100) / 100, (v) => v],
-  ["#ramp-smoothing", "smoothing", (v) => v, (v) => v],
-  ["#ramp-wb-step", "wb_max_step_pct", (v) => v, (v) => v],
-].map(([selector, field, toInput, toWire]) => ({
-  input: document.querySelector(selector),
-  field,
-  toInput,
-  toWire,
-}));
-
 let rules = [];
 let station = null;
-let exposure = { mode: "Dashboard" };
 let editingRuleId = null;
 // Whether the staged config differs from a fresh load/save/discard — drives
 // Save rules' disabled state and Discard changes' visibility, so those
@@ -248,8 +214,7 @@ async function loadInitial() {
     const status = await response.json();
     rules = status.config.schedule.rules || [];
     station = status.config.schedule.station || null;
-    exposure = status.config.schedule.exposure || { mode: "Dashboard" };
-    renderExposure();
+    renderExposureMode(status.config.schedule.exposure);
     // `config` reflects a staged-but-uncommitted preview when one exists
     // (see current_app_config on the backend), so a reload mid-edit must
     // not assume "clean" just because it succeeded — otherwise Save rules
@@ -693,7 +658,7 @@ async function stageAndRefreshForecast() {
     await api("/api/schedule/preview", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ station, rules, exposure }),
+      body: JSON.stringify({ station, rules }),
     });
     await refreshForecast();
   } catch (error) {
@@ -847,52 +812,12 @@ elements.runToggleBtn.addEventListener("click", async () => {
   }
 });
 
-// --- Scheduled exposure (global, not per rule) ---
+// --- Scheduled exposure (read-only here; edited on the Dashboard) ---
 
-function renderExposure() {
-  const autoRamp = exposure.mode === "AutoRamp";
-  elements.exposureMode.value = autoRamp ? "AutoRamp" : "Dashboard";
-  elements.rampFields.hidden = !autoRamp;
-  elements.rampHelp.hidden = !autoRamp;
-  const settings = { ...RAMP_DEFAULTS, ...(autoRamp ? exposure : {}) };
-  for (const { input, field, toInput } of RAMP_INPUTS) {
-    // In Dashboard mode keep whatever the fields hold, so switching to
-    // Dashboard and back doesn't throw away edited limits.
-    if (autoRamp || input.value === "") {
-      input.value = String(toInput(settings[field]));
-    }
-  }
-}
-
-// Returns the wire object, or null (with a notice) if a field isn't a number.
-// Range checks stay on the backend (`RampSettings::validate`, 422).
-function readExposureForm() {
-  if (elements.exposureMode.value !== "AutoRamp") {
-    return { mode: "Dashboard" };
-  }
-  const next = { mode: "AutoRamp" };
-  for (const { input, field, toWire } of RAMP_INPUTS) {
-    const value = Number.parseFloat(input.value);
-    if (!Number.isFinite(value)) {
-      showNotice(
-        `Scheduled exposure: "${input.previousElementSibling.textContent}" must be a number.`,
-        "error",
-      );
-      return null;
-    }
-    next[field] = toWire(value);
-  }
-  return next;
-}
-
-function onExposureChange() {
-  const next = readExposureForm();
-  if (!next) {
-    return;
-  }
-  exposure = next;
-  renderExposure();
-  void stageAndRefreshForecast();
+function renderExposureMode(exposure) {
+  const autoRamp = exposure?.mode === "AutoRamp";
+  elements.exposureMode.textContent = autoRamp ? "Auto-ramp" : "Dashboard settings";
+  elements.exposureMode.className = `pill ${autoRamp ? "good" : "neutral"}`;
 }
 
 function formatShutter(us) {
@@ -926,11 +851,6 @@ function renderRampStatus(snapshot) {
   }
   parts.push(`max ${formatShutter(snapshot.max_shutter_us)}`);
   elements.rampStatus.textContent = parts.join(" · ");
-}
-
-elements.exposureMode.addEventListener("change", onExposureChange);
-for (const { input } of RAMP_INPUTS) {
-  input.addEventListener("change", onExposureChange);
 }
 
 updateTriggerFieldVisibility();

@@ -1,7 +1,10 @@
 # Dated Worklog: 2026-09-21 - Exposure Ramping for Scheduled Captures
 
-Status: **implemented and tested (Mac host + Linux/aarch64 compile and
-camera-free tests on the Pi); not deployed, not hardware-validated.** The test plan was written before any `src/` edit.
+Status: **Part 1 (ramp engine): deployed 2026-09-22 and partly
+hardware-validated** (4 frames: seed, shutter-first jump, 1/3 EV steps,
+manual WB; night convergence not observed). **Part 2 (dashboard UX
+redesign): implemented and tested on the Mac (unit, node and browser
+checks); not deployed, not hardware-verified.** Awaiting user acceptance. The test plan was written before any `src/` edit.
 
 Design: `docs/optic-daemon-exposure-ramping.md`.
 
@@ -250,6 +253,55 @@ no `notifications` field, so a deploy plus a test commit would have dropped
 that config. The rebased branch includes it. The deploy was put on hold
 until the user confirms.
 
+### Deploy and hardware test (2026-09-22, user-approved)
+
+- The user discarded the pending staged dashboard edit first. Then
+  `./scripts/build-deploy-optic-daemon.sh` (rebased branch = main + ramp)
+  ran and exited 0: fmt, 232 tests on the Pi (service stopped), clippy
+  `-D warnings`, release build, install with rollback. The service is active.
+  `notifications` config was kept and applied; the exposure mode defaulted to
+  Dashboard.
+- The test committed `{"mode":"AutoRamp"}` (defaults; station, rules and
+  notifications resent unchanged) and resumed the existing `every1min` rule
+  (60 s, so the budget capped the shutter at 4,227,272 µs). Night, sun ≈ −40°,
+  target −2 EV (0.045).
+
+| Frame (UTC) | Kind | Shutter (metadata) | Gain | ColourGains R/B | Luminance |
+|---|---|---|---|---|---|
+| 08:30:02 | seed (AE/AWB) | 66,654 µs | 15.52 | 2.648 / 1.827 | 0.0096 |
+| 08:31:32 | ramped | 4,226,589 µs | 1.145 | 2.634 / 1.823 | 0.089 |
+| 08:32:46 | ramped | 3,843,022 µs | 1.000 | 2.662 / 1.827 | 0.066 |
+| 08:33:36 | ramped | 3,050,132 µs | 1.000 | 2.684 / 1.828 | 0.0156 |
+
+Observed on hardware:
+- A manual 4.2 s shutter is honoured; the previous tested maximum was 1 s.
+- `AwbEnable(false)` + `ColourGains` holds on the output frame. The easing
+  moved at most 1.05% per frame.
+- The first ramped frame after the seed jumped straight to shutter-first
+  (the seed's AE used gain 15.5). Later steps were exactly −1/3 EV, with gain
+  taken out before the shutter was shortened.
+- Captures completed within the 48 s budget (the slowest took 45.5 s; the
+  11-frame warmup dominates).
+- The loop overshot by 1 EV after the seed jump (0.089 against 0.045): the
+  shadow tone curve is steeper than the γ 2.2 model. The loop was correcting
+  as designed.
+- Frame 4 metered 2.1 EV darker from a 1/3 EV cut. This is most likely a scene
+  change (a light going off at 01:33 local); unconfirmed, because the frames
+  had already synced off the Pi.
+- **Not observed:** night steady state and convergence. Someone (not this
+  session) paused the scheduler during frame 4. `schedule_run_state.json` was
+  written at 08:33:36, the second the capture finished, because commands wait
+  while a capture is in progress.
+- Finding: during long ramped captures, Pause/Resume replies wait for the
+  capture to finish (up to about 45 s at night). This comes from the existing
+  actor design, and is now visible.
+- Finding: the Scheduler card rounds `max_step_ev` for display, and
+  re-staging wrote 0.33 back (seen staged on the Pi). To be fixed in the
+  dashboard redesign.
+- Restored afterwards: exposure mode Dashboard committed (a staged-only
+  `max_step_ev` diff was superseded), the scheduler left Paused as the pauser
+  wanted, and rules, station, notifications and gain 11.8 unchanged.
+
 Not run on the Pi, on purpose: the full `cargo test`. `optic_camera.rs:290`
 and `optic_scheduler.rs:2138` spawn the real camera on Linux, and would contend
 with the running daemon.
@@ -289,3 +341,195 @@ approval).
    gain rises above 1; and that WB changes slowly.
 3. Build a timelapse from the frames and check for flicker, and that night
    is darker than day but not black.
+
+## Part 2: Dashboard UX Redesign (2026-09-22) — plan written before code
+
+### Request (user, 2026-09-22)
+
+The Scheduler-page card is "too professional", not intuitive, and can't be
+verified visually. Move scheduled exposure onto the dashboard's camera
+controls: a **Scheduled exposure** toggle below Shutter. When it's on, show
+the ramp settings, make the manual exposure fields read-only, and have them
+show the live values calculated from the ramp, with a subtle colour hint that
+they change over time. The user approved adding this to PR #16, then went
+AFK: "please use your best judgement going forward". Judgement calls are
+listed below. No new deploy or Pi use happens without the user.
+
+### Design (best judgement, recorded for the user's review)
+
+1. **Toggle = `ScheduleConfig.exposure.mode`.** It is staged through a new
+   `POST /api/schedule/exposure` (mirrors `/api/config/save-dng`) and
+   saved or discarded by the dashboard's existing Save Settings / Discard
+   Changes.
+2. **Live plan from the server.** `GET /api/status` gains `exposure_plan`,
+   computed on each poll from the staged-or-committed schedule, the
+   scheduler's in-memory ramp state, and the sun elevation *now*: the next
+   planned shutter, gain and colour gains (or `seeding: true`), target
+   bias, sun elevation, and shutter cap. It is `null` in Dashboard mode. The
+   ramp only learns from captured frames, so the values drift with the sun
+   target between frames and jump when a frame is observed.
+3. **Locked fields show the plan.** With the toggle on, the Shutter and Gain
+   inputs (and White balance) are disabled and show the planned values in an
+   amber "ramp" style. A short pulse plays whenever the values change. While
+   seeding, they read "Auto (seeding)". The user's manual values are kept
+   in the inputs' staged settings and come back when the toggle goes off.
+4. **Brightness-equivalent live preview.** The stream request gains an
+   optional, never-staged `exposure_override`. With the toggle on, the
+   preview uses the plan's total exposure with the shutter clamped to the
+   preview frame time and the rest moved into gain (max 16), plus the plan's
+   colour gains. The preview then shows the next frame's brightness and
+   colour at preview frame rate (noisier). A seeding plan previews with auto
+   exposure and AWB, which is what the seed frame will use.
+   `reconfigure_stream` stages only `settings`, so the override never
+   reaches the saved config. Manual "Capture & transfer" keeps using the
+   manual settings, unchanged.
+5. **Fewer knobs.** Night look (a slider from dark to bright, mapped to
+   `night_drop_ev` 4…0), Max shutter, and Max gain (noise limit). The other
+   five go in a collapsed "Advanced". Each input writes only its own field,
+   which fixes the Scheduler card's `max_step_ev` rounding write-back.
+6. **The Scheduler page card becomes read-only.** It shows the mode, the last
+   ramped frame, and "Configure on the Dashboard". `scheduler.js` stops
+   sending `exposure`, so it can't overwrite the dashboard's value.
+7. New UI code lives in `src/web/scheduled-exposure.js` (the focus-tools
+   pattern: pure functions tested with `node --test`). `app.js` only gets
+   small hooks: `streamRequest` and `refreshStatus`, plus excluding the new
+   inputs from the generic control listener.
+
+### Acceptance criteria (Part 2)
+
+A1. Toggling on the dashboard stages `{"mode":"AutoRamp",…}`, and Save
+    Settings commits it. Toggling off stages `Dashboard`.
+A2. With the toggle on, the Shutter, Gain and White balance inputs are
+    disabled and show `exposure_plan` values (or "Auto (seeding)"),
+    refreshed with every status poll, with a visible hint when a value
+    changes.
+A3. With the toggle on, the preview request carries a brightness-equivalent
+    `exposure_override`; the staged `settings` keep the manual values.
+    Toggling off removes the override and restores the manual fields.
+A4. `exposure_plan` is `null` in Dashboard mode; `seeding: true` with no
+    ramp state; otherwise it matches `exposure_ramp::plan` for now.
+A5. The three simple knobs plus Advanced stage only the field that was
+    edited (no rounding write-back).
+A6. The Scheduler page shows ramp status read-only and never sends
+    `exposure`.
+A7. All existing checks pass (fmt, test, clippy, Biome, node web tests), plus
+    new Rust and node tests.
+
+### Test plan (Part 2)
+
+- Rust: `live_exposure_plan` is None for Dashboard, seeding without state,
+  and equal to `plan()` with a state; `StreamRequest::effective_settings`
+  applies the override (seed → auto/AWB auto; manual → shutter/gain/gains)
+  and validates; `exposure_override` defaults to None, so old request JSON
+  still parses; `POST /api/schedule/exposure` validation (reuses
+  `RampSettings::validate`); the `web.rs` asset test checks the new element
+  IDs.
+- Node: `previewEquivalent` (a clamp to frame time moves exposure into gain;
+  capped at 16; seeding → auto), the night-look mapping in both directions,
+  shutter formatting.
+- Local daemon plus Chrome on the Mac (no camera): toggle staging, locked
+  fields, Advanced, Save/Discard, and the Scheduler page read-only card. The
+  preview override on real frames needs the Pi, so it is left for the user.
+
+### Implementation (Part 2)
+
+- `src/camera.rs`: `StreamRequest.exposure_override: Option<ExposureOverride>`
+  (`#[serde(default)]`, so older clients still parse); `effective_settings()`
+  (override applied; no colour gains → AWB auto); `validate()` checks the
+  effective settings.
+- `src/native_camera.rs`: preview start/reconfigure uses
+  `request.effective_settings()`. Still capture is unchanged.
+- `src/optic_scheduler.rs`: `SchedulerStatus.ramp_state` (`#[serde(skip)]`,
+  published after each capture); `LiveExposurePlan` and
+  `live_exposure_plan(schedule, ramp_state, now)`, which reuses
+  `exposure_ramp::plan`, the sun elevation now, and the interval budget
+  (6 h lookahead).
+- `src/web.rs` (outside the owned files): `StatusResponse.exposure_plan`;
+  `POST /api/schedule/exposure` (staging like `stage_save_dng`, 422 via
+  `RampSettings::validate`); a wiring test like focus-tools'.
+- `src/web/scheduled-exposure.js` (new): the toggle, the three simple
+  controls plus Advanced, the locked amber live values with a pulse, the
+  caption (target, sun, shutter cap, last learned, and preview shortfall),
+  and the preview override. The pure functions are exported for Node.
+- `src/web/index.html`, `src/web/app.js` (outside the task brief's owned
+  files; focus-tools, their owner, merged in #13): the toggle block below
+  Shutter and the live-value outputs; `app.js` adds 28 lines (the override in
+  `streamRequest`, `applyConfig`/`onStatus` hooks, a
+  `scheduled-exposure-change` listener, and the manual-control selector
+  excluding `data-ramp-input`).
+- `src/web/scheduler.{html,js}`: the card is read-only (mode pill, last
+  ramped frame, link to the Dashboard); `exposure` is no longer sent.
+- `src/web/styles.css`: the unused card grid rules were removed and a
+  dashboard block appended. Gain is pinned full-width, because the new block
+  shifts the existing `nth-last-child(-n+3)` span rule.
+  `prefers-reduced-motion` disables the pulse.
+- `biome.json`: added `src/web/scheduled-exposure.js` (outside the owned
+  files). `tests/web/scheduled-exposure.test.js` (new).
+- Docs: `docs/optic-daemon-exposure-ramping.md` §4/§7/§10;
+  `docs/optic-daemon.md` API list (`exposure_plan`,
+  `/api/schedule/exposure`, `exposure_override`).
+
+### Validation (Part 2, Mac)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo test` | 238 passed (+4: override parsing/effective settings, live plan ×2, dashboard wiring) |
+| `cargo clippy --all-targets -- -D warnings` | pass |
+| Biome 2.5.14 `ci` (13 files) | pass (`biome format` applied to the touched web files) |
+| `node --test tests/web/*.test.js` | 22 passed (9 new) |
+
+Local daemon (no camera, Vancouver station, 60 s rule) in Chrome:
+- `POST /api/schedule/exposure` with `night_drop_ev: 9` → 422 `night
+  darkening must be between 0 and 6 EV`.
+- Toggle on → staged `AutoRamp`, Save enabled; `exposure_plan` = seeding,
+  sun −39.4°, target −2.0 EV, cap 4,227,272 µs (A1, A4). Shutter, Gain and
+  White balance hidden/disabled, showing "Auto (seeding)" in amber
+  (A2). `settings()` still returns the manual values; the stream override is
+  `{0, 0, null}` (auto, like the seed) (A3).
+- Simulated plan 3.84 s → 3.05 s: the live fields read "3.8 s" / "1.00×" /
+  "Eased · R 2.63 / B 1.82" and then "3.1 s" with the pulse class; the
+  override is 118,750 µs × 16 (8 FPS, caption "preview ≈ 1.0 EV darker"),
+  and 475,000 µs × 8.09 for the 2 FPS Master Archive preview; two change
+  events.
+- Night look → Bright staged only `night_drop_ev: 2 → 0` (A5; the rounding
+  write-back is fixed).
+- Discard reverts the toggle and fields to the committed mode and leaves
+  nothing staged; Save commits `AutoRamp` (A1).
+- Scheduler page: an "Auto-ramp" pill and a link to `/`, with no editable
+  inputs; staging rules leaves `exposure` unchanged (A6).
+- Side observation (not from this change): in one run, `config_staged`
+  read `true` right after Discard. This matches the existing behaviour of
+  `start_stream`/`reconfigure_stream` staging the current camera `settings`
+  whenever the preview (re)starts. A later reproduction staged nothing.
+
+Not verified (needs the Pi and user approval, so not done while the user
+is away): the preview override on real frames, and whether the preview's
+brightness matches the scheduled frames.
+
+### Limitations / next steps (Part 2)
+
+- At night the preview can't fully match the frame: an 8 FPS preview tops
+  out at about 119 ms × 16 gain, so the caption shows the shortfall
+  (≈ 1 EV for a 4 s frame). Master Archive's 2 FPS preview gets 8× more
+  headroom.
+- The live plan only changes when a scheduled frame is observed, or when the
+  sun target drifts. It doesn't learn from the preview.
+- Starting a preview with the toggle on uses the override, so another tab
+  viewing the preview sees the ramp exposure too. This is intended, since the
+  preview is shared.
+- Deploying Part 2 and checking it on the camera is left for the user
+  (steps below).
+
+### User verification (Part 2)
+
+1. Approve a deploy (`./scripts/build-deploy-optic-daemon.sh`), or merge
+   PR #16 and deploy `main`.
+2. On the dashboard, turn on **Scheduled exposure**. Shutter, Gain and White
+   balance turn amber and read "Auto (seeding)". The preview switches to auto
+   exposure. Press **Save Settings**.
+3. Resume the scheduler for a few frames. The amber values should change to
+   the ramp's shutter, gain and WB and pulse, and the preview's brightness
+   should follow them (see the caption for any preview shortfall).
+4. Move **Night look** and watch the target in the caption. Turn the toggle
+   off and check that your manual values come back.

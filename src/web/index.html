@@ -8,6 +8,7 @@
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
   <script src="/focus-tools.js" defer></script>
+  <script src="/scheduled-exposure.js" defer></script>
   <script src="/app.js" defer></script>
   <script src="/footer.js" defer></script>
 </head>
@@ -170,9 +171,10 @@
 
         <p class="controls-help">Changes apply automatically while preview is live. The image may pause briefly while the camera pipeline reloads.</p>
 
-        <div class="control-grid">
+        <div id="camera-control-grid" class="control-grid">
           <label>
             <span>White balance</span>
+            <output id="awb-ramp-value" class="ramp-value" hidden></output>
             <select id="awb">
               <option value="auto" selected>Auto</option>
               <option value="daylight">Daylight</option>
@@ -206,12 +208,65 @@
           <label>
             <span>Analogue gain <output id="gain-value">1.0</output></span>
             <input id="gain" type="range" min="1" max="16" step="0.1" value="1">
+            <output id="gain-ramp-value" class="ramp-value" hidden></output>
           </label>
 
           <label>
             <span>Shutter (µs) <output id="shutter-value">10000</output></span>
             <input id="shutter" type="number" min="100" max="5000000" step="100" value="10000" inputmode="numeric">
+            <output id="shutter-ramp-value" class="ramp-value" hidden></output>
           </label>
+
+          <div class="scheduled-exposure">
+            <label class="check">
+              <input id="scheduled-exposure" type="checkbox" data-ramp-input>
+              <span>Scheduled exposure <small>Ramp scheduled captures from day to night</small></span>
+            </label>
+            <div id="scheduled-exposure-panel" hidden>
+              <p id="scheduled-exposure-caption" class="ramp-caption" role="status"></p>
+              <div class="ramp-grid">
+                <label>
+                  <span>Night look <output id="ramp-night-look-value">−2.0 EV at night</output></span>
+                  <input id="ramp-night-look" type="range" min="0" max="4" step="0.5" value="2" data-ramp-input>
+                  <small class="ramp-scale"><span>Dark</span><span>Bright</span></small>
+                </label>
+                <label>
+                  <span>Max gain (noise limit) <output id="ramp-max-gain-value">8.0×</output></span>
+                  <input id="ramp-max-gain" type="range" min="1" max="16" step="0.5" value="8" data-ramp-input>
+                </label>
+                <label>
+                  <span>Max shutter (s)</span>
+                  <input id="ramp-max-shutter" type="number" min="0.001" max="5" step="0.1" value="5" data-ramp-input>
+                </label>
+              </div>
+              <details class="ramp-advanced">
+                <summary>Advanced</summary>
+                <div class="ramp-grid">
+                  <label>
+                    <span>Day brightness (EV)</span>
+                    <input id="ramp-day-bias" type="number" min="-3" max="3" step="0.1" value="0" data-ramp-input>
+                  </label>
+                  <label>
+                    <span>Max step per frame (EV)</span>
+                    <input id="ramp-max-step" type="number" min="0.05" max="2" step="0.05" value="0.33" data-ramp-input>
+                  </label>
+                  <label>
+                    <span>Smoothing (0–0.95)</span>
+                    <input id="ramp-smoothing" type="number" min="0" max="0.95" step="0.05" value="0.5" data-ramp-input>
+                  </label>
+                  <label>
+                    <span>White-balance step (%)</span>
+                    <input id="ramp-wb-step" type="number" min="0" max="20" step="0.5" value="3" data-ramp-input>
+                  </label>
+                  <label>
+                    <span>Min shutter (ms)</span>
+                    <input id="ramp-min-shutter" type="number" min="0.1" max="5000" step="0.1" value="0.1" data-ramp-input>
+                  </label>
+                </div>
+              </details>
+              <p class="ramp-note">The live preview shows the next scheduled frame's brightness and colour. Capture &amp; transfer still uses your manual settings.</p>
+            </div>
+          </div>
 
           <fieldset>
             <legend>Transform</legend>

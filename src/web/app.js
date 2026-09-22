@@ -140,8 +140,22 @@ function selectedProfile() {
   return document.querySelector('input[name="capture-profile"]:checked').value;
 }
 
+function previewFps(profileName) {
+  // Master Archive's downsampled preview runs at 8 FPS, not its table's 2.
+  return profileName === "master_archive" && elements.downsamplePreview.checked
+    ? 8
+    : profiles[profileName].previewFps;
+}
+
 function streamRequest(profileName = selectedProfile()) {
-  return { settings: settings(), profile: profileName, control_revision: controlRevision };
+  return {
+    settings: settings(),
+    profile: profileName,
+    control_revision: controlRevision,
+    // Preview-only: never staged (docs/optic-daemon-exposure-ramping.md §10).
+    exposure_override:
+      window.OpticScheduledExposure?.previewOverride(previewFps(profileName)) ?? null,
+  };
 }
 
 function optionLabel(controlId, value) {
@@ -895,8 +909,10 @@ async function refreshStatus() {
     renderSchedulerSummary(status.schedule, status.config.schedule.rules);
     if (!cameraFieldsInitialized) {
       applyServerConfig(status.config);
+      window.OpticScheduledExposure?.applyConfig(status.config);
       cameraFieldsInitialized = true;
     }
+    window.OpticScheduledExposure?.onStatus(status);
     elements.saveConfig.disabled = !status.config_staged;
     elements.discardConfig.hidden = !status.config_staged;
     applyPreviewState(status.preview);
@@ -1007,7 +1023,10 @@ elements.reset.addEventListener("click", () => {
     showNotice("Camera controls reset to automatic defaults.");
   }
 });
-document.querySelectorAll(".control-grid input, .control-grid select").forEach((control) => {
+// The Scheduled exposure inputs (data-ramp-input) stage themselves.
+const MANUAL_CONTROLS =
+  ".control-grid input:not([data-ramp-input]), .control-grid select:not([data-ramp-input])";
+document.querySelectorAll(MANUAL_CONTROLS).forEach((control) => {
   control.addEventListener("input", () => {
     controlRevision += 1;
     beginControlMeasurement(control);
@@ -1027,6 +1046,13 @@ document.querySelectorAll('input[name="capture-profile"]').forEach((control) => 
   });
 });
 elements.saveDng.addEventListener("change", stageSaveDng);
+// Scheduled exposure toggled/edited, or its live plan moved: re-apply the
+// preview's exposure override and pick up the staged state (Save button).
+document.addEventListener("scheduled-exposure-change", () => {
+  controlRevision += 1;
+  schedulePreviewUpdate();
+  void refreshStatus();
+});
 elements.preview.addEventListener("error", () => {
   if (livePreview) {
     showNotice("Waiting for camera frames…");

@@ -55,10 +55,12 @@ field without changing the ramp.
 
 ## 4. Configuration
 
-A new field on `ScheduleConfig` (`AppConfig.schedule.exposure`), staged and
-committed with the rules through the existing preview/commit/discard flow
-(`POST /api/schedule/preview`, then `POST /api/config/commit`). A config
-written before this field existed deserializes as `Dashboard`.
+A new field on `ScheduleConfig` (`AppConfig.schedule.exposure`). It is staged
+from the dashboard with `POST /api/schedule/exposure` (§10) and committed by
+Save Settings (`POST /api/config/commit`). `POST /api/schedule/preview`
+accepts it too, but the Scheduler page no longer sends it, so staging rules
+there leaves it unchanged. A config written before this field existed
+deserializes as `Dashboard`.
 
 ```json
 "exposure": { "mode": "Dashboard" }
@@ -87,7 +89,8 @@ written before this field existed deserializes as `Dashboard`.
 | `smoothing` | 0 ..= 0.95 | Weight of the previous scene estimate (0 = react fully to each frame). |
 | `wb_max_step_pct` | 0 ..= 20 | Largest colour-gain change per frame, in percent. |
 
-`POST /api/schedule/preview` rejects out-of-range values with 422. At run
+`POST /api/schedule/exposure` (and `/api/schedule/preview`) reject
+out-of-range values with 422. At run
 time the scheduler clamps any hand-edited value into range instead of
 failing captures.
 
@@ -212,9 +215,9 @@ for fixing colour in post.
 - `SchedulerStatus.exposure` (new, in `GET /api/status` → `schedule`) shows
   the mode, the last planned shutter/gain/colour gains, target bias, sun
   elevation, measured scene EV, and whether the last frame was a seed.
-- The Scheduler page has a new **Scheduled exposure** card with the mode and
-  its limits, staged and saved together with the rules, plus a live readout of
-  that status.
+- **Dashboard UI (2026-09-22 redesign, §10):** a *Scheduled exposure*
+  toggle below Shutter on the dashboard's camera controls. The Scheduler page
+  only shows the ramp status read-only.
 - Manual dashboard captures and the live preview are unchanged.
 
 ## 8. Failure Handling
@@ -236,3 +239,32 @@ for fixing colour in post.
 - Per-rule fixed exposure overrides were declined for now (§3.1).
 - The metering does not yet handle a region of interest (e.g. excluding the sky).
 - Ramp state is not persisted across daemon restarts (§5.4, intended).
+
+## 10. Dashboard UI (redesign, 2026-09-22)
+
+The first UI (an eight-field card on the Scheduler page) was judged too
+technical and gave no way to see the result. The redesign puts the ramp where
+exposure already lives:
+
+- **Toggle.** *Scheduled exposure* sits below Shutter on the dashboard. It
+  stages `ScheduleConfig.exposure` through `POST /api/schedule/exposure` and
+  is saved or discarded with the dashboard's Save Settings / Discard
+  Changes.
+- **Locked, live fields.** With the toggle on, Shutter, Gain and White
+  balance are read-only and show the *next planned exposure* from
+  `GET /api/status` → `exposure_plan`. This is recomputed on every poll from
+  the ramp state, the settings, and the current sun elevation, so it drifts
+  as the night target changes and jumps when a scheduled frame is observed.
+  An amber style marks ramp-driven values, and a brief pulse marks a change.
+  "Auto (seeding)" means the next frame is a seed.
+- **Brightness-equivalent preview.** The live preview can't run a 4 s
+  shutter, so the stream request carries a preview-only `exposure_override`:
+  the plan's total `shutter × gain`, with the shutter clamped to the preview
+  frame time and the rest moved into gain (≤ 16), plus the plan's colour
+  gains. Brightness and colour match the next scheduled frame; noise is
+  higher. `reconfigure_stream` stages only `settings`, so the override is
+  never saved.
+- **Three simple controls.** *Night look* (Dark ↔ Bright, which maps to
+  `night_drop_ev` 4 … 0 EV), *Max shutter* and *Max gain*. Day brightness,
+  max step, smoothing, white-balance rate and min shutter sit under
+  *Advanced*.

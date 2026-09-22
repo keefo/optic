@@ -952,6 +952,92 @@ pub struct SchedulerStatus {
     pub last_capture: Option<LastCapture>,
     /// The last auto-ramped capture; `None` in `Dashboard` mode.
     pub exposure: Option<RampSnapshot>,
+    /// The ramp's state for `live_exposure_plan` (the dashboard's live
+    /// values); internal, not part of the status JSON.
+    #[serde(skip)]
+    pub ramp_state: Option<RampState>,
+}
+
+/// The next scheduled frame's exposure as of now — what the dashboard's
+/// locked Shutter/Gain/White balance fields show while *Scheduled
+/// exposure* is on (`docs/optic-daemon-exposure-ramping.md` §10).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LiveExposurePlan {
+    /// The next frame is an auto-exposure/AWB seed, so there's no manual
+    /// exposure to show yet.
+    pub seeding: bool,
+    pub shutter_us: Option<u64>,
+    pub gain: Option<f32>,
+    pub colour_gains: Option<[f32; 2]>,
+    pub target_bias_ev: f64,
+    pub sun_elevation_deg: Option<f64>,
+    pub max_shutter_us: u64,
+    /// When the ramp last learned from a captured frame.
+    pub ramp_updated_at: Option<DateTime<Utc>>,
+}
+
+/// How far ahead `live_exposure_plan` looks for the next two shots to size
+/// the interval budget. Short: it runs on every status poll.
+const LIVE_PLAN_LOOKAHEAD: Duration = Duration::hours(6);
+
+/// Plans the next ramped frame for `now`, the same way the scheduler will
+/// when it fires (sun elevation and interval budget included). `None` in
+/// `Dashboard` mode.
+pub fn live_exposure_plan(
+    schedule: &ScheduleConfig,
+    ramp_state: Option<&RampState>,
+    now: DateTime<Utc>,
+) -> Option<LiveExposurePlan> {
+    let ScheduleExposure::AutoRamp(settings) = &schedule.exposure else {
+        return None;
+    };
+    let settings = settings.sanitized();
+    let sun_elevation_deg = schedule
+        .station
+        .as_ref()
+        .map(|station| sun_elevation_at(station)(now));
+    let mut upcoming = occurrences(
+        schedule,
+        now.with_timezone(&schedule.tz()),
+        LIVE_PLAN_LOOKAHEAD,
+    )
+    .into_iter();
+    let gap = upcoming
+        .next()
+        .and_then(|next| upcoming.next().map(|after| after.at - next.at));
+    let max_shutter_us = exposure_ramp::max_shutter_for_gap(gap, &settings);
+    let target_bias_ev = exposure_ramp::target_bias_ev(sun_elevation_deg, &settings);
+    let base = LiveExposurePlan {
+        seeding: true,
+        shutter_us: None,
+        gain: None,
+        colour_gains: None,
+        target_bias_ev,
+        sun_elevation_deg,
+        max_shutter_us,
+        ramp_updated_at: ramp_state.map(|state| state.updated_at),
+    };
+    match exposure_ramp::plan(
+        ramp_state,
+        now,
+        sun_elevation_deg,
+        &settings,
+        max_shutter_us,
+    ) {
+        RampPlan::Seed => Some(base),
+        RampPlan::Manual {
+            shutter_us,
+            gain,
+            colour_gains,
+            ..
+        } => Some(LiveExposurePlan {
+            seeding: false,
+            shutter_us: Some(shutter_us),
+            gain: Some(gain),
+            colour_gains: Some(colour_gains),
+            ..base
+        }),
+    }
 }
 
 /// What the last auto-ramped capture did — the exposure the camera
@@ -1019,6 +1105,7 @@ impl SchedulerHandle {
             next_capture_rules: Vec::new(),
             last_capture: None,
             exposure: None,
+            ramp_state: None,
         });
         tokio::spawn(run_actor(
             camera,
@@ -1134,6 +1221,7 @@ async fn run_actor(
                         let mut status = status_tx.borrow().clone();
                         status.last_capture = Some(outcome);
                         status.exposure = exposure;
+                        status.ramp_state = ramp;
                         let _ = status_tx.send(status);
                     }
                     command = commands.recv() => {
@@ -2112,6 +2200,77 @@ mod actor_tests {
         // No station: the target stays at the day level.
         assert_eq!(ramp_shot.sun_elevation_deg, None);
         assert_eq!(ramp_shot.target_bias_ev, 0.0);
+    }
+
+    #[test]
+    fn live_exposure_plan_is_none_in_dashboard_mode() {
+        let schedule = ScheduleConfig::default();
+        assert_eq!(live_exposure_plan(&schedule, None, Utc::now()), None);
+    }
+
+    #[test]
+    fn live_exposure_plan_seeds_without_state_and_tracks_the_ramp_with_it() {
+        use chrono::TimeZone as _;
+        let now = Utc.with_ymd_and_hms(2026, 9, 22, 8, 40, 0).unwrap();
+        let station = Station {
+            latitude: 49.22,
+            longitude: -123.0,
+            elevation_m: 86.0,
+            timezone: "America/Vancouver".to_owned(),
+        };
+        let settings = exposure_ramp::RampSettings::default();
+        let schedule = ScheduleConfig {
+            station: Some(station.clone()),
+            rules: vec![Rule {
+                id: "every-minute".to_owned(),
+                label: "Every minute".to_owned(),
+                slug: "every-minute".to_owned(),
+                enabled: true,
+                trigger: Trigger::Interval {
+                    every_secs: 60,
+                    align_to_wall_clock: true,
+                },
+                constraints: Constraints::default(),
+            }],
+            exposure: ScheduleExposure::AutoRamp(settings),
+        };
+
+        let seeding = live_exposure_plan(&schedule, None, now).unwrap();
+        assert!(seeding.seeding);
+        assert_eq!((seeding.shutter_us, seeding.gain), (None, None));
+        // 60 s interval -> the capture-time budget caps the shutter.
+        assert_eq!(seeding.max_shutter_us, 4_227_272);
+        // 01:40 local: deep night, full night drop.
+        assert!(seeding.sun_elevation_deg.unwrap() < -18.0);
+        assert_eq!(seeding.target_bias_ev, -2.0);
+
+        let state = RampState {
+            updated_at: now - Duration::minutes(1),
+            scene_ev: -26.0,
+            planned_log2_exposure: Some(21.0),
+            colour_gains: [2.6, 1.8],
+        };
+        let live = live_exposure_plan(&schedule, Some(&state), now).unwrap();
+        let RampPlan::Manual {
+            shutter_us,
+            gain,
+            colour_gains,
+            ..
+        } = exposure_ramp::plan(
+            Some(&state),
+            now,
+            seeding.sun_elevation_deg,
+            &settings,
+            4_227_272,
+        )
+        else {
+            panic!("expected a manual plan");
+        };
+        assert!(!live.seeding);
+        assert_eq!(live.shutter_us, Some(shutter_us));
+        assert_eq!(live.gain, Some(gain));
+        assert_eq!(live.colour_gains, Some(colour_gains));
+        assert_eq!(live.ramp_updated_at, Some(state.updated_at));
     }
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
