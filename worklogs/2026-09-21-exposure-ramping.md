@@ -503,6 +503,11 @@ Local daemon (no camera, Vancouver station, 60 s rule) in Chrome:
   `start_stream`/`reconfigure_stream` staging the current camera `settings`
   whenever the preview (re)starts. A later reproduction staged nothing.
 
+GitHub CI on PR #16 head `1db6a39`: Detect changed scope pass, Biome
+pass, **Rust (Debian 13 arm64) pass** (Linux build and tests, including the
+`native_camera.rs` preview-override path), Timelapse tool skipped (not
+touched).
+
 Not verified (needs the Pi and user approval, so not done while the user
 is away): the preview override on real frames, and whether the preview's
 brightness matches the scheduled frames.
