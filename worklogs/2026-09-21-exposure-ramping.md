@@ -750,3 +750,39 @@ Hardware verification (Pi, scheduler **Paused**, settings **staged only**):
 Still open for the user: night convergence over a real sunset, and whether
 the preview's metering (a different sensor mode than captures) biases the
 first scheduled frames.
+
+## Part 6: White-balance drift (2026-09-22)
+
+### Bug
+
+User: "the WB value is keep shifting and my entire live preview tempature
+color is keep changing. which looks very bad." Caused by Part 5: white
+balance eases up to `wb_max_step_pct` per *frame*, sized for captures about
+a minute apart, but preview frames arrive up to 8× a second. Grey-world also
+pulls a coloured scene toward neutral, so the temperature wandered within
+seconds. Workaround given immediately: turn the toggle off.
+
+### Fixes
+
+1. `observe_preview` updates brightness only; colour gains are seeded once
+   and then only ever eased by captured frames. Regression test: 20 preview
+   frames with a strong cast leave the gains untouched, while a captured
+   frame with easing enabled still moves them. Deployed.
+2. Follow-up decision (user): **lock white balance by default**.
+   `wb_max_step_pct` defaults to `0` (Rust and JS defaults), the Advanced
+   field is relabelled "White-balance drift (%/frame, 0 = locked)", and the
+   docs' decision table is revised. Per-frame AWB flicker — the actual goal
+   — is solved by fixing the gains at all; neutralizing a sunset is not
+   wanted, and post-processing handles the day-to-night colour shift.
+   Easing stays opt-in.
+
+### Verification (Pi, after deploy)
+
+- Checks: 243 tests on the Mac, clippy, Biome; 237 tests on the Pi during
+  the deploy; deploy exit 0.
+- Live: with the preview running, the plan's colour gains stayed exactly
+  `[2.8956, 1.7315]` across 20 s while the shutter kept adapting
+  (701 → 675 µs). Before the fix the gains moved on every frame.
+- The user's staged config still carried the old `3.0`, since serde defaults
+  only fill missing fields; it was set to `0.0` to match their decision.
+  Mode AutoRamp, scheduler still Paused, nothing committed.
