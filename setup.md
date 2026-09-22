@@ -255,6 +255,23 @@ ssh liam@optic.local 'bash -s -- --phase 4 --color' < verify.sh
 
 The setup script disables `bluetooth.service`. It leaves absent services and audio daemons unchanged rather than installing or masking nonexistent units.
 
+It also disables the services the 2026-09-21 audit found unused on this station (`docs/pi-services-audit.md`):
+
+| Disabled | Why | Skipped when |
+| --- | --- | --- |
+| `man-db.timer` | Daily man-index rebuild on a headless box | never |
+| `udisks2.service` | Desktop disk-mount service | never |
+| user unit `mpris-proxy.service` (globally) | Bluetooth media proxy; Bluetooth is off | never |
+| `apt-daily.timer`, `apt-daily-upgrade.timer` | No-ops: `APT::Periodic` is unset | any `APT::Periodic::` value is configured |
+| `e2scrub_all.timer`, `e2scrub_reap.service` | Act only on ext4 on LVM | `/` is on LVM |
+| `cron.service` | Every cron job defers to a systemd timer | a crontab exists, or a cron job does not skip under systemd |
+| cloud-init (`/etc/cloud/cloud-init.disabled`) | First-boot provisioning only; peaks at 65 MiB every boot | `cloud-init status` is not `done` |
+| tty1 console autologin (drop-in moved to `/var/backups/optic-hardening`) | Anyone at the HDMI console got a `liam` shell | `liam` has no usable password (`passwd -S` state not `P`) |
+
+Skipped items are reported at the end of the run, and `verify.sh` Phase 4 shows them as `WARN`. The cloud-init change takes effect at the next boot. The Wi-Fi profile NetworkManager keeps in `/etc/netplan/90-NM-*.yaml` does not depend on cloud-init, but confirm that Wi-Fi returns after that reboot while a console is available.
+
+The script re-renders its `config.txt` block in place, so the Phase 5 block after it no longer makes a rerun rewrite the file and ask for a reboot.
+
 *(Note: Retain `avahi-daemon` enabled if you access the node via `optic.local`).*
 
 ### B. Firmware Hardware Disables
@@ -382,15 +399,15 @@ The iMac receiver uses a dedicated SSH daemon on TCP `2222`. It does **not** ena
 ### A. Bootstrap the Pi RAM Stage and Client Key
 
 ```bash
-scp /Users/admin/Documents/projects/optic/scripts/{setup-phase-06-pi-ram-transfer.sh,optic-capture-transfer.sh} liam@optic.local:/home/liam/.local/bin/
-ssh liam@optic.local 'chmod 700 /home/liam/.local/bin/setup-phase-06-pi-ram-transfer.sh; chmod 755 /home/liam/.local/bin/optic-capture-transfer.sh'
+scp /Users/admin/Documents/projects/optic/scripts/setup-phase-06-pi-ram-transfer.sh liam@optic.local:/home/liam/.local/bin/
+ssh liam@optic.local 'chmod 700 /home/liam/.local/bin/setup-phase-06-pi-ram-transfer.sh'
 ssh -t liam@optic.local '/home/liam/.local/bin/setup-phase-06-pi-ram-transfer.sh'
 scp liam@optic.local:/home/liam/.ssh/optic_capture_ed25519.pub /tmp/optic_capture_ed25519.pub
 ```
 
-The first run creates the RAM stage and key but leaves the transfer timer disabled until the iMac host key is pinned.
+The first run creates the RAM stage and key. `optic_sync` can reach the iMac once the receiver's host key is pinned in step C.
 
-> **Retired timer:** this script still installs the original shell transfer (`optic-capture-transfer.timer`), and step C enables it. `optic_sync` has replaced it. The timer ships and deletes every non-hidden file in `/mnt/capture`, so disable it after provisioning (`sudo systemctl disable --now optic-capture-transfer.timer`). `verify.sh` Phase 6 fails while it is enabled.
+> **Retired timer:** the original shell transfer (`optic-capture-transfer.timer`, which ships and then deletes every non-hidden file in `/mnt/capture`) has been replaced by `optic_sync`. This script no longer installs it. If an earlier run left it behind, the script stops it and moves its units, `/etc/optic/capture-transfer.conf`, `/usr/local/libexec/optic-capture-transfer` and `~/.local/bin/optic-capture-transfer.sh` into `/var/backups/optic-hardening/retired-capture-transfer.<time>/`. `verify.sh` Phase 6 fails while any of them remain.
 
 ### B. Configure the Restricted iMac Receiver
 
@@ -401,7 +418,7 @@ sudo ./scripts/setup-phase-06-imac-receiver.sh --client-key /tmp/optic_capture_e
 
 Captures are stored under `/Users/admin/Pictures/Optic`. The setup exports its dedicated public host key to `/Users/admin/.config/optic/capture_receiver_host_ed25519.pub`.
 
-### C. Pin the Receiver and Enable Transfers on the Pi
+### C. Pin the Receiver on the Pi
 
 ```bash
 scp /Users/admin/.config/optic/capture_receiver_host_ed25519.pub liam@optic.local:/tmp/optic_capture_receiver_host.pub
