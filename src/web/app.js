@@ -13,6 +13,8 @@ const elements = {
   firstVisibleLatency: document.querySelector("#first-visible-latency"),
   medianVisibleLatency: document.querySelector("#median-visible-latency"),
   medianSampleCount: document.querySelector("#median-sample-count"),
+  captureLatency: document.querySelector("#capture-latency"),
+  captureLatencyDetail: document.querySelector("#capture-latency-detail"),
   measurementSample: document.querySelector("#measurement-sample"),
   discardConfig: document.querySelector("#discard-config"),
   saveConfig: document.querySelector("#save-config"),
@@ -106,6 +108,9 @@ const controlChanges = new Map();
 let cameraFieldsInitialized = false;
 const activeMeasurements = new Map();
 const firstVisibleSamples = [];
+// Capture latency samples per profile + DNG choice: their costs differ too
+// much (≈0.7 s vs ≈2.5 s) for one shared median to mean anything.
+const captureSamples = new Map();
 const MAX_MEASUREMENT_SAMPLES = 10;
 const SETTLE_TIMEOUT_MS = 15000;
 const POST_CAPTURE_FREEZE_MS = 3000;
@@ -580,6 +585,25 @@ function median(values) {
   return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
 }
 
+function recordCaptureLatency(key, label, latency) {
+  const samples = captureSamples.get(key) || [];
+  samples.push(latency);
+  if (samples.length > MAX_MEASUREMENT_SAMPLES) samples.shift();
+  captureSamples.set(key, samples);
+  elements.captureLatency.textContent = formatLatency(latency);
+  elements.captureLatencyDetail.textContent = `${label} · median ${formatLatency(median(samples))} of ${samples.length}`;
+}
+
+// The button stays disabled after the capture itself: the frozen-still hold
+// plus the preview restart. Shown so that wait isn't mistaken for capture time.
+function traceButtonReady(captureDoneAt, holdDoneAt, readyAt) {
+  const hold = holdDoneAt - captureDoneAt;
+  const preview = readyAt - holdDoneAt;
+  const trace = `button ready +${formatLatency(readyAt - captureDoneAt)} (hold ${formatLatency(hold)}, preview ${formatLatency(preview)})`;
+  elements.captureLatencyDetail.textContent += ` · ${trace}`;
+  console.info(`capture perf: ${trace}`);
+}
+
 function formatLatency(milliseconds) {
   return `${Math.round(milliseconds)} ms`;
 }
@@ -726,6 +750,11 @@ async function captureAndTransfer() {
   const profileName = selectedProfile();
   const profile = profiles[profileName];
   const saveDng = elements.saveDng.checked;
+  const captureKey = `${profileName}:${saveDng}`;
+  const captureLabel = saveDng ? `${profile.label} + DNG` : profile.label;
+  const captureStartedAt = performance.now();
+  elements.captureLatency.textContent = "Measuring…";
+  elements.captureLatencyDetail.textContent = captureLabel;
   setBusy(true);
   prepareForStillCapture();
   showNotice(`Capturing ${profile.label} to the verified RAM queue…`);
@@ -740,21 +769,27 @@ async function captureAndTransfer() {
       }),
     });
     const result = await response.json();
+    recordCaptureLatency(captureKey, captureLabel, performance.now() - captureStartedAt);
     showNotice(
       `${result.files.length} file${result.files.length === 1 ? "" : "s"} queued for ${profile.label} (${formatBytes(result.bytes)}).`,
       "success",
     );
   } catch (error) {
+    elements.captureLatency.textContent = "Failed";
+    elements.captureLatencyDetail.textContent = `${captureLabel} · not counted`;
     showNotice(error.message, "error");
   } finally {
     // Hold the frozen frame for a moment so the capture reads as a
     // deliberate still, rather than flickering straight back to live the
     // instant the request completes. captureRunning stays true through the
     // wait so refreshStatus()'s own auto-resume logic doesn't race this.
+    const captureDoneAt = performance.now();
     await new Promise((resolve) => setTimeout(resolve, POST_CAPTURE_FREEZE_MS));
+    const holdDoneAt = performance.now();
     captureRunning = false;
     await ensurePreview(null, false);
     setBusy(false);
+    traceButtonReady(captureDoneAt, holdDoneAt, performance.now());
     refreshStatus();
   }
 }
