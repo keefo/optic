@@ -14,6 +14,12 @@ RPI_SWAP_FILE="/etc/rpi/swap.conf.d/90-optic.conf"
 ZRAM_GENERATOR_FILE="/etc/systemd/zram-generator.conf.d/90-optic.conf"
 SYSCTL_FILE="/etc/sysctl.d/99-optic-memory.conf"
 GENERATOR="/usr/lib/systemd/system-generators/rpi-swap-generator"
+# The firmware prepends cgroup_disable=memory to the kernel command line; a
+# later cgroup_enable=memory (from cmdline.txt) turns the memory controller
+# back on, so systemd's MemoryHigh=/MemoryMax= limits are enforced
+# (docs/optic-daemon-system-service.md) and per-service memory is reported.
+CMDLINE_FILE="/boot/firmware/cmdline.txt"
+CMDLINE_TOKEN="cgroup_enable=memory"
 TEMPORARY=""
 VALIDATION_DIR=""
 
@@ -22,7 +28,8 @@ usage() {
 Usage: setup-phase-02-memory.sh [--dry-run] [--reboot] [--help]
 
 Idempotently configures native Raspberry Pi OS pure zram swap at 50% of RAM,
-zstd compression, priority 100, and Project Optic virtual-memory sysctls.
+zstd compression, priority 100, Project Optic virtual-memory sysctls, and the
+kernel memory cgroup (cgroup_enable=memory in /boot/firmware/cmdline.txt).
 
   --dry-run   Report required changes without modifying the system.
   --reboot    Reboot when required to activate zram configuration changes.
@@ -145,6 +152,38 @@ runtime_zram_matches() {
        "$backing" == "none" && -z "$non_zram" ]]
 }
 
+cmdline_has_token() {
+    [[ -r "$CMDLINE_FILE" ]] && tr -s ' \n' '\n\n' < "$CMDLINE_FILE" | grep -qx "$CMDLINE_TOKEN"
+}
+
+runtime_memcg_enabled() {
+    tr ' ' '\n' < /sys/fs/cgroup/cgroup.controllers 2>/dev/null | grep -qx memory
+}
+
+# cmdline.txt must stay a single line, and /boot/firmware is vfat: write a
+# sibling temporary file and rename it (no chmod/chown, which vfat rejects).
+append_cmdline_token() {
+    local current backup_name backup
+    current=$(tr -d '\n' < "$CMDLINE_FILE")
+    [[ -n "$current" ]] || { printf '%s is empty; refusing to edit it.\n' "$CMDLINE_FILE" >&2; exit 1; }
+    install -d -m 0700 "$BACKUP_DIR"
+    backup_name=${CMDLINE_FILE#/}
+    backup_name=${backup_name//\//_}
+    backup="$BACKUP_DIR/$backup_name.$(date +%Y%m%dT%H%M%S).bak"
+    cp -- "$CMDLINE_FILE" "$backup"
+    printf 'Backed up previous kernel command line to %s\n' "$backup"
+    TEMPORARY=$(mktemp "$(dirname "$CMDLINE_FILE")/.cmdline.txt.XXXXXX")
+    printf '%s %s\n' "${current% }" "$CMDLINE_TOKEN" > "$TEMPORARY"
+    [[ $(wc -l < "$TEMPORARY") -eq 1 ]] && grep -q 'root=' "$TEMPORARY" || {
+        printf '%s\n' 'Refusing to install a kernel command line that is not a single line with root=.' >&2
+        exit 1
+    }
+    mv -f -- "$TEMPORARY" "$CMDLINE_FILE"
+    TEMPORARY=""
+    sync
+    printf 'Appended %s to %s\n' "$CMDLINE_TOKEN" "$CMDLINE_FILE"
+}
+
 if [[ ! -x "$GENERATOR" ]] || ! command -v rpi-systemd-config >/dev/null 2>&1; then
     printf '%s\n' 'Required native rpi-swap components are not installed.' >&2
     exit 69
@@ -159,6 +198,16 @@ if ((DRY_RUN)); then
         printf '%s\n' '[OK] Runtime zram state already matches the plan.'
     else
         printf '%s\n' '[CHANGE] A reboot is required to activate the planned zram state.'
+    fi
+    if cmdline_has_token; then
+        printf '[OK] %s contains %s.\n' "$CMDLINE_FILE" "$CMDLINE_TOKEN"
+    else
+        printf '[CHANGE] Append %s to %s.\n' "$CMDLINE_TOKEN" "$CMDLINE_FILE"
+    fi
+    if runtime_memcg_enabled; then
+        printf '%s\n' '[OK] The memory cgroup controller is active.'
+    else
+        printf '%s\n' '[CHANGE] A reboot is required to activate the memory cgroup controller.'
     fi
     exit 0
 fi
@@ -183,6 +232,11 @@ if install_managed_file "$ZRAM_GENERATOR_FILE" "$zram_generator_content"; then
     ZRAM_CONFIGURATION_CHANGED=1
 fi
 install_managed_file "$SYSCTL_FILE" "$sysctl_content" || true
+if cmdline_has_token; then
+    printf '%s already contains %s.\n' "$CMDLINE_FILE" "$CMDLINE_TOKEN"
+else
+    append_cmdline_token
+fi
 
 VALIDATION_DIR=$(mktemp -d)
 mkdir -p "$VALIDATION_DIR/normal" "$VALIDATION_DIR/early" "$VALIDATION_DIR/late"
@@ -217,13 +271,13 @@ for specification in vm.swappiness:10 vm.min_free_kbytes:65536 vm.vfs_cache_pres
     }
 done
 
-if ((ZRAM_CONFIGURATION_CHANGED)) || ! runtime_zram_matches; then
-    printf '%s\n' 'Phase 2 configuration is installed; reboot is required for zram changes.'
+if ((ZRAM_CONFIGURATION_CHANGED)) || ! runtime_zram_matches || ! runtime_memcg_enabled; then
+    printf '%s\n' 'Phase 2 configuration is installed; reboot is required for zram or memory cgroup changes.'
     if ((REBOOT)); then
         printf '%s\n' 'Rebooting now.'
         systemctl reboot
     else
-        printf '%s\n' 'Rerun this script with --reboot to activate the zram configuration.'
+        printf '%s\n' 'Rerun this script with --reboot to activate the configuration.'
     fi
 else
     printf '%s\n' 'Phase 2 setup complete; runtime and persistent state match the plan.'

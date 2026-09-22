@@ -1,22 +1,34 @@
-# Project Optic Phase 1 user service
+# System service running as liam (docs/optic-daemon-system-service.md).
+# Installed by scripts/setup-optic-daemon-system-service.sh (root); deploys
+# refuse to run if /etc/systemd/system/optic-daemon.service differs from
+# this file. %h would expand to root's home in a system unit, so paths are
+# explicit.
 [Unit]
 Description=Project Optic camera control daemon
 Documentation=file:///home/liam/.local/src/optic-daemon/optic-daemon.md
-After=default.target
+# No RTC battery: after a power cut the clock is wrong until NTP syncs.
+# time-sync.target waits for a real sync only because
+# systemd-time-wait-sync.service is enabled, bounded to 90 s by its
+# optic-bounded-wait.conf drop-in.
+Wants=network-online.target time-sync.target
+After=network-online.target time-sync.target
+RequiresMountsFor=/mnt/capture /home/liam
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/optic-daemon
+User=liam
+Group=liam
+SupplementaryGroups=video render
+ExecStart=/home/liam/.local/bin/optic-daemon
 Environment=OPTIC_BIND_ADDR=0.0.0.0:8000
 Environment=OPTIC_CAPTURE_DIR=/mnt/capture
 Environment=OPTIC_SYNC_REMOTE_HOST=imacpro.local
 Environment=RUST_LOG=info
-Environment=LD_LIBRARY_PATH=%h/.local/optic-sysroot/usr/lib/aarch64-linux-gnu
+Environment=LD_LIBRARY_PATH=/home/liam/.local/optic-sysroot/usr/lib/aarch64-linux-gnu
 Restart=on-failure
 RestartSec=3s
 TimeoutStopSec=10s
 UMask=0027
-
 NoNewPrivileges=true
 LockPersonality=true
 ProtectClock=true
@@ -27,16 +39,26 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/mnt/capture /dev/shm %h/.local/state/optic-daemon
+ReadWritePaths=/mnt/capture /dev/shm /home/liam/.local/state/optic-daemon
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 SystemCallArchitectures=native
-
+# Enforced under the system manager (a user manager skipped it).
+# ProtectClock= alone would add DeviceAllow=char-rtc and so block the
+# camera, so its device classes are listed explicitly: V4L2 video and
+# sub-devices, the media controller, dma-buf heaps (libcamera buffers), DRM.
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-media rw
+DeviceAllow=char-dma_heap rw
+DeviceAllow=char-drm rw
+CapabilityBoundingSet=
+AmbientCapabilities=
 MemoryHigh=350M
 MemoryMax=500M
 TasksMax=32
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

@@ -282,7 +282,15 @@
     <span id="footer-summary" class="muted">Loading system status&hellip;</span>
     <div class="button-row">
       <button id="footer-restart-daemon" type="button">Restart daemon</button>
-      <button id="footer-reboot" class="bad" type="button">Reboot Pi</button>
+      <div class="power-menu">
+        <button id="footer-power" class="bad" type="button" aria-label="Power" title="Power" aria-haspopup="menu" aria-expanded="false" aria-controls="footer-power-menu">
+          <svg class="power-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 3v8"/><path d="M6.3 6.8a8 8 0 1 0 11.4 0"/></svg>
+        </button>
+        <div id="footer-power-menu" class="power-menu-list" role="menu" aria-labelledby="footer-power" hidden>
+          <button id="footer-reboot" type="button" role="menuitem">Reboot</button>
+          <button id="footer-shutdown" class="bad" type="button" role="menuitem">Shut down</button>
+        </div>
+      </div>
     </div>
   </footer>
 </body>

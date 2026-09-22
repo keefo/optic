@@ -177,7 +177,9 @@ copies from `OPTIC_NATIVE_LIB` under the service's `LD_LIBRARY_PATH`.
 ## Install and Verify
 
 The installer copies the already-built release binary, verifies the required
-runtime library and capture-stage prerequisites, restarts the user service,
+runtime library and capture-stage prerequisites, checks that the installed
+system unit matches `systemd/` (see `docs/optic-daemon-system-service.md`),
+restarts the system service through PolicyKit (no sudo),
 and waits until `/api/status` reports the version from `Cargo.toml`:
 
 ```bash
@@ -194,9 +196,9 @@ python3 -c 'import json, sys; print(json.load(sys.stdin)["version"])' <<<"$statu
 
 curl --fail --silent --show-error http://127.0.0.1:8000/app.js |
   grep -F 'previewFps' >/dev/null
-systemctl --user is-enabled optic-daemon.service
-systemctl --user is-active optic-daemon.service
-journalctl --user -u optic-daemon.service --since '-2 minutes' --no-pager
+systemctl is-enabled optic-daemon.service
+systemctl is-active optic-daemon.service
+journalctl -u optic-daemon.service --since '-2 minutes' --no-pager
 ```
 
 Finally, open [http://optic.local:8000/](http://optic.local:8000/) and confirm

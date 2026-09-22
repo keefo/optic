@@ -11,7 +11,10 @@
 const footerElements = {
   summary: document.querySelector("#footer-summary"),
   restartDaemon: document.querySelector("#footer-restart-daemon"),
+  power: document.querySelector("#footer-power"),
+  powerMenu: document.querySelector("#footer-power-menu"),
   reboot: document.querySelector("#footer-reboot"),
+  shutdown: document.querySelector("#footer-shutdown"),
 };
 
 async function footerApi(path, options = {}) {
@@ -131,12 +134,57 @@ footerElements.restartDaemon.addEventListener("click", () =>
     "Restart the optic-daemon service? The page will briefly disconnect.",
   ),
 );
-footerElements.reboot.addEventListener("click", () =>
+
+// Power menu: one footer button that opens Reboot / Shut down. Each item
+// closes the menu first, then asks for confirmation as before.
+const powerMenuItems = [footerElements.reboot, footerElements.shutdown];
+
+function setPowerMenuOpen(open, { focusButton = false } = {}) {
+  footerElements.powerMenu.hidden = !open;
+  footerElements.power.setAttribute("aria-expanded", String(open));
+  if (open) powerMenuItems[0].focus();
+  else if (focusButton) footerElements.power.focus();
+}
+
+footerElements.power.addEventListener("click", () =>
+  setPowerMenuOpen(footerElements.powerMenu.hidden),
+);
+document.addEventListener("click", (event) => {
+  if (
+    !footerElements.powerMenu.hidden &&
+    !footerElements.power.parentElement.contains(event.target)
+  ) {
+    setPowerMenuOpen(false);
+  }
+});
+footerElements.power.parentElement.addEventListener("keydown", (event) => {
+  if (footerElements.powerMenu.hidden) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    setPowerMenuOpen(false, { focusButton: true });
+  } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    const step = event.key === "ArrowDown" ? 1 : -1;
+    const current = powerMenuItems.indexOf(document.activeElement);
+    const next = (current + step + powerMenuItems.length) % powerMenuItems.length;
+    powerMenuItems[next].focus();
+  }
+});
+
+footerElements.reboot.addEventListener("click", () => {
+  setPowerMenuOpen(false, { focusButton: true });
   footerSystemAction(
     "/api/system/reboot",
     "Reboot the Raspberry Pi? This takes it offline for about a minute.",
-  ),
-);
+  );
+});
+footerElements.shutdown.addEventListener("click", () => {
+  setPowerMenuOpen(false, { focusButton: true });
+  footerSystemAction(
+    "/api/system/shutdown",
+    "Shut down the Raspberry Pi? It stays off until someone presses its power button or unplugs and replugs it.",
+  );
+});
 
 // Shared header status pills — Daemon version, Camera, and health Alerts
 // (docs/optic-daemon-alerts.md §8) — on every page, followed by any

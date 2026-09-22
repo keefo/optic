@@ -56,10 +56,11 @@ RAM-upper mechanism in §1 with no Option B.
 | Path | Writer and pattern | Under OverlayFS without Option B | Plan |
 |------|--------------------|----------------------------------|------|
 | `~/.local/state/optic-daemon/history.db` (+ `-wal`, `-shm`) | daemon: one row per capture, SQLite WAL | **Breaks**: rows lost at every reboot; RAM growth | Data volume (bind mount) |
+| `~/.local/state/optic-daemon/events.db` (+ `-wal`, `-shm`) | daemon: a few rows per boot, daemon start/stop and Power request (`docs/optic-daemon-system-events.md`), SQLite WAL | **Breaks**: boot/shutdown history lost at every reboot, and every boot looks like the first | Data volume (same directory) |
 | `~/.local/state/optic-daemon/config.json` | daemon: on Save (commit), temp file + rename (`src/durable_state.rs`) | **Breaks**: scheduler rules, Station, camera config revert at reboot | Data volume (same directory) |
 | `~/.local/state/optic-daemon/schedule_run_state.json` | daemon: on run/pause changes | **Breaks**: run/pause state reverts | Data volume (same directory) |
 | `~/.local/bin/optic-daemon`, `~/.local/bin/web/` | deploy script (`setup-optic-daemon-phase-01.sh`, `--assets` path) | **Breaks deploys**: the new build runs until reboot, then the old one returns | Data volume (bind mount) |
-| `~/.config/systemd/user/optic-daemon.service` | deploy script, per deploy | **Breaks deploys**: unit changes revert | Keep on root and change only with overlay off, or data volume (open decision, §3.3) |
+| `/etc/systemd/system/optic-daemon.service`, `/etc/systemd/system/systemd-time-wait-sync.service.d/optic-bounded-wait.conf` | `scripts/setup-optic-daemon-system-service.sh` (root), only when the unit changes; deploys never write them and refuse on drift (since 2026-09-21, `docs/optic-daemon-system-service.md`) | Unit changes revert at reboot | Keep on root; change only with the overlay off (§4) |
 | `/mnt/capture` (JPEG/DNG, `.part` files, `*.log.json`, `preview_config.json`) | daemon captures and sync deletes; Phase 6 tmpfs | Unaffected: separate tmpfs, already volatile by design | No change |
 | `/dev/shm/optic-daemon/` (config and run-state cache) | daemon: hydrated at start from the durable copy | Unaffected: tmpfs, rebuilt each start | No change |
 | `/var/log/journal/` (persistent journal, 16 MiB cap) | journald | **Breaks the Phase 1 goal**: crash evidence lost at reboot; up to 16 MiB of RAM | Data volume (bind mount) |
@@ -127,7 +128,7 @@ LABEL=optic-data  /srv/optic  ext4  defaults,noatime,nofail,x-systemd.device-tim
 ```
 
 System fstab mounts come up before `local-fs.target`, so they exist before
-`user@1000.service` (the lingering user manager) starts `optic-daemon`. The
+`optic-daemon.service` starts (a system unit since 2026-09-21, with `RequiresMountsFor=/home/liam`). The
 journal moves from `/run` to `/var/log/journal` in
 `systemd-journal-flush.service`, which waits for that mount.
 
@@ -138,7 +139,7 @@ would write its state into RAM again without saying so. Proposed guard (a
 
 ```ini
 [Unit]
-AssertPathIsMountPoint=%h/.local/state/optic-daemon
+AssertPathIsMountPoint=/home/liam/.local/state/optic-daemon
 ```
 
 With it, the daemon refuses to start and `verify.sh` fails, rather than
@@ -149,10 +150,11 @@ the alternative.
 ### 3.3 Open decisions
 
 1. Backing device: B1 or B2 (§3.1).
-2. Whether `~/.config/systemd/user/` moves to the data volume. Unit changes
-   are rare and reviewable, so the recommendation is to keep it on root and
-   change it only with the overlay off. The deploy script then must refuse to
-   install a *changed* unit while the overlay is on (§4).
+2. ~~Whether `~/.config/systemd/user/` moves to the data volume.~~ Resolved
+   2026-09-21: optic-daemon is a system unit in `/etc/systemd/system`,
+   installed only by a root script, and deploys already refuse to run when it
+   differs from `systemd/` (`docs/optic-daemon-system-service.md`). It stays
+   on root and changes only with the overlay off.
 3. Whether to add `AssertPathIsMountPoint=` (§3.2).
 4. Timesync clock persistence (§3.4).
 5. Whether to make `/boot/firmware` read-only (Stage 4).

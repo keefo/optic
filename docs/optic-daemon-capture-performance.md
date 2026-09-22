@@ -68,7 +68,7 @@ manually with the same environment variables, redirecting stdout/stderr to
 a plain file:
 
 ```bash
-systemctl --user stop optic-daemon.service
+systemctl stop optic-daemon.service   # was --user before the 2026-09-21 system-service migration
 OPTIC_BIND_ADDR=0.0.0.0:8000 \
 OPTIC_CAPTURE_DIR=/mnt/capture \
 OPTIC_SYNC_REMOTE_HOST=imacpro.local \
@@ -78,7 +78,7 @@ nohup /home/liam/.local/bin/optic-daemon > /tmp/optic-perf.log 2>&1 &
 disown
 # ... trigger captures via curl against http://optic.local:8000 ...
 # then: pkill -f "/home/liam/.local/bin/optic-daemon"
-systemctl --user start optic-daemon.service   # restore normal operation
+systemctl start optic-daemon.service   # restore normal operation
 ```
 
 This is a real, if minor, gap in this deployment's observability — anyone
@@ -99,6 +99,11 @@ optic-daemon`. However, the exact invocation form documented above,
 that specific quirk is unrelated to volatile-vs-persistent storage and
 remains unresolved. Use the system-scoped query form instead until that's
 separately investigated.
+
+**Update 2026-09-21:** optic-daemon is now a system service
+(`docs/optic-daemon-system-service.md`), so `journalctl -u
+optic-daemon.service` (no `--user`) returns its lines directly, readable by
+`liam` through the `adm` group.
 
 ## 3. Findings
 

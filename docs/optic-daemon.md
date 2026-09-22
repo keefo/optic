@@ -16,7 +16,7 @@ The current source serves the dashboard from disk (see [dynamic web asset loadin
 * A full-resolution `4056 × 3040` Master Archive MJPEG preview at 2 FPS, plus lower-bandwidth profile-correct 4K DCI and 2K previews at up to 8 FPS.
 * Profile-specific JPEG and optional DNG captures published as `testshot-<profile>-*` in `/mnt/capture` for `optic_sync`. (Named `testshot-` — not `optic-web-` — to make manually-triggered captures from the dashboard easy to distinguish from real timelapse frames once `optic_scheduler` exists; see `worklogs/2026-09-18-data-sync-manager.md`. The dedicated "Profile test shot" preview-only button/`POST /api/test-shot` endpoint was removed as unused — "Capture & transfer" is now the only capture control.)
 
-The canonical LAN URL is [http://optic.local:8000/](http://optic.local:8000/). Phase 1 runs as an unprivileged systemd user service. On the validated Pi, `net.ipv4.ip_unprivileged_port_start=1024`, no process listens on TCP port `80`, and noninteractive sudo is unavailable; port `80` is therefore not part of this deployment.
+The canonical LAN URL is [http://optic.local:8000/](http://optic.local:8000/). Phase 1 runs as an unprivileged system service (`User=liam`; see `docs/optic-daemon-system-service.md`). On the validated Pi, `net.ipv4.ip_unprivileged_port_start=1024`, no process listens on TCP port `80`, and noninteractive sudo is unavailable; port `80` is therefore not part of this deployment.
 
 ---
 
@@ -75,7 +75,7 @@ Instead of tight in-memory coupling (shared message buses or cross-thread actor 
 * **Hardware Mutual Exclusion:** The Sony IMX477 CSI-2 bus cannot be opened concurrently. A shared `Arc<Mutex<()>>` (or lockfile `/run/optic/camera.lock`) arbitrates access between the Web Service (interactive calibration) and the Scheduler (automated shots).
 * **Crash & Network Isolation:** If the iMac goes offline or local Wi-Fi stalls, `optic_sync` backs off. The `optic_scheduler` continues firing captures without blocking.
 * **OverlayFS Boundary:** The Phase 1 binary lives at `/home/liam/.local/bin/optic-daemon`. Captures use the bounded `/mnt/capture` tmpfs.
-* **Resource Limits:** The user unit enforces `MemoryHigh=350M`, `MemoryMax=500M`, and `TasksMax=32`. Idle RSS measured 4.0 MiB during deployment validation; long-duration memory behavior is not yet established.
+* **Resource Limits:** The unit sets `MemoryHigh=350M`, `MemoryMax=500M`, and `TasksMax=32`. All three are enforced since 2026-09-21. Before that, the firmware's `cgroup_disable=memory` left the memory limits without effect; Phase 2 (`scripts/setup-phase-02-memory.sh`) now appends `cgroup_enable=memory` to `/boot/firmware/cmdline.txt`. A Master Archive + DNG capture peaked at 129 MiB in the daemon's cgroup, including capture files waiting in the `/mnt/capture` tmpfs, which are charged to it (`worklogs/2026-09-21-system-service-migration.md`). Idle RSS measured 4.0 MiB during deployment validation; long-duration memory behavior is not yet established.
 
 ---
 
@@ -295,8 +295,10 @@ The dashboard does not expose a separate JPEG-quality override. Quality is part 
 * `POST /api/schedule/preview`: Stages rule edits and returns upcoming occurrences plus advisories; invalid or duplicate slugs are rejected immediately (`docs/optic-daemon-scheduler.md`).
 * `GET /api/schedule/forecast`: Shot and storage/bandwidth forecast for the staged (or committed) rules, capped at one week.
 * `GET /api/captures`: Filtered, paginated capture history from `history.db` (`docs/optic-daemon-capture-log.md` §7).
+* `GET /api/events?limit=N`: System events, newest first (default 50, max 200): boots (with how the previous boot ended), reboots, shutdowns, daemon starts/stops, and the Power/Restart requests. Shown on the Capture History page. See `docs/optic-daemon-system-events.md`.
 * `GET /api/system/status`: Pi health (memory, disk, temperature, uptime, time sync).
-* `POST /api/system/reboot`, `POST /api/system/restart-daemon`: Reboot the Pi or restart the daemon (PolicyKit-scoped).
+* `POST /api/system/reboot` and `POST /api/system/shutdown`: Back **Reboot** and **Shut down** in the Power menu (the icon-only power button in the shared page footer, `src/web/footer.js`), each behind a confirmation prompt. They run `systemctl reboot` / `systemctl poweroff` over D-Bus, authorized by the Phase 8 PolicyKit rules (`setup.md` §G); a missing rule returns an error and the Pi stays up. After a shutdown the Pi stays off until its power button is pressed or it is re-plugged. Each request is recorded in the system events log.
+* `POST /api/system/restart-daemon`: Restart the daemon (the footer's Restart daemon button; `systemctl --no-block restart` of the system service, allowed by PolicyKit rule 64).
 * `POST /api/system/ntp-sync`, `POST /api/system/timezone`: Trigger an NTP sync, or set the system timezone to a validated IANA name.
 * `GET /api/timezones`: Every valid IANA timezone name, for the Config page.
 * `GET /api/celestial-preview`: Sun, Moon and Milky Way event times for a station, for planning rules.
@@ -625,9 +627,9 @@ pub async fn atomic_save_config(path: &Path, content: &str) -> anyhow::Result<()
 
 ---
 
-## 9. Deployment & Systemd User Service
+## 9. Deployment & Systemd Service
 
-Phase 1 uses the repository unit at `systemd/optic-daemon.service`. It installs as `/home/liam/.config/systemd/user/optic-daemon.service`, runs `/home/liam/.local/bin/optic-daemon`, binds `0.0.0.0:8000`, and is enabled in the user manager's `default.target`. `loginctl enable-linger liam` must already have been run by an administrator so the user manager starts without an interactive login.
+Phase 1 uses the repository unit at `systemd/optic-daemon.service`. Since 2026-09-21 it installs as the system unit `/etc/systemd/system/optic-daemon.service` (`User=liam`, groups `video`/`render`), runs `/home/liam/.local/bin/optic-daemon`, binds `0.0.0.0:8000`, and is enabled for `multi-user.target`, ordered after `network-online.target` and a bounded (90 s) `time-sync.target`. The root script `scripts/setup-optic-daemon-system-service.sh` installs the unit and performs the one-time migration from the former user unit (`--dry-run`, `--rollback`). Deploys stay unprivileged: they install the binary and assets as `liam`, restart the unit through PolicyKit rule `64-optic-daemon-manage-unit.rules`, and refuse to run if the installed unit differs from `systemd/`. Design: `docs/optic-daemon-system-service.md`.
 
 ### Installation Sequence
 
@@ -672,7 +674,7 @@ The installer refuses to proceed unless `/mnt/capture` is a tmpfs and `liam` bel
 4. Verify the deployed service and dashboard:
 
 ```bash
-systemctl --user status optic-daemon.service
+systemctl status optic-daemon.service
 curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/api/status
 ```
@@ -697,7 +699,7 @@ Validated on the Raspberry Pi 5 on 2026-09-16 UTC:
 | Port 80 | Not configured; canonical endpoint is TCP `8000` |
 | Reboot persistence | Unit is enabled and `Linger=yes`. Pending on 2026-09-16; later passed on real reboots (`worklogs/2026-09-19-reboot-nonewprivileges-fix.md`, `worklogs/2026-09-19-timelapse-scheduler-phase1b.md`) |
 
-To re-check persistence after future changes, reboot the Pi, then confirm `systemctl --user is-active optic-daemon.service` and `curl http://127.0.0.1:8000/healthz` as `liam`.
+To re-check persistence after future changes, reboot the Pi, then confirm `systemctl is-active optic-daemon.service` and `curl http://127.0.0.1:8000/healthz` as `liam`.
 
 ---
 

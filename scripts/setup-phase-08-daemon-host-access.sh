@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 # Configure the host access optic-daemon's dashboard system actions depend on:
-# the scoped PolicyKit rules behind Reboot Pi, NTP Sync now, and the Station
-# timezone save, plus the user-manager lingering and device groups the user
-# service needs.
+# the scoped PolicyKit rules behind the Power menu (Reboot, Shut down), NTP
+# Sync now, the Station timezone save, and restarting optic-daemon.service
+# (Restart daemon and deploys), plus lingering (for the Beszel agent's user
+# service) and the device groups the daemon needs.
 
 set -euo pipefail
 
@@ -21,6 +22,8 @@ RULE_NAMES=(
     60-optic-daemon-reboot.rules
     61-optic-daemon-ntp-sync.rules
     62-optic-daemon-set-timezone.rules
+    63-optic-daemon-power-off.rules
+    64-optic-daemon-manage-unit.rules
 )
 LINGER_FILE="/var/lib/systemd/linger/$DAEMON_USER"
 TEMPORARY=""
@@ -99,6 +102,38 @@ EOF
 // page Station-timezone-save integration.
 polkit.addRule(function(action, subject) {
     if (action.id == "org.freedesktop.timedate1.set-timezone" &&
+        subject.user == "liam") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+            ;;
+        63-optic-daemon-power-off.rules)
+            cat <<'EOF'
+// Allow liam to power off the Pi without interactive PolicyKit
+// authentication. Scoped to exactly this one action for optic-daemon's
+// Shut down Pi control.
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.login1.power-off" &&
+        subject.user == "liam") {
+        return polkit.Result.YES;
+    }
+});
+EOF
+            ;;
+        64-optic-daemon-manage-unit.rules)
+            cat <<'EOF'
+// Allow liam to start, stop, and restart optic-daemon.service (a system
+// service running as liam) without interactive PolicyKit authentication,
+// for the dashboard's Restart daemon control and unprivileged deploys.
+// Scoped to exactly this one unit and these verbs -- NOT enable/disable,
+// unit-file changes, or any other unit.
+// See docs/optic-daemon-system-service.md.
+polkit.addRule(function(action, subject) {
+    var verb = action.lookup("verb");
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "optic-daemon.service" &&
+        (verb == "start" || verb == "stop" || verb == "restart") &&
         subject.user == "liam") {
         return polkit.Result.YES;
     }
@@ -299,9 +334,12 @@ authorized() {
 
 for attempt in {1..10}; do
     if authorized org.freedesktop.login1.reboot &&
+       authorized org.freedesktop.login1.power-off &&
        authorized org.freedesktop.timedate1.set-timezone &&
        authorized org.freedesktop.systemd1.manage-units \
-           --detail unit systemd-timesyncd.service --detail verb restart; then
+           --detail unit systemd-timesyncd.service --detail verb restart &&
+       authorized org.freedesktop.systemd1.manage-units \
+           --detail unit optic-daemon.service --detail verb restart; then
         break
     fi
     ((attempt < 10)) || {
@@ -325,6 +363,20 @@ elif ((scope_status != 1 && scope_status != 2)); then
     exit 1
 fi
 
+# Rule 64 must not reach past start/stop/restart of optic-daemon.service:
+# "reload" of the same unit is an unlisted verb and must still be refused.
+scope_status=0
+authorized org.freedesktop.systemd1.manage-units \
+    --detail unit optic-daemon.service --detail verb reload || scope_status=$?
+if ((scope_status == 0)); then
+    printf 'The optic-daemon unit rule is too broad: %s may reload it without authentication.\n' \
+        "$DAEMON_USER" >&2
+    exit 1
+elif ((scope_status != 1 && scope_status != 2)); then
+    printf 'Could not check the optic-daemon unit rule scope (pkcheck exit status %s).\n' "$scope_status" >&2
+    exit 1
+fi
+
 [[ -e "$LINGER_FILE" ]]
 for group in "${REQUIRED_GROUPS[@]}"; do
     user_in_group "$group"
@@ -333,4 +385,4 @@ done
 if ((GROUPS_CHANGED)); then
     printf '%s\n' "New group membership applies to $DAEMON_USER's next login and user manager start; reboot (with approval) before relying on it."
 fi
-printf '%s\n' 'Phase 8 daemon host access setup complete: Reboot, NTP sync, and timezone actions are authorized.'
+printf '%s\n' 'Phase 8 daemon host access setup complete: Reboot, shutdown, NTP sync, timezone, and optic-daemon restart actions are authorized.'
