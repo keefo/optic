@@ -20,7 +20,11 @@
 > this design (the Storage Forecaster, §8). Decision #3 (which capture
 > profile/settings an autonomous shot uses) is confirmed here: **whatever
 > the currently committed profile/settings are** — no scheduler-specific
-> override, including for DNG (§6). Decision #4 (full-disk runtime
+> override, including for DNG (§6). *Update 2026-09-21:* exposure is the
+> one exception — `ScheduleConfig.exposure` can switch every scheduled
+> capture to global auto-ramped exposure
+> (`docs/optic-daemon-exposure-ramping.md`); its default, `Dashboard`,
+> keeps this behaviour. Decision #4 (full-disk runtime
 > behavior) is resolved in §7 (skip the tick and report it). Decision #6
 > (UI placement as a nested section) is superseded by a dedicated page
 > (§10). Also new since the
@@ -52,6 +56,8 @@ examples to show the primitives are sufficient.
 struct ScheduleConfig {
     station: Option<Station>,   // required only if any rule needs it (§4, §5)
     rules: Vec<Rule>,
+    exposure: ScheduleExposure, // Dashboard (default) | AutoRamp{..} — global, not per rule;
+                                // see docs/optic-daemon-exposure-ramping.md
     // No `enabled: bool` here — run state moved to its own durably-stored
     // type, kept separate from this staged/edited config on purpose. See
     // §2.1.
@@ -652,6 +658,12 @@ concurrency style.
 - On wake: re-read `AppConfig` (hot-reload, same as the original design
   called for) in case it changed since the sleep was armed — a rule edit
   mid-sleep should take effect on the next wake, not require a restart.
+- Exposure (added 2026-09-21): in `AutoRamp` mode the capture's
+  shutter, gain and colour gains come from the one global ramp state,
+  which every scheduled frame's metadata and meter update; the shutter is
+  also capped by the gap to the following shot. Merged rules share that
+  one exposure by construction. See
+  `docs/optic-daemon-exposure-ramping.md` §5–§7.
 - Fire: gather every rule whose occurrence falls within the §3.1 merge
   window of the due instant (not just the one rule that triggered the
   wake), collect their `slug`s, and call

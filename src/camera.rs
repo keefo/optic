@@ -18,7 +18,22 @@ pub struct CameraSettings {
     pub gain: f32,
     pub shutter_us: u64,
     pub denoise: String,
+    /// Manual white balance as `[red, blue]` colour gains. `Some` disables
+    /// AWB for the request (`AwbEnable(false)` + `ColourGains`); `None`
+    /// keeps per-frame AWB with `awb`'s mode. Set by exposure ramping
+    /// (`docs/optic-daemon-exposure-ramping.md` §6), never by the dashboard.
+    pub colour_gains: Option<[f32; 2]>,
 }
+
+/// Manual shutter range accepted by `CameraSettings::validate` (0 = auto).
+pub(crate) const MIN_SHUTTER_US: u64 = 100;
+pub(crate) const MAX_SHUTTER_US: u64 = 5_000_000;
+/// Manual analogue gain range (0 = auto).
+pub(crate) const MIN_GAIN: f32 = 1.0;
+pub(crate) const MAX_GAIN: f32 = 16.0;
+/// Manual colour-gain range for `CameraSettings::colour_gains`.
+pub(crate) const COLOUR_GAIN_MIN: f32 = 0.5;
+pub(crate) const COLOUR_GAIN_MAX: f32 = 8.0;
 
 impl Default for CameraSettings {
     fn default() -> Self {
@@ -33,6 +48,7 @@ impl Default for CameraSettings {
             gain: 0.0,
             shutter_us: 0,
             denoise: "auto".to_owned(),
+            colour_gains: None,
         }
     }
 }
@@ -63,14 +79,25 @@ impl CameraSettings {
         if !(-4.0..=4.0).contains(&self.ev) || !self.ev.is_finite() {
             return Err(CameraError::Invalid("EV must be between -4 and 4"));
         }
-        if !(self.gain == 0.0 || (1.0..=16.0).contains(&self.gain)) || !self.gain.is_finite() {
+        if !(self.gain == 0.0 || (MIN_GAIN..=MAX_GAIN).contains(&self.gain))
+            || !self.gain.is_finite()
+        {
             return Err(CameraError::Invalid(
                 "gain must be 0 (auto) or between 1 and 16",
             ));
         }
-        if !(self.shutter_us == 0 || (100..=5_000_000).contains(&self.shutter_us)) {
+        if !(self.shutter_us == 0 || (MIN_SHUTTER_US..=MAX_SHUTTER_US).contains(&self.shutter_us)) {
             return Err(CameraError::Invalid(
                 "shutter must be 0 (auto) or between 100 and 5000000 microseconds",
+            ));
+        }
+        if let Some(gains) = self.colour_gains
+            && !gains
+                .iter()
+                .all(|gain| (COLOUR_GAIN_MIN..=COLOUR_GAIN_MAX).contains(gain))
+        {
+            return Err(CameraError::Invalid(
+                "colour gains must be between 0.5 and 8",
             ));
         }
         Ok(())
@@ -226,6 +253,12 @@ pub(crate) const STILL_MIN_FRAME_DURATION_US: i64 = 33_333;
 /// preview limit that still captures used to inherit.
 pub(crate) const STILL_AUTO_MAX_FRAME_DURATION_US: i64 = 500_000;
 
+/// Frames a still capture waits for before its output frame: the 3 queued
+/// requests plus `native_camera.rs`'s 8 warmup frames. Each lasts at least
+/// one shutter, which bounds how long a ramped shutter can be for a given
+/// interval (`exposure_ramp::max_shutter_for_gap`).
+pub(crate) const STILL_CAPTURE_FRAMES: u32 = 11;
+
 /// `FrameDurationLimits` for still-capture requests: as fast as the sensor
 /// mode and the exposure allow. Auto shutter leaves auto exposure its old
 /// headroom; a manual shutter is never truncated by the limit.
@@ -355,6 +388,19 @@ pub struct CaptureResult {
     pub bytes: u64,
     pub width: u32,
     pub height: u32,
+    /// What the output frame was actually exposed with, and its meter —
+    /// feeds exposure ramping. `None` when the backend can't report it.
+    pub exposure: Option<CaptureExposure>,
+}
+
+/// Request metadata of the output frame (the values libcamera used, not
+/// the ones requested) plus its brightness/colour meter.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct CaptureExposure {
+    pub exposure_us: Option<i32>,
+    pub analogue_gain: Option<f32>,
+    pub colour_gains: Option<[f32; 2]>,
+    pub meter: Option<crate::exposure_ramp::FrameMeter>,
 }
 
 #[derive(Debug)]
@@ -501,6 +547,26 @@ mod tests {
             ..CameraSettings::default()
         };
         assert!(invalid_awb.validate().is_err());
+    }
+
+    #[test]
+    fn colour_gains_default_to_awb_and_are_range_checked() {
+        let settings: CameraSettings = serde_json::from_str(r#"{"shutter_us": 1000}"#).unwrap();
+        assert_eq!(settings.colour_gains, None);
+        settings.validate().unwrap();
+
+        let manual = CameraSettings {
+            colour_gains: Some([2.0, 1.6]),
+            ..CameraSettings::default()
+        };
+        manual.validate().unwrap();
+        for gains in [[0.4, 1.6], [2.0, 8.5], [f32::NAN, 1.0]] {
+            let invalid = CameraSettings {
+                colour_gains: Some(gains),
+                ..CameraSettings::default()
+            };
+            assert!(invalid.validate().is_err(), "{gains:?}");
+        }
     }
 
     #[test]

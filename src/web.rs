@@ -599,6 +599,10 @@ struct SchedulePreviewRequest {
     station: Option<optic_scheduler::Station>,
     #[serde(default)]
     rules: Vec<optic_scheduler::Rule>,
+    /// Omitted by clients that predate exposure ramping; the staged value
+    /// is then left as it was (`docs/optic-daemon-exposure-ramping.md` §4).
+    #[serde(default)]
+    exposure: Option<crate::exposure_ramp::ScheduleExposure>,
 }
 
 /// Stages rule edits into `preview_config.json`, the same file
@@ -617,9 +621,20 @@ async fn schedule_preview(
             message: format!("invalid schedule rule slugs: {error:?}"),
         });
     }
+    if let Some(crate::exposure_ramp::ScheduleExposure::AutoRamp(settings)) = &request.exposure
+        && let Err(message) = settings.validate()
+    {
+        return Err(AppError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("invalid scheduled exposure: {message}"),
+        });
+    }
     let mut config = current_app_config(&state).await;
     config.schedule.station = request.station;
     config.schedule.rules = request.rules;
+    if let Some(exposure) = request.exposure {
+        config.schedule.exposure = exposure;
+    }
     let serialized = serde_json::to_string_pretty(&config).map_err(|error| AppError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: error.to_string(),

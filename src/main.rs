@@ -1,6 +1,7 @@
 mod camera;
 mod durable_state;
 mod ephemeris;
+mod exposure_ramp;
 mod native_camera;
 #[cfg(target_os = "linux")]
 mod native_codec;

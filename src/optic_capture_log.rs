@@ -615,6 +615,7 @@ mod tests {
             bytes: 1234,
             width: 4056,
             height: 3040,
+            exposure: None,
         })
     }
 

@@ -37,10 +37,11 @@ mod imp {
 
     use crate::{
         camera::{
-            CameraError, CameraSettings, CaptureFile, CaptureProfile, CaptureRequest,
-            CaptureResult, CaptureSource, PreviewFrame, StreamRequest, format_rule_tags,
-            still_frame_duration_limits_us,
+            CameraError, CameraSettings, CaptureExposure, CaptureFile, CaptureProfile,
+            CaptureRequest, CaptureResult, CaptureSource, PreviewFrame, StreamRequest,
+            format_rule_tags, still_frame_duration_limits_us,
         },
+        exposure_ramp::meter_yuv420,
         native_codec::{DngMetadata, decode_pisp_comp1, encode_bayer16_dng, encode_yuv420_jpeg},
     };
 
@@ -100,6 +101,7 @@ mod imp {
         yuv: Vec<u8>,
         raw: Option<Vec<u8>>,
         metadata: DngMetadata,
+        exposure: CaptureExposure,
         still: StreamInfo,
         raw_info: Option<StreamInfo>,
     }
@@ -389,7 +391,20 @@ mod imp {
                         elapsed_ms = frame_started.elapsed().as_millis(),
                         "capture perf"
                     );
-                    frame_result.and_then(|frame| {
+                    frame_result.and_then(|mut frame| {
+                        let meter_started = Instant::now();
+                        frame.exposure.meter = meter_yuv420(
+                            &frame.yuv,
+                            frame.still.width,
+                            frame.still.height,
+                            frame.still.stride,
+                        );
+                        info!(
+                            stage = "meter",
+                            luminance = frame.exposure.meter.map(|meter| meter.luminance),
+                            elapsed_ms = meter_started.elapsed().as_millis(),
+                            "capture perf"
+                        );
                         let publish_started = Instant::now();
                         let publish_result = publish_capture(&capture_dir, request, frame);
                         info!(
@@ -680,12 +695,23 @@ mod imp {
         controls
             .set(controls::AeEnable(false))
             .map_err(backend_error)?;
-        controls
-            .set(controls::AwbEnable(true))
-            .map_err(backend_error)?;
-        controls
-            .set(controls::AwbMode::from_setting(&settings.awb))
-            .map_err(backend_error)?;
+        // Manual colour gains (exposure ramping's eased white balance)
+        // replace per-frame AWB; otherwise AWB runs in the chosen mode.
+        if let Some(gains) = settings.colour_gains {
+            controls
+                .set(controls::AwbEnable(false))
+                .map_err(backend_error)?;
+            controls
+                .set(controls::ColourGains(gains))
+                .map_err(backend_error)?;
+        } else {
+            controls
+                .set(controls::AwbEnable(true))
+                .map_err(backend_error)?;
+            controls
+                .set(controls::AwbMode::from_setting(&settings.awb))
+                .map_err(backend_error)?;
+        }
         controls
             .set(noise_reduction_mode(&settings.denoise, fps.is_some()))
             .map_err(backend_error)?;
@@ -854,6 +880,12 @@ mod imp {
                         yuv,
                         raw,
                         metadata: dng_metadata(request.metadata(), &pipeline.raw_info, model),
+                        exposure: CaptureExposure {
+                            exposure_us,
+                            analogue_gain,
+                            colour_gains,
+                            meter: None,
+                        },
                         still: pipeline.still_info.clone(),
                         raw_info: pipeline.raw_info.clone(),
                     });
@@ -1204,6 +1236,7 @@ mod imp {
             bytes,
             width: spec.width,
             height: spec.height,
+            exposure: Some(frame.exposure),
         })
     }
 

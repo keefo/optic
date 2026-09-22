@@ -186,6 +186,23 @@ When the operator adjusts an exposure slider or changes white balance in the UI:
 
 No sensor reset, process restart, or I2C clock re-initialization occurs. The hardware ISP applies updated gains and exposure targets at the start of the next vertical blanking interval.
 
+### 4.1.1 White Balance and Exposure Controls (as implemented, 2026-09-21)
+
+`apply_controls` (`src/native_camera.rs`) always sets `AeEnable(false)`
+and manual `ExposureTime`/`AnalogueGain` (a value of `0` still lets
+libcamera choose; see `docs/optic-daemon-capture-performance.md` §7).
+White balance depends on `CameraSettings.colour_gains`:
+
+- `None` (dashboard, preview, and `Dashboard`-mode scheduled captures):
+  `AwbEnable(true)` with the selected `AwbMode`, i.e. per-frame AWB.
+- `Some([red, blue])` (auto-ramped scheduled captures): `AwbEnable(false)`
+  plus `ColourGains`, validated to 0.5..8.
+
+Every still capture reports the output frame's metadata exposure, gain and
+colour gains, plus a brightness/colour meter of the YUV frame, in
+`CaptureResult.exposure`. Exposure ramping uses this
+(`docs/optic-daemon-exposure-ramping.md`).
+
 ### 4.2 Non-Blocking Dual Capture Sequence
 
 1. The viewfinder cycles buffers continuously on **Stream 0** ($1280 \times 960$)[cite: 1].
