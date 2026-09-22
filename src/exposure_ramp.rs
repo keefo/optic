@@ -451,13 +451,16 @@ pub fn observe(
 
 /// Folds a *live preview* frame into the ramp state (design doc §11).
 ///
-/// Same measurement as `observe`, with one deliberate difference: it never
-/// touches `planned_log2_exposure`, which anchors the capture sequence's
-/// per-frame step limit. Preview frames therefore teach the ramp the scene
-/// (so unsaved settings show up live, and a scheduled run starts converged)
-/// without letting a preview restart or a passing cloud jump a running
-/// timelapse. With no state yet it seeds, taking colour gains from the
-/// preview's own AWB.
+/// Brightness only. Two things are deliberately left alone:
+///
+/// - `planned_log2_exposure`, the anchor for the capture sequence's
+///   per-frame step limit, so a preview restart or a passing cloud can't
+///   jump a running timelapse.
+/// - `colour_gains`. White balance eases per *frame*, which is sized for
+///   captures arriving about once a minute. Preview frames arrive up to 8
+///   times a second, so easing here drifted the colour temperature visibly
+///   within seconds (2026-09-22 bug report). The gains are seeded once from
+///   the preview's AWB and then only ever eased by captured frames.
 pub fn observe_preview(
     state: Option<&RampState>,
     observation: &FrameObservation,
@@ -475,15 +478,11 @@ pub fn observe_preview(
         });
     };
     let blend = 1.0 - settings.smoothing;
-    let applied = observation
-        .colour_gains
-        .unwrap_or(state.colour_gains)
-        .map(f64::from);
     Some(RampState {
         updated_at: now,
         scene_ev: state.scene_ev + blend * (scene_ev - state.scene_ev),
         planned_log2_exposure: state.planned_log2_exposure,
-        colour_gains: ease_colour_gains(state.colour_gains, applied, &observation.meter, settings),
+        colour_gains: state.colour_gains,
     })
 }
 
@@ -1036,6 +1035,43 @@ mod tests {
         }
         assert!((f64::from(state.colour_gains[0]) - truth[0]).abs() < 0.02);
         assert!((f64::from(state.colour_gains[1]) - truth[1]).abs() < 0.02);
+    }
+
+    #[test]
+    fn preview_frames_never_move_white_balance() {
+        // Regression (2026-09-22): easing WB at preview frame rate drifted
+        // the colour temperature visibly within seconds.
+        let settings = RampSettings::default();
+        let state = RampState {
+            planned_log2_exposure: Some(12.0),
+            ..seeded(-14.0, at(0))
+        };
+        let strong_cast = FrameObservation {
+            exposure_us: 4_000.0,
+            analogue_gain: 1.0,
+            colour_gains: Some([2.0, 1.6]),
+            meter: meter(MID_GREY, Some([0.30, 0.18, 0.05])),
+        };
+        let mut next = state;
+        for frame in 1..=20 {
+            next = observe_preview(Some(&next), &strong_cast, at(frame), &settings).unwrap();
+            assert_eq!(next.colour_gains, state.colour_gains, "frame {frame}");
+        }
+        // A captured frame still eases, as designed (§6).
+        let captured = observe(
+            Some(&next),
+            &RampPlan::Manual {
+                shutter_us: 4_000,
+                gain: 1.0,
+                colour_gains: next.colour_gains,
+                log2_exposure: 12.0,
+            },
+            &strong_cast,
+            at(21),
+            &settings,
+        )
+        .unwrap();
+        assert_ne!(captured.colour_gains, state.colour_gains);
     }
 
     #[test]
