@@ -76,7 +76,7 @@ impl CameraSettings {
         ) {
             return Err(CameraError::Invalid("unsupported denoise mode"));
         }
-        if !(-4.0..=4.0).contains(&self.ev) || !self.ev.is_finite() {
+        if !(MIN_EV..=MAX_EV).contains(&self.ev) || !self.ev.is_finite() {
             return Err(CameraError::Invalid("EV must be between -4 and 4"));
         }
         if !(self.gain == 0.0 || (MIN_GAIN..=MAX_GAIN).contains(&self.gain))
@@ -373,7 +373,16 @@ pub struct ExposureOverride {
     pub gain: f32,
     #[serde(default)]
     pub colour_gains: Option<[f32; 2]>,
+    /// Exposure compensation for the auto (seeding) case, in EV: the ramp's
+    /// target bias, so an unsaved brightness change shows in the preview
+    /// before the ramp has any state (design doc §10).
+    #[serde(default)]
+    pub ev: f32,
 }
+
+/// `CameraSettings::ev` range (libcamera `ExposureValue`).
+pub(crate) const MIN_EV: f32 = -4.0;
+pub(crate) const MAX_EV: f32 = 4.0;
 
 impl StreamRequest {
     pub(crate) fn validate(&self) -> Result<(), CameraError> {
@@ -388,6 +397,11 @@ impl StreamRequest {
             settings.shutter_us = exposure.shutter_us;
             settings.gain = exposure.gain;
             settings.colour_gains = exposure.colour_gains;
+            settings.ev = if exposure.ev.is_finite() {
+                exposure.ev.clamp(MIN_EV, MAX_EV)
+            } else {
+                0.0
+            };
             if exposure.colour_gains.is_none() {
                 settings.awb = "auto".to_owned();
             }
@@ -606,16 +620,33 @@ mod tests {
         );
         ramped.validate().unwrap();
 
-        // Seeding: auto exposure and AWB.
+        // Seeding: auto exposure and AWB, with the ramp's brightness bias.
         let seed: StreamRequest = serde_json::from_str(
             r#"{"settings": {"awb": "daylight"}, "profile": "dci_4k",
-                "exposure_override": {"shutter_us": 0, "gain": 0.0}}"#,
+                "exposure_override": {"shutter_us": 0, "gain": 0.0, "ev": -2.3}}"#,
         )
         .unwrap();
         let effective = seed.effective_settings();
         assert_eq!((effective.shutter_us, effective.gain), (0, 0.0));
         assert_eq!(effective.awb, "auto");
         assert_eq!(effective.colour_gains, None);
+        assert_eq!(effective.ev, -2.3);
+        seed.validate().unwrap();
+
+        // `ev` defaults to 0 and is clamped into the control's range.
+        let no_ev: StreamRequest = serde_json::from_str(
+            r#"{"settings": {}, "profile": "dci_4k",
+                "exposure_override": {"shutter_us": 0, "gain": 0.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(no_ev.effective_settings().ev, 0.0);
+        let wild: StreamRequest = serde_json::from_str(
+            r#"{"settings": {}, "profile": "dci_4k",
+                "exposure_override": {"shutter_us": 0, "gain": 0.0, "ev": -9.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(wild.effective_settings().ev, MIN_EV);
+        wild.validate().unwrap();
 
         let invalid: StreamRequest = serde_json::from_str(
             r#"{"settings": {}, "profile": "dci_4k",

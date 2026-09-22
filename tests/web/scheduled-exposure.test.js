@@ -18,13 +18,22 @@ test("no plan means no preview override", () => {
   assert.equal(ramp.previewEquivalent(null, 8), null);
 });
 
-test("a seeding plan previews with auto exposure and AWB", () => {
-  assert.deepEqual(ramp.previewEquivalent({ seeding: true }, 8), {
+test("a seeding plan previews with auto exposure, AWB and the target bias", () => {
+  assert.deepEqual(ramp.previewEquivalent({ seeding: true, target_bias_ev: -2.3 }, 8), {
     shutter_us: 0,
     gain: 0,
     colour_gains: null,
+    ev: -2.3,
     shortfall_ev: 0,
   });
+  // No target yet, and beyond libcamera's compensation range.
+  assert.equal(ramp.previewEquivalent({ seeding: true }, 8).ev, 0);
+  assert.equal(ramp.previewEquivalent({ seeding: true, target_bias_ev: -9 }, 8).ev, -4);
+  assert.equal(ramp.previewEquivalent({ seeding: true, target_bias_ev: 7 }, 8).ev, 4);
+});
+
+test("a ramped plan needs no exposure compensation", () => {
+  assert.equal(ramp.previewEquivalent(manualPlan(10000, 1), 8).ev, 0);
 });
 
 test("a short shutter passes through unchanged", () => {
