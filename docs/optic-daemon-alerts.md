@@ -173,7 +173,7 @@ daemon. Setup (as `liam` on the Pi):
 install -d -m 0700 ~/.config/optic-daemon
 install -m 0600 /dev/null ~/.config/optic-daemon/alerts.json
 $EDITOR ~/.config/optic-daemon/alerts.json
-systemctl --user restart optic-daemon.service
+systemctl restart optic-daemon.service   # system service; allowed for liam by PolicyKit rule 64
 curl -s http://127.0.0.1:8000/api/alerts
 ```
 

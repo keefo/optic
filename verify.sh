@@ -422,6 +422,19 @@ journal_usage=$(journalctl --disk-usage 2>/dev/null | tr '\n' ' ' || true)
 
 section "2. zram and virtual memory"
 
+# Memory cgroup (scripts/setup-phase-02-memory.sh): the firmware disables it,
+# cmdline.txt re-enables it so systemd memory limits are enforced.
+if tr -s ' \n' '\n\n' < /boot/firmware/cmdline.txt 2>/dev/null | grep -qx 'cgroup_enable=memory'; then
+    pass "Kernel command line re-enables the memory cgroup" "cgroup_enable=memory in /boot/firmware/cmdline.txt"
+else
+    fail "Kernel command line does not re-enable the memory cgroup" "add cgroup_enable=memory via scripts/setup-phase-02-memory.sh"
+fi
+if tr ' ' '\n' < /sys/fs/cgroup/cgroup.controllers 2>/dev/null | grep -qx memory; then
+    pass "Memory cgroup controller is active" "MemoryHigh=/MemoryMax= limits are enforced"
+else
+    fail "Memory cgroup controller is inactive" "systemd memory limits are not enforced; reboot after enabling it"
+fi
+
 swap_count=$(awk 'NR > 1 {count++} END {print count + 0}' /proc/swaps 2>/dev/null)
 non_zram_swap=$(awk 'NR > 1 && $1 !~ /^\/dev\/zram[0-9]+$/ {print $1}' /proc/swaps 2>/dev/null |
     paste -sd, -)
@@ -759,9 +772,10 @@ else
 fi
 
 # Capture transfer is optic_sync inside optic-daemon (docs/optic-daemon.md
-# §6), configured by OPTIC_SYNC_* in the user unit; unset port/user fall
-# back to the daemon defaults (src/main.rs DEFAULT_SYNC_REMOTE_*).
-daemon_environment=$(systemctl --user show optic-daemon.service -p Environment --value 2>/dev/null || true)
+# §6), configured by OPTIC_SYNC_* in the system unit
+# (docs/optic-daemon-system-service.md); unset port/user fall back to the
+# daemon defaults (src/main.rs DEFAULT_SYNC_REMOTE_*).
+daemon_environment=$(systemctl show optic-daemon.service -p Environment --value 2>/dev/null || true)
 sync_env_value() {
     local key=$1 entry
     for entry in $daemon_environment; do
@@ -918,13 +932,38 @@ info "Optical validation remains manual" \
     "confirm native-resolution framing and focus on the transferred iMac image"
 
 # Host access for the daemon's dashboard system actions
-# (scripts/setup-phase-08-daemon-host-access.sh). The user service needs
-# lingering to start at boot without a login.
+# (scripts/setup-phase-08-daemon-host-access.sh). optic-daemon is a system
+# service now; lingering remains for the Beszel agent's user service.
 daemon_user=liam
 if [[ -e "/var/lib/systemd/linger/$daemon_user" ]]; then
     pass "User manager lingering is enabled" "$daemon_user"
 else
-    fail "User manager lingering is disabled" "optic-daemon will not start at boot for $daemon_user"
+    fail "User manager lingering is disabled" "the Beszel agent user service will not start at boot for $daemon_user"
+fi
+
+# optic-daemon runs as a system service owned by liam
+# (docs/optic-daemon-system-service.md).
+daemon_unit_state=""
+for daemon_unit_property in UnitFileState ActiveState User; do
+    daemon_unit_state+="$(systemctl show optic-daemon.service -p "$daemon_unit_property" --value 2>/dev/null || true) "
+done
+daemon_unit_state=${daemon_unit_state% }
+if [[ "$daemon_unit_state" == "enabled active $daemon_user" ]]; then
+    pass "optic-daemon is an enabled, active system service" "User=$daemon_user"
+else
+    fail "optic-daemon system service state differs from the plan" \
+        "expected 'enabled active $daemon_user', got '${daemon_unit_state:-unknown}'; see scripts/setup-optic-daemon-system-service.sh"
+fi
+if [[ -e "/home/$daemon_user/.config/systemd/user/optic-daemon.service" ]]; then
+    fail "A user-level optic-daemon unit is still installed" \
+        "it would compete for the camera and port 8000; rerun scripts/setup-optic-daemon-system-service.sh"
+else
+    pass "No user-level optic-daemon unit is installed"
+fi
+if [[ "$(systemctl is-enabled systemd-time-wait-sync.service 2>/dev/null || true)" == "enabled" ]]; then
+    pass "Boot waits (bounded) for NTP before optic-daemon" "systemd-time-wait-sync.service enabled"
+else
+    fail "systemd-time-wait-sync.service is not enabled" "time-sync.target will not wait for NTP"
 fi
 
 # pkcheck only asks polkitd for a decision; it performs no action. Any user
@@ -968,6 +1007,7 @@ else
 
     for policy_action in \
         "org.freedesktop.login1.reboot|Reboot Pi" \
+        "org.freedesktop.login1.power-off|Shut down Pi" \
         "org.freedesktop.timedate1.set-timezone|Station timezone save"; do
         if pkcheck --process "$policy_subject" --action-id "${policy_action%%|*}" >/dev/null 2>&1; then
             pass "PolicyKit authorizes $daemon_user for ${policy_action#*|}" "${policy_action%%|*}"
@@ -1002,7 +1042,28 @@ else
             fail "NTP sync PolicyKit scope check failed" "pkcheck exit status $policy_status"
         fi
 
-        for policy_rule in 60-optic-daemon-reboot.rules 61-optic-daemon-ntp-sync.rules 62-optic-daemon-set-timezone.rules; do
+        if "${policy_root[@]}" pkcheck --process "$policy_subject" \
+            --action-id org.freedesktop.systemd1.manage-units \
+            --detail unit optic-daemon.service --detail verb restart >/dev/null 2>&1; then
+            pass "PolicyKit authorizes $daemon_user for Restart daemon and deploys" "restart optic-daemon.service"
+        else
+            fail "PolicyKit does not authorize $daemon_user to restart optic-daemon.service" \
+                "see scripts/setup-phase-08-daemon-host-access.sh"
+        fi
+        "${policy_root[@]}" pkcheck --process "$policy_subject" \
+            --action-id org.freedesktop.systemd1.manage-units \
+            --detail unit optic-daemon.service --detail verb reload >/dev/null 2>&1
+        policy_status=$?
+        if ((policy_status == 0)); then
+            fail "optic-daemon unit PolicyKit rule is too broad" "$daemon_user may reload it without authentication"
+        elif ((policy_status == 1 || policy_status == 2)); then
+            pass "optic-daemon unit PolicyKit rule stays scoped to start/stop/restart" "reload still requires authentication"
+        else
+            fail "optic-daemon unit PolicyKit scope check failed" "pkcheck exit status $policy_status"
+        fi
+
+        for policy_rule in 60-optic-daemon-reboot.rules 61-optic-daemon-ntp-sync.rules 62-optic-daemon-set-timezone.rules \
+            63-optic-daemon-power-off.rules 64-optic-daemon-manage-unit.rules; do
             policy_rule_meta=$("${policy_root[@]}" stat -c '%a %U:%G' "/etc/polkit-1/rules.d/$policy_rule" 2>/dev/null || true)
             if [[ "$policy_rule_meta" == "644 root:root" ]]; then
                 pass "PolicyKit rule is installed" "$policy_rule ($policy_rule_meta)"

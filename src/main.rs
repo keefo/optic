@@ -7,6 +7,7 @@ mod native_codec;
 mod optic_alerts;
 mod optic_camera;
 mod optic_capture_log;
+mod optic_events;
 mod optic_scheduler;
 mod optic_sync;
 mod system_status;
@@ -16,6 +17,7 @@ use std::{env, net::SocketAddr, path::PathBuf};
 
 use optic_camera::OpticCamera;
 use optic_capture_log::CaptureLog;
+use optic_events::{BootInfo, SystemEventKind, SystemEventLog};
 use optic_sync::{DataSyncManager, SyncConfig};
 use system_status::{SystemStatusReader, WatchedPaths};
 use tokio::net::TcpListener;
@@ -102,6 +104,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| capture_log_db_path.clone());
+    // Boot/reboot/shutdown and daemon start/stop history
+    // (docs/optic-daemon-system-events.md). Its own database next to
+    // history.db, so it never contends with capture writes.
+    let events_db_path = state_dir.join("events.db");
+    let events = match SystemEventLog::open(&events_db_path, BootInfo::read_host()) {
+        Ok(events) => {
+            events.record_startup(env!("CARGO_PKG_VERSION")).await;
+            info!(path = %events_db_path.display(), "system event log ready");
+            Some(events)
+        }
+        Err(error) => {
+            warn!(
+                %error,
+                path = %events_db_path.display(),
+                "system event log unavailable; boot and shutdown events will not be recorded"
+            );
+            None
+        }
+    };
+
     let system_status = SystemStatusReader::new(WatchedPaths {
         capture_dir: capture_dir.clone(),
         state_dir: state_dir.clone(),
@@ -174,15 +196,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         preview_state_cache_path,
         asset_dir,
         sensor,
-    );
+    )
+    .with_events(events.clone());
     let listener = TcpListener::bind(bind).await?;
     info!(address = %bind, "optic_web listening");
 
     axum::serve(
         listener,
-        web::router(state).merge(web::alerts_router(alerts)),
+        web::router(state)
+            .merge(web::alerts_router(alerts))
+            .merge(web::events_router(events.clone())),
     )
-    .with_graceful_shutdown(shutdown_signal(camera, sync, scheduler))
+    .with_graceful_shutdown(shutdown_signal(camera, sync, scheduler, events))
     .await?;
 
     Ok(())
@@ -303,6 +328,7 @@ async fn shutdown_signal(
     camera: OpticCamera,
     sync: DataSyncManager,
     scheduler: optic_scheduler::SchedulerHandle,
+    events: Option<SystemEventLog>,
 ) {
     #[cfg(unix)]
     {
@@ -325,6 +351,23 @@ async fn shutdown_signal(
     }
 
     info!("shutdown requested");
+    // Recorded first: the steps below can hang until systemd SIGKILLs the
+    // process, and then nothing after them runs.
+    if let Some(events) = &events {
+        match optic_events::host_shutdown_action().await {
+            Some((kind, target)) => {
+                info!(target, "host is going down");
+                events
+                    .record(kind, serde_json::json!({ "target": target }))
+                    .await;
+            }
+            None => {
+                events
+                    .record(SystemEventKind::DaemonStop, serde_json::json!({}))
+                    .await;
+            }
+        }
+    }
     if let Err(error) = camera.shutdown().await {
         warn!(%error, "failed to shut down optic_camera cleanly");
     }

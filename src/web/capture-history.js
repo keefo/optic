@@ -205,3 +205,104 @@ elements.nextBtn.addEventListener("click", () => {
 });
 
 void load();
+
+// System events (GET /api/events): boots, reboots, shutdowns, and daemon
+// starts/stops — docs/optic-daemon-system-events.md. Independent of the
+// capture filters above.
+const eventsElements = {
+  body: document.querySelector("#events-body"),
+  refresh: document.querySelector("#refresh-events"),
+};
+
+const PREVIOUS_BOOT_ENDINGS = {
+  reboot: "Previous boot ended with a reboot.",
+  shutdown: "Previous boot ended with a shutdown.",
+  daemon_stopped: "The daemon was stopped earlier; how the Pi went down was not recorded.",
+  unexpected: "Previous boot ended unexpectedly (power loss, crash, or watchdog reset).",
+};
+
+function formatDowntime(ms) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) {
+    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+  }
+  return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
+}
+
+// Returns [label, pillKind, details]; details is already HTML-escaped.
+function describeEvent(event) {
+  const detail = event.detail ?? {};
+  switch (event.kind) {
+    case "boot": {
+      const previous = detail.previous_boot;
+      if (!previous) return ["Pi booted", "neutral", "First boot recorded."];
+      const ending = PREVIOUS_BOOT_ENDINGS[previous.ended] ?? escapeHtml(previous.ended);
+      const downtime = formatDowntime(event.occurred_at_unix_ms - previous.last_event_at_unix_ms);
+      return [
+        "Pi booted",
+        previous.ended === "unexpected" ? "bad" : "neutral",
+        `${ending} Down for about ${downtime}.`,
+      ];
+    }
+    case "reboot":
+      return ["Pi rebooting", "neutral", escapeHtml(detail.target ?? "")];
+    case "shutdown":
+      return ["Pi shutting down", "neutral", escapeHtml(detail.target ?? "")];
+    case "daemon_start":
+      return ["Daemon started", "good", `Version ${escapeHtml(detail.version ?? "?")}`];
+    case "daemon_stop":
+      return ["Daemon stopped", "neutral", ""];
+    case "reboot_requested":
+      return ["Reboot requested", "neutral", "From the dashboard"];
+    case "shutdown_requested":
+      return ["Shutdown requested", "neutral", "From the dashboard"];
+    case "daemon_restart_requested":
+      return ["Daemon restart requested", "neutral", "From the dashboard"];
+    case "request_failed":
+      return [
+        "Request failed",
+        "bad",
+        `${escapeHtml(detail.action ?? "?")}: ${escapeHtml(detail.error ?? "")}`,
+      ];
+    default:
+      return [escapeHtml(event.kind), "neutral", ""];
+  }
+}
+
+async function loadEvents() {
+  eventsElements.body.innerHTML =
+    '<tr><td colspan="3" class="empty-state">Loading&hellip;</td></tr>';
+  try {
+    const response = await fetch("/api/events?limit=50");
+    if (!response.ok) {
+      let message = `${response.status} ${response.statusText}`;
+      try {
+        const body = await response.json();
+        message = body.error || message;
+      } catch (_) {
+        // Keep the HTTP status when the response is not JSON.
+      }
+      throw new Error(message);
+    }
+    const { events } = await response.json();
+    if (events.length === 0) {
+      eventsElements.body.innerHTML =
+        '<tr><td colspan="3" class="empty-state">No system events recorded yet.</td></tr>';
+      return;
+    }
+    eventsElements.body.innerHTML = events
+      .map((event) => {
+        const when = new Date(event.occurred_at_unix_ms).toLocaleString();
+        const [label, kind, details] = describeEvent(event);
+        return `<tr><td>${when}</td><td><span class="pill ${kind}">${label}</span></td><td>${details}</td></tr>`;
+      })
+      .join("");
+  } catch (error) {
+    eventsElements.body.innerHTML = `<tr><td colspan="3" class="empty-state">Failed to load system events: ${escapeHtml(error.message)}</td></tr>`;
+  }
+}
+
+eventsElements.refresh.addEventListener("click", () => void loadEvents());
+void loadEvents();

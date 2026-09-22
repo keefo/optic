@@ -73,7 +73,7 @@ done
 if [[ $MODE == full ]]; then
     for path in Cargo.toml Cargo.lock rust-toolchain.toml README.md biome.json docs/optic-daemon-build-environment.md \
         docs/optic-daemon-camera.md docs/optic-daemon.md setup.md src systemd \
-        scripts/setup-optic-daemon-phase-01.sh; do
+        scripts/setup-optic-daemon-phase-01.sh scripts/setup-optic-daemon-system-service.sh; do
         [[ -e $PROJECT_ROOT/$path ]] || {
             printf 'Required project path is missing: %s\n' "$PROJECT_ROOT/$path" >&2
             exit 69
@@ -185,8 +185,15 @@ if [[ $MODE == full ]]; then
     for group in video render; do
         id -nG | tr ' ' '\n' | grep -qx "$group" || fail "liam is not in group $group"
     done
-    [[ $(loginctl show-user liam -p Linger --value 2>/dev/null || true) == yes ]] || \
-        fail 'systemd lingering is not enabled for liam'
+    # optic-daemon is a system service (docs/optic-daemon-system-service.md).
+    # Its unit files are installed by a root script, never by a deploy;
+    # refuse here, before the daemon is stopped for the build, if they drifted.
+    for unit_pair in \
+        "systemd/optic-daemon.service:/etc/systemd/system/optic-daemon.service" \
+        "systemd/systemd-time-wait-sync.service.d/optic-bounded-wait.conf:/etc/systemd/system/systemd-time-wait-sync.service.d/optic-bounded-wait.conf"; do
+        cmp -s "$SOURCE_DIR/${unit_pair%%:*}" "${unit_pair#*:}" || \
+            fail "${unit_pair#*:} is missing or differs from ${unit_pair%%:*}; run: sudo $SOURCE_DIR/scripts/setup-optic-daemon-system-service.sh"
+    done
 
     for command in cmp curl date dpkg-deb gcc g++ install ldd pkg-config python3 systemctl systemd-analyze; do
         command -v "$command" >/dev/null || fail "required Pi command is missing: $command"
@@ -224,14 +231,14 @@ if [[ $MODE == full ]]; then
     on_exit() {
         local status=$?
         [[ -z $CLIPPY_WRAPPER ]] || rm -f "$CLIPPY_WRAPPER"
-        systemctl --user is-active --quiet optic-daemon.service || \
-            systemctl --user start optic-daemon.service || true
+        systemctl is-active --quiet optic-daemon.service || \
+            systemctl start optic-daemon.service || true
         exit "$status"
     }
     trap on_exit EXIT
 
     printf '%s\n' '==> Stopping optic-daemon.service to free RAM for the build (dashboard/camera offline until reinstalled)'
-    systemctl --user stop optic-daemon.service || true
+    systemctl stop optic-daemon.service || true
 
     printf '%s\n' '==> Bootstrapping the pinned Rust toolchain'
     if ! command -v rustup >/dev/null; then
@@ -420,16 +427,11 @@ fi
 printf '%s\n' '==> Installing with rollback protection'
 backup_dir=$(mktemp -d "$HOME/.cache/optic-daemon-deploy.XXXXXX")
 had_binary=false
-had_unit=false
 had_web_assets=false
 if [[ $MODE == full ]]; then
     if [[ -f $HOME/.local/bin/optic-daemon ]]; then
         cp -p "$HOME/.local/bin/optic-daemon" "$backup_dir/optic-daemon"
         had_binary=true
-    fi
-    if [[ -f $HOME/.config/systemd/user/optic-daemon.service ]]; then
-        cp -p "$HOME/.config/systemd/user/optic-daemon.service" "$backup_dir/optic-daemon.service"
-        had_unit=true
     fi
 fi
 if [[ -d $HOME/.local/bin/web ]]; then
@@ -452,17 +454,10 @@ rollback() {
         cp -pr "$backup_dir/web" "$HOME/.local/bin/web"
     fi
     if [[ $MODE == full ]]; then
-        if [[ $had_unit == true ]]; then
-            install -m 0644 "$backup_dir/optic-daemon.service" \
-                "$HOME/.config/systemd/user/optic-daemon.service"
-            systemctl --user daemon-reload
-            systemctl --user restart optic-daemon.service
-        else
-            systemctl --user disable --now optic-daemon.service
-            rm -f "$HOME/.config/systemd/user/optic-daemon.service"
-            systemctl --user daemon-reload
-        fi
-        systemctl --user --no-pager --full status optic-daemon.service >&2
+        # The unit is not the deploy's to restore (it never changes it);
+        # restarting brings the previous binary back.
+        systemctl restart optic-daemon.service
+        systemctl --no-pager --full status optic-daemon.service >&2
     fi
     rm -rf "$backup_dir"
     exit 1
@@ -496,12 +491,12 @@ fi
 rm -f "$web_asset_diff"
 
 if [[ $MODE == full ]]; then
-    if ! systemctl --user is-enabled --quiet optic-daemon.service; then
+    if ! systemctl is-enabled --quiet optic-daemon.service; then
         printf '%s\n' 'optic-daemon.service is not enabled.' >&2
         rollback
     fi
 fi
-if ! systemctl --user is-active --quiet optic-daemon.service; then
+if ! systemctl is-active --quiet optic-daemon.service; then
     printf '%s\n' 'optic-daemon.service is not active.' >&2
     rollback
 fi
@@ -585,7 +580,7 @@ if ! grep -F '/api/system/status' <<<"$footer_js" >/dev/null; then
     rollback
 fi
 
-error_logs=$(journalctl --user -u optic-daemon.service --since "$deploy_started" \
+error_logs=$(journalctl -u optic-daemon.service --since "$deploy_started" \
     --priority err --quiet --no-pager -o cat || true)
 if [[ -n $error_logs ]]; then
     printf '%s\n' "$error_logs" >&2
@@ -599,7 +594,7 @@ fi
 rm -rf "$backup_dir"
 
 printf '%s\n' '==> Recent service log'
-journalctl --user -u optic-daemon.service -n 20 --no-pager
+journalctl -u optic-daemon.service -n 20 --no-pager
 if [[ $MODE == full ]]; then
     printf 'SUCCESS: optic-daemon %s is active at http://optic.local:8000/\n' "$VERSION"
 else

@@ -174,6 +174,10 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 - Do not use `orca worktree set --comment ...` without a selector (`orca worktree set --help` lists `--worktree <selector>` as required); use `orca worktree set --worktree current --comment ...` instead.
 - Do not use `git push origin main` (GitHub ruleset GH013: changes to `main` must go through a pull request with 2 required status checks); push a branch and open a pull request instead.
 - Do not use `$var:r`-style expansions such as `testsrc2=s=$sz:r=24` in zsh (zsh treats `:r` as a history modifier and strips it); use `${sz}` or run the command under `bash -c` instead.
+- Do not nest a `<<'EOF'` heredoc inside another `<<'EOF'` heredoc (the inner `EOF` line ends the outer one and zsh parses the rest as commands); give the outer heredoc a distinct delimiter such as `<<'PYEOF'` instead.
+- Do not use `timeout <secs> <cmd>` on the Mac (GNU coreutils `timeout` is not installed: `command not found`); for SSH use `-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2` and the Bash tool's own timeout instead.
+- Do not use `rg` in commands run on the Pi over SSH (not installed there: `rg: command not found`); use `grep -E` on the Pi and keep `rg` for the Mac checkout.
+- Do not put several SSH options in one shell variable such as `S="-o BatchMode=yes -o ConnectTimeout=10"; ssh $S host` (zsh does not word-split unquoted variables, so ssh gets one bad argument: `keyword batchmode extra arguments at end of line`); write the `-o` options out inline instead.
 
 ## Orca Worktree Completion Rules
 - When the task, PR, or assigned scope is finished:

@@ -25,6 +25,7 @@ use crate::{
     optic_alerts::{AlertsHandle, AlertsStatus},
     optic_camera::{CameraBackendKind, OpticCamera},
     optic_capture_log::{CaptureHealthStatus, CaptureLog, CaptureLogEntry, CaptureQueryFilter},
+    optic_events::{SystemEvent, SystemEventKind, SystemEventLog},
     optic_scheduler::{
         self, CelestialTarget, LunarEvent, MilkyWayEvent, SchedulerHandle, SchedulerStatus,
         SchedulerUnavailable, SolarEvent, Station,
@@ -64,6 +65,9 @@ pub struct AppState {
     asset_dir: Arc<PathBuf>,
     sensor: Option<String>,
     started: Instant,
+    /// Records the Power menu and Restart daemon requests; `None` when the
+    /// event log could not be opened.
+    events: Option<SystemEventLog>,
 }
 
 impl AppState {
@@ -99,6 +103,18 @@ impl AppState {
             asset_dir: Arc::new(asset_dir),
             sensor,
             started: Instant::now(),
+            events: None,
+        }
+    }
+
+    pub fn with_events(mut self, events: Option<SystemEventLog>) -> Self {
+        self.events = events;
+        self
+    }
+
+    async fn record_event(&self, kind: SystemEventKind, detail: serde_json::Value) {
+        if let Some(events) = &self.events {
+            events.record(kind, detail).await;
         }
     }
 }
@@ -128,6 +144,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/captures", get(capture_history))
         .route("/api/system/status", get(system_status_handler))
         .route("/api/system/reboot", post(system_reboot))
+        .route("/api/system/shutdown", post(system_shutdown))
         .route("/api/system/restart-daemon", post(system_restart_daemon))
         .route("/api/system/ntp-sync", post(system_ntp_sync))
         .route("/api/system/timezone", post(system_set_timezone))
@@ -138,6 +155,41 @@ pub fn router(state: AppState) -> Router {
 
 /// Read-only health-alert state (`docs/optic-daemon-alerts.md` §8). Its own
 /// small router, merged in `main.rs`, so `AppState` doesn't change.
+/// Read-only system event history (`docs/optic-daemon-system-events.md`).
+/// Its own small router, like `alerts_router`, so it can be tested without
+/// a camera-backed `AppState`.
+pub fn events_router(events: Option<SystemEventLog>) -> Router {
+    Router::new()
+        .route("/api/events", get(list_events))
+        .with_state(events)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EventsParams {
+    limit: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct EventsResponse {
+    events: Vec<SystemEvent>,
+}
+
+async fn list_events(
+    State(events): State<Option<SystemEventLog>>,
+    Query(params): Query<EventsParams>,
+) -> Result<Json<EventsResponse>, AppError> {
+    let Some(events) = events else {
+        return Err(AppError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "the system event log is unavailable on this daemon".to_owned(),
+        });
+    };
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    Ok(Json(EventsResponse {
+        events: events.list(limit).await,
+    }))
+}
+
 pub fn alerts_router(alerts: AlertsHandle) -> Router {
     Router::new()
         .route("/api/alerts", get(alerts_status))
@@ -783,14 +835,54 @@ async fn system_status_handler(State(state): State<AppState>) -> Json<SystemStat
     })
 }
 
-async fn system_reboot() -> Result<impl IntoResponse, AppError> {
-    system_status::reboot_host().await?;
+// Each request is recorded before its command runs: a successful reboot or
+// shutdown may stop this process before anything after it executes.
+async fn system_reboot(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    state
+        .record_event(
+            SystemEventKind::RebootRequested,
+            serde_json::json!({ "source": "dashboard" }),
+        )
+        .await;
+    if let Err(error) = system_status::reboot_host().await {
+        record_request_failure(&state, "reboot", &error).await;
+        return Err(error.into());
+    }
     Ok((StatusCode::OK, Json(Message::new("rebooting"))))
 }
 
-async fn system_restart_daemon() -> impl IntoResponse {
+async fn system_shutdown(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    state
+        .record_event(
+            SystemEventKind::ShutdownRequested,
+            serde_json::json!({ "source": "dashboard" }),
+        )
+        .await;
+    if let Err(error) = system_status::power_off_host().await {
+        record_request_failure(&state, "shutdown", &error).await;
+        return Err(error.into());
+    }
+    Ok((StatusCode::OK, Json(Message::new("shutting down"))))
+}
+
+async fn system_restart_daemon(State(state): State<AppState>) -> impl IntoResponse {
+    state
+        .record_event(
+            SystemEventKind::DaemonRestartRequested,
+            serde_json::json!({ "source": "dashboard" }),
+        )
+        .await;
     system_status::restart_daemon_detached();
     (StatusCode::OK, Json(Message::new("restarting")))
+}
+
+async fn record_request_failure(state: &AppState, action: &str, error: &std::io::Error) {
+    state
+        .record_event(
+            SystemEventKind::RequestFailed,
+            serde_json::json!({ "action": action, "error": error.to_string() }),
+        )
+        .await;
 }
 
 async fn system_ntp_sync() -> Result<impl IntoResponse, AppError> {
@@ -1459,6 +1551,15 @@ mod tests {
     const INDEX_HTML: &str = include_str!("web/index.html");
     const APP_JS: &str = include_str!("web/app.js");
     const STYLES_CSS: &str = include_str!("web/styles.css");
+    const FOOTER_JS: &str = include_str!("web/footer.js");
+    const CAPTURE_HISTORY_HTML: &str = include_str!("web/capture-history.html");
+    const CAPTURE_HISTORY_JS: &str = include_str!("web/capture-history.js");
+    const FOOTER_PAGES: [(&str, &str); 4] = [
+        ("index.html", INDEX_HTML),
+        ("scheduler.html", include_str!("web/scheduler.html")),
+        ("capture-history.html", CAPTURE_HISTORY_HTML),
+        ("config.html", include_str!("web/config.html")),
+    ];
 
     fn unique_temp_dir(label: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1552,6 +1653,79 @@ mod tests {
         assert!(!INDEX_HTML.contains("Preview ends automatically"));
         assert!(!APP_JS.contains("watchdog limit"));
         assert!(STYLES_CSS.contains(":root"));
+    }
+
+    #[test]
+    fn every_page_footer_has_one_power_menu() {
+        // The handlers themselves are not called here: on a Linux runner
+        // they would really try to reboot or power the machine off.
+        assert!(FOOTER_JS.contains("\"/api/system/reboot\""));
+        assert!(FOOTER_JS.contains("\"/api/system/shutdown\""));
+        assert!(FOOTER_JS.contains("#footer-power-menu"));
+        for (name, html) in FOOTER_PAGES {
+            assert_eq!(
+                html.matches("id=\"footer-power\"").count(),
+                1,
+                "{name} needs exactly one Power button"
+            );
+            assert!(
+                html.contains("aria-label=\"Power\""),
+                "{name}: the icon-only Power button needs an accessible name"
+            );
+            let menu = html
+                .find("id=\"footer-power-menu\"")
+                .unwrap_or_else(|| panic!("{name} has no Power menu"));
+            let reboot = html
+                .find("id=\"footer-reboot\"")
+                .unwrap_or_else(|| panic!("{name} has no Reboot item"));
+            let shutdown = html
+                .find("id=\"footer-shutdown\"")
+                .unwrap_or_else(|| panic!("{name} has no Shut down item"));
+            assert!(
+                menu < reboot && reboot < shutdown,
+                "{name}: the menu must hold Reboot, then Shut down"
+            );
+            assert!(!html.contains("Reboot Pi"), "{name}: old Reboot Pi label");
+            assert!(!html.contains("Shut down Pi"), "{name}: old label");
+        }
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_lists_newest_first_and_clamps_the_limit() {
+        let dir = unique_temp_dir("events-endpoint");
+        let log = SystemEventLog::open(&dir.join("events.db"), None).unwrap();
+        log.record_startup("test").await;
+        log.record(SystemEventKind::RebootRequested, serde_json::json!({}))
+            .await;
+
+        let Json(body) = list_events(
+            State(Some(log.clone())),
+            Query(EventsParams { limit: Some(9999) }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the event log is available"));
+        let kinds: Vec<_> = body.events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["reboot_requested", "daemon_start"]);
+
+        let Json(one) = list_events(State(Some(log)), Query(EventsParams { limit: Some(1) }))
+            .await
+            .unwrap_or_else(|_| panic!("the event log is available"));
+        assert_eq!(one.events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn events_endpoint_reports_a_missing_log() {
+        let error = list_events(State(None), Query(EventsParams { limit: None }))
+            .await
+            .err()
+            .expect("no log means an error");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn capture_history_page_shows_system_events() {
+        assert!(CAPTURE_HISTORY_HTML.contains("id=\"events-body\""));
+        assert!(CAPTURE_HISTORY_JS.contains("/api/events"));
     }
 
     #[test]

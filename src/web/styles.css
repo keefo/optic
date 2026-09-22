@@ -282,6 +282,38 @@ footer { padding: 0 0 36px; color: var(--muted); font-size: 0.78rem; text-align:
 }
 .system-footer .button-row { gap: 8px; }
 .system-footer button { padding: 6px 12px; font-size: 0.78rem; }
+/* Footer Power menu (footer.js). Opens upward: the footer is the last
+   thing on the page, so there is no room below it. */
+.power-menu { position: relative; }
+/* Icon-only; its name comes from aria-label/title. Padding matches the
+   footer's other buttons vertically so the row stays one height. */
+#footer-power { display: inline-flex; align-items: center; justify-content: center; padding: 6px 9px; }
+.power-icon { flex: none; }
+.power-menu-list {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  min-width: 132px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.system-footer .power-menu-list button {
+  min-height: 36px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+.system-footer .power-menu-list button:hover:not(:disabled),
+.system-footer .power-menu-list button:focus-visible {
+  transform: none;
+  background: var(--panel-raised);
+}
 /* Monospace specifically because this text ticks every second (see
    footer.js/config.js's tickCurrentTime) — a proportional font
    reflows/jitters as digits with different widths cycle in place; every

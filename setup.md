@@ -140,6 +140,8 @@ ssh liam@optic.local 'chmod 700 /home/liam/.local/bin/optic-setup-phase-02-memor
 ssh -t liam@optic.local '/home/liam/.local/bin/optic-setup-phase-02-memory --reboot'
 ```
 
+The same script also re-enables the kernel memory cgroup: the firmware prepends `cgroup_disable=memory`, so it appends `cgroup_enable=memory` to `/boot/firmware/cmdline.txt` (backed up, kept on one line). This makes systemd's `MemoryHigh=`/`MemoryMax=` limits (optic-daemon's 350/500 MiB) take effect, and gives Beszel per-service memory. There must be no swap on the SD card: a hand-added `/var/swap.img` line in `/etc/fstab` was found and disabled on 2026-09-21. A real on-Pi release build (LTO) still fit in RAM + zram, at 25 MiB available at its peak (`worklogs/2026-09-21-system-service-migration.md`).
+
 The native swap generator requires a reboot to replace the active zram device. After `optic` returns, verify only Phase 2:
 
 ```bash
@@ -564,35 +566,48 @@ LD_LIBRARY_PATH="$OPTIC_NATIVE_LIB" cargo build --locked --release
 '
 ```
 
-The setup script runs as `liam`, installs `/home/liam/.local/bin/optic-daemon`, and enables `/home/liam/.config/systemd/user/optic-daemon.service`. It requires the Phase 6 tmpfs, `video` and `render` group membership, and administrator-provisioned `Linger=yes`.
+The setup script runs as `liam`: it installs `/home/liam/.local/bin/optic-daemon` and the web assets, and restarts the **system** service `optic-daemon.service` (`User=liam`) through PolicyKit rule 64 (§G). It requires the Phase 6 tmpfs, `video` and `render` group membership, and the system unit already installed. It refuses to run if `/etc/systemd/system/optic-daemon.service` or the time-wait-sync drop-in differs from `systemd/`.
+
+The unit itself is installed once, as root, by `scripts/setup-optic-daemon-system-service.sh`. That script also migrates from the former user service, enables the bounded NTP wait, checks health with the camera detected, and rolls back automatically on failure. Run §G first, then, from a staged source tree on the Pi:
+
+```bash
+ssh -t liam@optic.local 'sudo ~/.local/src/optic-daemon/scripts/setup-optic-daemon-system-service.sh --dry-run'
+ssh -t liam@optic.local 'sudo ~/.local/src/optic-daemon/scripts/setup-optic-daemon-system-service.sh'
+# Return to the user service if needed:
+ssh -t liam@optic.local 'sudo ~/.local/src/optic-daemon/scripts/setup-optic-daemon-system-service.sh --rollback'
+```
+
+Design and rationale: `docs/optic-daemon-system-service.md`.
 
 Validate the service and open the dashboard:
 
 ```bash
 ssh liam@optic.local '
-systemctl --user is-enabled optic-daemon.service
-systemctl --user is-active optic-daemon.service
+systemctl is-enabled optic-daemon.service
+systemctl is-active optic-daemon.service
 curl --fail http://127.0.0.1:8000/healthz
 curl --fail http://127.0.0.1:8000/api/status
 '
 open http://optic.local:8000/
 ```
 
-TCP `8000` is the canonical endpoint. The validated Pi reserves ports below `1024` for privileged processes, nothing listens on port `80`, and the user service intentionally remains unprivileged. Do not document `http://optic.local/` unless an administrator later installs and validates a port-80 proxy or redirect.
+TCP `8000` is the canonical endpoint. The validated Pi reserves ports below `1024` for privileged processes, nothing listens on port `80`, and the service intentionally runs unprivileged as `liam`. Do not document `http://optic.local/` unless an administrator later installs and validates a port-80 proxy or redirect.
 
-The deployed unit is enabled and `Linger=yes`, and a controlled user-service restart was validated. Full reboot persistence was later confirmed: the dashboard's Reboot button (backed by a scoped PolicyKit rule) rebooted the Pi and the daemon came back automatically (`worklogs/2026-09-19-reboot-nonewprivileges-fix.md`, `worklogs/2026-09-19-timelapse-scheduler-phase1b.md`).
+The daemon ran as a user service with `Linger=yes` until 2026-09-21, when it moved to a system service (`docs/optic-daemon-system-service.md`). Full reboot persistence was later confirmed: the dashboard's Reboot button (backed by a scoped PolicyKit rule) rebooted the Pi and the daemon came back automatically (`worklogs/2026-09-19-reboot-nonewprivileges-fix.md`, `worklogs/2026-09-19-timelapse-scheduler-phase1b.md`).
 
 ### G. Grant the Daemon's Host Access
 
-The daemon's sandbox cannot use `sudo`, so the dashboard's **Reboot Pi**, the Config page's **NTP Sync now**, and the Station timezone save call systemd, logind, and timedated over D-Bus. PolicyKit authorizes each call through one narrow rule for `liam`:
+The daemon's sandbox cannot use `sudo`, so the footer Power menu's **Reboot** and **Shut down**, the Config page's **NTP Sync now**, and the Station timezone save call systemd, logind, and timedated over D-Bus. The Restart daemon button and deploys restart the system service the same way. PolicyKit authorizes each call through one narrow rule for `liam`:
 
 | Rule in `/etc/polkit-1/rules.d/` | Action allowed without a password |
 |----------------------------------|-----------------------------------|
 | `60-optic-daemon-reboot.rules` | `org.freedesktop.login1.reboot` |
 | `61-optic-daemon-ntp-sync.rules` | `org.freedesktop.systemd1.manage-units`, only `restart` of `systemd-timesyncd.service` |
 | `62-optic-daemon-set-timezone.rules` | `org.freedesktop.timedate1.set-timezone` |
+| `63-optic-daemon-power-off.rules` | `org.freedesktop.login1.power-off` |
+| `64-optic-daemon-manage-unit.rules` | `org.freedesktop.systemd1.manage-units`, only `start`/`stop`/`restart` of `optic-daemon.service` |
 
-The same script enables `Linger=yes` for `liam` and ensures `video` and `render` membership. It changes only what differs, backs up any rule it replaces to `/var/backups/optic-hardening/`, and needs no service restart because `polkitd` reloads its rules on change. After applying, it confirms with `pkcheck` that each action is authorized and that restarting a different unit still is not. Run it before §F on a fresh Pi:
+The same script enables `Linger=yes` for `liam` (still needed by the Beszel agent's user service) and ensures `video` and `render` membership. It changes only what differs, backs up any rule it replaces to `/var/backups/optic-hardening/`, and needs no service restart because `polkitd` reloads its rules on change. After applying, it confirms with `pkcheck` that each action is authorized and that restarting a different unit still is not. Run it before §F on a fresh Pi:
 
 ```bash
 scp /Users/admin/Documents/projects/optic/scripts/setup-phase-08-daemon-host-access.sh liam@optic.local:/home/liam/.local/bin/optic-setup-phase-08-daemon-host-access
@@ -601,7 +616,7 @@ ssh -t liam@optic.local 'sudo /home/liam/.local/bin/optic-setup-phase-08-daemon-
 ssh -t liam@optic.local '/home/liam/.local/bin/optic-setup-phase-08-daemon-host-access'
 ```
 
-The dry run needs `sudo` only to read the rules (on Debian 13, `rules.d` is `root:polkitd 0750`); it writes nothing. `verify.sh --phase 8` checks lingering and the reboot and timezone decisions as `liam`, and uses non-interactive `sudo -n` for the checks that need root (`pkcheck --detail` for the NTP rule's unit scope, and the rule files' mode).
+The dry run needs `sudo` only to read the rules (on Debian 13, `rules.d` is `root:polkitd 0750`); it writes nothing. `verify.sh --phase 8` checks lingering, the optic-daemon system unit, and the reboot, power-off, and timezone decisions as `liam`, and uses non-interactive `sudo -n` for the checks that need root (`pkcheck --detail` for the NTP and optic-daemon unit rules' scope, and the rule files' mode).
 
 The blanket `/etc/sudoers.d/liam-nopasswd` grant and `/etc/systemd/system.conf.d/90-watchdog-headroom.conf` are also hand-installed on the current Pi. Neither is provisioned by a script: the daemon does not use the sudoers grant, and the watchdog override contradicts Phase 3 (`worklogs/2026-09-20-provisioning.md`).
 

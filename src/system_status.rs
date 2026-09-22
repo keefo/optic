@@ -340,6 +340,24 @@ pub async fn reboot_host() -> std::io::Result<()> {
     }
 }
 
+/// Powers the host off via `systemctl poweroff`, the same D-Bus path as
+/// `reboot_host` (see its note on why not sudo). Requires the scoped
+/// PolicyKit rule granting the invoking user
+/// `org.freedesktop.login1.power-off` without interactive auth
+/// (`63-optic-daemon-power-off.rules`, from
+/// `scripts/setup-phase-08-daemon-host-access.sh`). A Pi 5 stays off until
+/// its power button is pressed or it is re-plugged.
+pub async fn power_off_host() -> std::io::Result<()> {
+    let status = Command::new("systemctl").arg("poweroff").status().await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "poweroff command exited with {status}"
+        )))
+    }
+}
+
 /// Forces an immediate NTP resync via `systemctl restart
 /// systemd-timesyncd.service` — the only real lever available:
 /// `systemd-timesyncd`'s own D-Bus interface
@@ -399,25 +417,46 @@ pub async fn set_system_timezone(timezone: &str) -> std::io::Result<()> {
     }
 }
 
-/// Restarts `optic-daemon.service` (no sudo needed — it's the invoking
-/// user's own systemd user service). The restart is spawned detached with
-/// a short delay so the HTTP response triggering it can be flushed to the
+/// `systemctl` arguments for restarting this daemon: the system service
+/// (docs/optic-daemon-system-service.md), authorized for this user by the
+/// scoped PolicyKit rule `64-optic-daemon-manage-unit.rules`. `--no-block`
+/// hands the job to systemd and returns at once, so the job does not
+/// depend on this `systemctl` process, which the restart itself kills.
+const RESTART_DAEMON_ARGS: [&str; 3] = ["--no-block", "restart", "optic-daemon.service"];
+
+/// Restarts `optic-daemon.service`. The restart is spawned detached with a
+/// short delay so the HTTP response triggering it can be flushed to the
 /// client before this process is killed by its own restart.
 pub fn restart_daemon_detached() {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        let _ = Command::new("systemctl")
-            .arg("--user")
-            .arg("restart")
-            .arg("optic-daemon.service")
+        match Command::new("systemctl")
+            .args(RESTART_DAEMON_ARGS)
             .status()
-            .await;
+            .await
+        {
+            // No exit code means systemctl was killed by a signal: the
+            // restart it queued stops this service's whole cgroup, which
+            // can include systemctl itself before it exits. That is success.
+            Ok(status) if status.success() || status.code().is_none() => {}
+            Ok(status) => tracing::warn!(%status, "optic-daemon restart request failed"),
+            Err(error) => tracing::warn!(%error, "could not run systemctl to restart optic-daemon"),
+        }
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_targets_the_system_service_without_blocking() {
+        assert_eq!(
+            RESTART_DAEMON_ARGS,
+            ["--no-block", "restart", "optic-daemon.service"]
+        );
+        assert!(!RESTART_DAEMON_ARGS.contains(&"--user"));
+    }
 
     #[test]
     fn best_matching_disk_picks_longest_prefix_match() {

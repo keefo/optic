@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 
-# Install the Phase 1 optic-daemon binary as liam's persistent systemd user service.
+# Install the optic-daemon binary and web assets as liam and restart the
+# system service (docs/optic-daemon-system-service.md). Unit files are not
+# touched here: they are installed by the root script
+# scripts/setup-optic-daemon-system-service.sh, and this script refuses to
+# run if the installed ones differ from systemd/.
 
 set -euo pipefail
 
@@ -10,9 +14,11 @@ export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 PROJECT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BINARY="$PROJECT_ROOT/target/release/optic-daemon"
 UNIT_SOURCE="$PROJECT_ROOT/systemd/optic-daemon.service"
+UNIT_TARGET="/etc/systemd/system/optic-daemon.service"
+DROPIN_SOURCE="$PROJECT_ROOT/systemd/systemd-time-wait-sync.service.d/optic-bounded-wait.conf"
+DROPIN_TARGET="/etc/systemd/system/systemd-time-wait-sync.service.d/optic-bounded-wait.conf"
 WEB_ASSETS_DIR="$PROJECT_ROOT/src/web"
 INSTALL_DIR="$HOME/.local/bin"
-UNIT_DIR="$HOME/.config/systemd/user"
 STATE_DIR="$HOME/.local/state/optic-daemon"
 RUNTIME_LIBRARY_DIR="$HOME/.local/optic-sysroot/usr/lib/aarch64-linux-gnu"
 EXPECTED_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$PROJECT_ROOT/Cargo.toml" | head -n 1)
@@ -21,8 +27,10 @@ usage() {
     cat <<'EOF'
 Usage: setup-optic-daemon-phase-01.sh [--binary FILE] [--help]
 
-Installs and starts optic-daemon for the current user. Run this script as liam,
-not with sudo. The systemd user manager must have lingering enabled.
+Installs the optic-daemon binary and web assets and restarts the system
+service. Run this script as liam, not with sudo. The system unit must already
+be installed by setup-optic-daemon-system-service.sh, and restarting it is
+authorized by PolicyKit rule 64 (setup-phase-08-daemon-host-access.sh).
 EOF
 }
 
@@ -63,8 +71,15 @@ for group in video render; do
         exit 69
     }
 done
+for pair in "$UNIT_SOURCE:$UNIT_TARGET" "$DROPIN_SOURCE:$DROPIN_TARGET"; do
+    cmp -s "${pair%%:*}" "${pair#*:}" || {
+        printf '%s is missing or differs from %s.\n' "${pair#*:}" "${pair%%:*}" >&2
+        printf 'Install it with: sudo %s/scripts/setup-optic-daemon-system-service.sh\n' "$PROJECT_ROOT" >&2
+        exit 69
+    }
+done
 
-install -d -m 0755 "$INSTALL_DIR" "$UNIT_DIR"
+install -d -m 0755 "$INSTALL_DIR"
 # optic_capture_log's history.db lives here; systemd's ReadWritePaths=
 # in the unit requires the path to already exist before the service
 # starts, so it must be created here rather than left for the daemon
@@ -82,12 +97,11 @@ cp -r "$WEB_ASSETS_DIR/." "$INSTALL_DIR/web/"
 find "$INSTALL_DIR/web" -type d -exec chmod 0755 {} +
 find "$INSTALL_DIR/web" -type f -exec chmod 0644 {} +
 
-install -m 0644 "$UNIT_SOURCE" "$UNIT_DIR/optic-daemon.service"
-
-systemd-analyze --user verify "$UNIT_DIR/optic-daemon.service"
-systemctl --user daemon-reload
-systemctl --user enable optic-daemon.service
-systemctl --user restart optic-daemon.service
+systemctl is-enabled --quiet optic-daemon.service || {
+    printf '%s\n' 'optic-daemon.service is not enabled; run setup-optic-daemon-system-service.sh.' >&2
+    exit 69
+}
+systemctl restart optic-daemon.service
 
 for _ in {1..20}; do
     if status=$(curl -fsS --max-time 2 http://127.0.0.1:8000/api/status 2>/dev/null); then
@@ -100,6 +114,6 @@ for _ in {1..20}; do
     sleep 0.5
 done
 
-systemctl --user --no-pager --full status optic-daemon.service >&2 || true
+systemctl --no-pager --full status optic-daemon.service >&2 || true
 printf 'optic-daemon did not become healthy at expected version %s.\n' "$EXPECTED_VERSION" >&2
 exit 1
