@@ -210,11 +210,10 @@ constraint type per rule" a structural, compile-time guarantee rather than
 something a runtime validator has to catch, since duplicating a type would
 be redundant anyway (two `SunElevationWindow`s, say, could only narrow or
 exactly duplicate each other under AND-composition, never add anything a
-single range can't already express). `time_window` is the only field
-implemented today (Phase 1, live in `src/optic_scheduler.rs`); the rest
-are Phase 2+ and exist only here for now, as a preview of the fields this
-struct grows into — each gets added as its own named field when actually
-implemented, not stubbed out in advance. They're introduced alongside
+single range can't already express). All five fields are
+implemented (`time_window` in Phase 1, the celestial windows in Phase 2;
+`src/optic_scheduler.rs`), each added as its own named field when it was
+implemented rather than stubbed out in advance. They're introduced alongside
 `Trigger`'s celestial targets above, rather than scattered later in this
 document, so the full data model reads as one piece:
 

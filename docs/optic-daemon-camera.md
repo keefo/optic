@@ -8,8 +8,8 @@
 > **Implementation status (2026-09-16):** The source now connects `optic_camera`
 > to a persistent native `libcamera` owner with bounded preview delivery,
 > serialized still reconfiguration, JPEG/DNG encoding, and staged publication.
-> Linux compilation and an end-to-end IMX477 capture cycle pass; transition soak
-> testing and deployment remain.
+> Linux compilation and an end-to-end IMX477 capture cycle pass. Deployed
+> since 0.1.3 (`worklogs/2026-09-16-native-camera-refactor.md`).
 
 ### Implementation sequence
 

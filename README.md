@@ -1,6 +1,6 @@
 # Project Optic
 
-Optic is an ultra-reliable, long-term timelapse system engineered around the Raspberry Pi 5 (1GB) and Raspberry Pi High Quality Camera, fitted with an official 6mm f/1.2 CS-mount wide-angle lens (PT361060M3MP12). Running on a stripped-down, headless Raspberry Pi OS Lite environment, Optic is architected for 365 days of unattended operation—pairing minimal memory overhead with read-only root safeguards (OverlayFS) to prevent file corruption and memory leaks across year-long captures.
+Optic is an ultra-reliable, long-term timelapse system engineered around the Raspberry Pi 5 (1GB) and Raspberry Pi High Quality Camera, fitted with an official 6mm f/1.2 CS-mount wide-angle lens (PT361060M3MP12). Running on a stripped-down, headless Raspberry Pi OS Lite environment, Optic is architected for 365 days of unattended operation—pairing minimal memory overhead with a planned read-only root (OverlayFS, Phase 9; not yet enabled, see `docs/phase9-readonly-root.md`) to prevent file corruption across year-long captures.
 
 ## Specifications
 
@@ -9,7 +9,7 @@ Optic is an ultra-reliable, long-term timelapse system engineered around the Ras
 * **CPU:** Broadcom BCM2712 (Quad-core Arm Cortex-A76 @ 2.4GHz)
 * **Memory:** 1 GB LPDDR4X-4267 SDRAM
 * **Operating System:** Raspberry Pi OS Lite (64-bit, Debian base, headless)
-* **Filesystem Architecture:** Read-only root via OverlayFS with isolated write target for capture storage
+* **Filesystem Architecture:** Writable ext4 root today, with RAM-backed `/mnt/capture` for capture staging; read-only OverlayFS root is planned (Phase 9, `docs/phase9-readonly-root.md`)
 
 ### Imaging & Optics
 * **Sensor:** Raspberry Pi High Quality Camera (Sony IMX477)
@@ -45,11 +45,11 @@ ssh liam@optic.local 'bash -s -- --color' < verify.sh
 
 Results use green `PASS`, yellow `WARN`, red `FAIL`, and cyan `INFO` labels. Use `--no-color` for plain output. No settings are changed and no secret values are displayed.
 
-Run one phase at a time with `--phase 1` through `--phase 9`. Phase 7 battery configuration is skipped on this deployment, Phase 8 commissions the HQ Camera, and Phase 9 enables OverlayFS. Reusable setup scripts are stored in `/Users/admin/Documents/projects/optic/scripts` where automation is appropriate.
+Run one phase at a time with `--phase 1` through `--phase 9`. Phase 7 battery configuration is skipped on this deployment, Phase 8 commissions the HQ Camera, and Phase 9 (OverlayFS) is planned but not yet enabled. Reusable setup scripts are stored in `/Users/admin/Documents/projects/optic/scripts` where automation is appropriate.
 
 ## Camera Daemon
 
-The `optic-daemon` Phase 1 source provides the embedded camera dashboard, IMX477 status, validated camera controls, profile-aware MJPEG previews and test shots, and atomic publication to the Phase 6 RAM transfer stage. Camera requests enter the bounded FIFO `optic_camera` actor and use one persistent native `libcamera` owner for preview and still capture. Master Archive previews at the full `4056 × 3040` resolution at 2 FPS; 4K DCI and 2K Binning use aspect-correct `1352 × 720` and `1014 × 760` previews at up to 8 FPS. Still captures remain Master Archive (`4056 × 3040`, JPEG Q100 + DNG), 4K DCI (`4056 × 2160`, JPEG Q95 with optional DNG), and 2K Binning (`2028 × 1520`, JPEG Q85). The installed service remains on the previous backend until this source is deployed after soak testing. It runs as `liam`'s persistent systemd user service and is intentionally exposed on unprivileged TCP port `8000`; nothing listens on port `80`.
+`optic-daemon` provides the camera dashboard, IMX477 status, validated camera controls, profile-aware MJPEG previews and test shots, and atomic publication to the Phase 6 RAM stage, plus the timelapse scheduler (`optic_scheduler`), in-process transfer to the iMac (`optic_sync`), capture history, and health alerts. Camera requests enter the bounded FIFO `optic_camera` actor and use one persistent native `libcamera` owner for preview and still capture. Master Archive previews at the full `4056 × 3040` resolution at 2 FPS; 4K DCI and 2K Binning use aspect-correct `1352 × 720` and `1014 × 760` previews at up to 8 FPS. Still captures remain Master Archive (`4056 × 3040`, JPEG Q100 + DNG), 4K DCI (`4056 × 2160`, JPEG Q95 with optional DNG), and 2K Binning (`2028 × 1520`, JPEG Q85). The native backend has been deployed since 0.1.3 (`worklogs/2026-09-16-native-camera-refactor.md`). It runs as `liam`'s persistent systemd user service and is intentionally exposed on unprivileged TCP port `8000`; nothing listens on port `80`.
 
 ```bash
 ssh liam@optic.local 'systemctl --user status optic-daemon.service'

@@ -3,8 +3,8 @@
 This is the canonical native build and deployment runbook for `optic-daemon`.
 Run these commands on `liam@optic.local`, not on the macOS development host.
 
-The environment was last verified on 2026-09-16. The current release source is
-staged under `/home/liam/.local/src/optic-daemon-0.1.3`.
+The environment was last verified on 2026-09-16. The deploy script stages each
+release's source under `/home/liam/.local/src/optic-daemon-<version>`.
 
 ## Validated Baseline
 
@@ -101,7 +101,7 @@ Set the source directory to the versioned release staged on the Pi:
 
 ```bash
 ssh liam@optic.local
-cd /home/liam/.local/src/optic-daemon-0.1.3
+cd /home/liam/.local/src/optic-daemon-<version>
 
 export PATH="$HOME/.cargo/bin:$PATH"
 export OPTIC_SYSROOT="$HOME/.local/optic-sysroot"

@@ -4,7 +4,7 @@
 
 It organizes the operational lifecycle of a 365-day autonomous timelapse into **three strictly decoupled subsystems** that communicate primarily via the persistent filesystem (`/mnt/capture`) and a single shared hardware mutex.
 
-> **Implementation status:** The three-subsystem design below is the target architecture. All three subsystems are now implemented and deployed, but in places differ from the target design below. `optic_web` was validated on 2026-09-16. `optic_scheduler` is implemented as the composable-rules design in [`docs/optic-daemon-scheduler.md`](optic-daemon-scheduler.md), which supersedes §5's single-mode design (see `worklogs/2026-09-19-timelapse-scheduler-phase1*.md` and `worklogs/2026-09-20-scheduler-phase2*.md`). `optic_sync` (Data Sync Manager) **is now implemented in-process** (see [section 6](#6-subsystem-3-data-sync-manager-optic_sync)) — but its actual protocol and configuration differ from the target design below: it reuses the existing restricted-SSH `ping`/`put` transport (`scripts/optic-capture-receiver.sh`, unchanged) rather than `scp`/`rsync` to `imac.local`, and is configured via `OPTIC_SYNC_*` environment variables rather than `config.toml` (which does not exist — see `worklogs/2026-09-18-data-sync-manager.md` for the full rationale). The older Phase 6 transfer script (`scripts/optic-capture-transfer.sh`) remains in the repository, but as of 2026-09-20 no systemd timer or service for it is installed on the Pi (`worklogs/2026-09-20-stale-iMac-ip-beszel-and-sync.md`), so `optic_sync` is the only live transfer path.
+> **Implementation status:** The three-subsystem design below is the target architecture. All three subsystems are now implemented and deployed, but in places differ from the target design below. `optic_web` was validated on 2026-09-16. `optic_scheduler` is implemented as the composable-rules design in [`docs/optic-daemon-scheduler.md`](optic-daemon-scheduler.md), which supersedes §5's single-mode design (see `worklogs/2026-09-19-timelapse-scheduler-phase1*.md` and `worklogs/2026-09-20-scheduler-phase2*.md`). `optic_sync` (Data Sync Manager) **is now implemented in-process** (see [section 6](#6-subsystem-3-data-sync-manager-optic_sync)) — but its actual protocol and configuration differ from the target design below: it reuses the existing restricted-SSH `ping`/`put` transport (`scripts/optic-capture-receiver.sh`, unchanged) rather than `scp`/`rsync` to `imac.local`, and is configured via `OPTIC_SYNC_*` environment variables rather than `config.toml` (which does not exist — see `worklogs/2026-09-18-data-sync-manager.md` for the full rationale). The retired Phase 6 shell transfer (`scripts/optic-capture-transfer.sh`, the system units `optic-capture-transfer.timer`/`.service`) is **still installed and enabled on the Pi** as of 2026-09-21; an earlier check looked only at user units and missed it. It fails every run because it still targets `192.168.0.231`, but it must be disabled: it ships and deletes every non-hidden file in `/mnt/capture` (including `preview_config.json`) and would race `optic_sync` if that address answered. `verify.sh` Phase 6 fails while it is enabled (`worklogs/2026-09-21-post-merge-drift-fixes.md`).
 
 ## Deployed Phase 1
 
@@ -14,10 +14,7 @@ The current source serves the dashboard from disk (see [dynamic web asset loadin
 * Validated rotation, flip, AWB, metering, exposure, EV, gain, shutter, and denoise controls.
 * A bounded FIFO `optic_camera` actor that is the sole camera entry point for `optic_web`; it owns a persistent native `libcamera` backend and serializes preview and still pipeline transitions.
 * A full-resolution `4056 × 3040` Master Archive MJPEG preview at 2 FPS, plus lower-bandwidth profile-correct 4K DCI and 2K previews at up to 8 FPS.
-* Profile-specific JPEG and optional DNG captures published as `testshot-<profile>-*` in `/mnt/capture` for `optic_sync`/the existing verified transfer timer. (Named `testshot-` — not `optic-web-` — to make manually-triggered captures from the dashboard easy to distinguish from real timelapse frames once `optic_scheduler` exists; see `worklogs/2026-09-18-data-sync-manager.md`. The dedicated "Profile test shot" preview-only button/`POST /api/test-shot` endpoint was removed as unused — "Capture & transfer" is now the only capture control.)
-
-The installed service remains on the previously validated CLI backend until the
-native source completes soak testing and deployment.
+* Profile-specific JPEG and optional DNG captures published as `testshot-<profile>-*` in `/mnt/capture` for `optic_sync`. (Named `testshot-` — not `optic-web-` — to make manually-triggered captures from the dashboard easy to distinguish from real timelapse frames once `optic_scheduler` exists; see `worklogs/2026-09-18-data-sync-manager.md`. The dedicated "Profile test shot" preview-only button/`POST /api/test-shot` endpoint was removed as unused — "Capture & transfer" is now the only capture control.)
 
 The canonical LAN URL is [http://optic.local:8000/](http://optic.local:8000/). Phase 1 runs as an unprivileged systemd user service. On the validated Pi, `net.ipv4.ip_unprivileged_port_start=1024`, no process listens on TCP port `80`, and noninteractive sudo is unavailable; port `80` is therefore not part of this deployment.
 
@@ -288,10 +285,22 @@ The dashboard does not expose a separate JPEG-quality override. Quality is part 
 * `POST /api/stream/reconfigure`: Accepts camera `settings` plus `profile` and serializes a native pipeline stop/reconfiguration/start. Returns `409 Conflict` if preview is not running.
 * `POST /api/stream/stop`: Used by dashboard page teardown to stop the native request loop and leave the acquired camera ready for reconfiguration; it is not exposed as a manual UI control.
 * `GET /api/stream/mjpeg`: Multipart MJPEG video feed for direct browser `<img>` rendering during lens tuning.
-* `POST /api/capture`: Accepts camera settings plus `profile` (`master_archive`, `dci_4k`, or `binning_2k`) and `save_dng`. It captures to hidden files under `/mnt/capture`, applies mode `0640`, and atomically renames the JPEG and any DNG for the transfer timer. The response lists every queued file and the aggregate byte count.
+* `POST /api/capture`: Accepts camera settings plus `profile` (`master_archive`, `dci_4k`, or `binning_2k`) and `save_dng`. It captures to hidden files under `/mnt/capture`, applies mode `0640`, and atomically renames the JPEG and any DNG for `optic_sync`. The response lists every queued file and the aggregate byte count.
 * `POST /api/sync/pause`: Pauses `optic_sync`'s drain loop (it keeps scanning and reporting queue depth, but stops attempting transfers) and returns the fresh sync status.
 * `POST /api/sync/resume`: Un-pauses `optic_sync` and returns the fresh sync status.
 * `POST /api/sync/retry-now`: Clears any active backoff so the next scan attempts a transfer immediately, and returns the fresh sync status.
+* `POST /api/config/commit`, `POST /api/config/discard`: Commit or discard the staged `preview_config.json` (camera settings and scheduler rules) against the durable committed config.
+* `POST /api/config/save-dng`: Stages the companion-DNG preference for committed-config captures.
+* `POST /api/schedule/pause`, `POST /api/schedule/resume`: Pause or resume `optic_scheduler`; the run state is durable across reboots.
+* `POST /api/schedule/preview`: Stages rule edits and returns upcoming occurrences plus advisories; invalid or duplicate slugs are rejected immediately (`docs/optic-daemon-scheduler.md`).
+* `GET /api/schedule/forecast`: Shot and storage/bandwidth forecast for the staged (or committed) rules, capped at one week.
+* `GET /api/captures`: Filtered, paginated capture history from `history.db` (`docs/optic-daemon-capture-log.md` §7).
+* `GET /api/system/status`: Pi health (memory, disk, temperature, uptime, time sync).
+* `POST /api/system/reboot`, `POST /api/system/restart-daemon`: Reboot the Pi or restart the daemon (PolicyKit-scoped).
+* `POST /api/system/ntp-sync`, `POST /api/system/timezone`: Trigger an NTP sync, or set the system timezone to a validated IANA name.
+* `GET /api/timezones`: Every valid IANA timezone name, for the Config page.
+* `GET /api/celestial-preview`: Sun, Moon and Milky Way event times for a station, for planning rules.
+* `GET /api/alerts`: Read-only health-alert state (`docs/optic-daemon-alerts.md` §8).
 
 ---
 
@@ -363,14 +372,15 @@ The Scheduler is a completely autonomous loop whose only mission is to take pict
 following the same shape as `optic_camera`: one owning `tokio::task`, a
 command channel for control, and a `watch` channel publishing a status
 snapshot. It replaces the Phase 6 shell script's *logic* (not, yet, its
-deployment — the systemd timer still runs too; see the implementation-status
-note above) while deliberately reusing the Phase 6 script's already-deployed
+deployment — the retired systemd timer is still installed on the Pi and must
+be disabled; see the implementation-status note above) while deliberately reusing the Phase 6 script's already-deployed
 *wire protocol*, so `scripts/optic-capture-receiver.sh` on the receiving Mac
 needs no changes:
 
 * **Scanning, not `inotify`:** every 5 seconds it lists `/mnt/capture` and
   filters to files matching the daemon's own capture naming pattern
-  (`optic-web-*.jpg` / `optic-web-*.dng`) — an explicit allowlist, not "every
+  (`testshot-*` / `scheduler-*` ending in `.jpg`, `.dng` or `.log.json`;
+  `optic_sync.rs::is_capture_filename`) — an explicit allowlist, not "every
   non-dotfile" like the shell script, which could otherwise sweep up and
   delete `config.json`/`preview_config.json`. Chosen over real `inotify`
   watching for lower implementation risk; still faster than the shell
@@ -597,7 +607,7 @@ async fn main() -> anyhow::Result<()> {
 
 ### Future Atomic Configuration Mutation Pattern
 
-This example is for the future scheduler configuration API; Phase 1 does not expose `/api/config`.
+This example is the original design; the implemented API stages to `preview_config.json` and commits with `POST /api/config/commit` (see Web API Endpoints).
 
 ```rust
 use std::path::Path;

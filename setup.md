@@ -102,26 +102,19 @@ cd /Users/admin/Documents/projects/optic
 ssh liam@optic.local 'bash -s -- --phase 1 --color' < verify.sh
 ```
 
-### A. Constrain Systemd Journal to RAM
+### A. Keep the Systemd Journal Small and Bounded
 
-Open `/etc/systemd/journald.conf`:
-
-```bash
-sudo nano /etc/systemd/journald.conf
-```
-
-Uncomment and configure the following directives:
+The journal was originally RAM-only (`Storage=volatile`, 32 MiB). Since
+2026-09-19 it uses small, bounded persistent storage, so logs from a crash
+or hang survive the reboot (`worklogs/2026-09-19-persistent-journal-crash-evidence.md`).
+`scripts/setup-phase-01-journaling.sh` installs this drop-in and restarts
+journald:
 
 ```ini
 [Journal]
-Storage=volatile
-RuntimeMaxUse=32M
-```
-
-Apply changes immediately:
-
-```bash
-sudo systemctl restart systemd-journald
+Storage=persistent
+SystemMaxUse=16M
+RuntimeMaxUse=16M
 ```
 
 ### B. Disable Disk-Heavy Logging Daemons
@@ -378,7 +371,7 @@ An RPM of `0` is normal while the cooling state and PWM are both `0`. If PWM is 
 
 ## 6. RAM Capture Stage & Verified iMac Transfer
 
-Never store captured frames on the boot/OS root partition. `/mnt/capture` is a bounded 256 MiB `tmpfs`; a systemd timer transfers completed files to `/Users/admin/Pictures/Optic` on the iMac at `imacpro.local`.
+Never store captured frames on the boot/OS root partition. `/mnt/capture` is a bounded 256 MiB `tmpfs`; `optic_sync` inside `optic-daemon` transfers completed captures to `/Users/admin/Pictures/Optic` on the iMac at `imacpro.local`, using the key, pinned host key and receiver set up below.
 
 > **Durability tradeoff:** queued captures exist only in RAM until transfer succeeds. An iMac/network outage eventually fills the bounded queue and causes new captures to fail rather than write to microSD. A Pi power loss loses any queued files. The iMac must remain available for unattended operation.
 
@@ -394,6 +387,8 @@ scp liam@optic.local:/home/liam/.ssh/optic_capture_ed25519.pub /tmp/optic_captur
 ```
 
 The first run creates the RAM stage and key but leaves the transfer timer disabled until the iMac host key is pinned.
+
+> **Retired timer:** this script still installs the original shell transfer (`optic-capture-transfer.timer`), and step C enables it. `optic_sync` has replaced it. The timer ships and deletes every non-hidden file in `/mnt/capture`, so disable it after provisioning (`sudo systemctl disable --now optic-capture-transfer.timer`). `verify.sh` Phase 6 fails while it is enabled.
 
 ### B. Configure the Restricted iMac Receiver
 
@@ -420,7 +415,7 @@ cd /Users/admin/Documents/projects/optic
 ssh liam@optic.local 'bash -s -- --phase 6 --color' < verify.sh
 ```
 
-Phase 6 verification checks the tmpfs size and hardening, timer state, pinned key, authenticated receiver probe, latest transfer result, Beszel export, and queued file/byte counts.
+Phase 6 verification checks the tmpfs size and hardening, the `optic_sync` target in the daemon unit, that the retired timer is not running, the pinned key, the authenticated receiver probe, `optic_sync` status from `/api/status`, the Beszel export, and queued file/byte counts.
 
 ---
 
