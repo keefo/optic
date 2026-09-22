@@ -526,6 +526,23 @@ brightness matches the scheduled frames.
 - Deploying Part 2 and checking it on the camera is left for the user
   (steps below).
 
+### Deploy (Part 2, 2026-09-22, user-requested)
+
+- Pre-flight: the worktree was clean at `aeb0ad9`; no build was running on the
+  Pi; nothing was staged; no preview was streaming; the scheduler was paused;
+  the mode was Dashboard.
+- `./scripts/build-deploy-optic-daemon.sh` exited 0: Biome, fmt, 234
+  tests on the Pi, clippy `-D warnings`, release build, install with
+  rollback. The service is `active` and the journal shows no warnings since
+  the restart.
+- Verified live: `/api/status` has `exposure_plan` (`null` in Dashboard
+  mode); `/scheduled-exposure.js` is served (200, 10,999 B); the dashboard HTML
+  has `#scheduled-exposure`; `POST /api/schedule/exposure` with
+  `max_gain: 99` → 422, with nothing staged. Rules, station, notifications
+  and gain 11.8 are unchanged; still paused; still Dashboard mode.
+- **Deployed, not yet hardware-verified in the UI.** The live preview
+  override on real frames is the user's acceptance step below.
+
 ### User verification (Part 2)
 
 1. Approve a deploy (`./scripts/build-deploy-optic-daemon.sh`), or merge
