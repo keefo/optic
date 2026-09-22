@@ -1833,7 +1833,7 @@ mod tests {
         assert!(INDEX_HTML.contains("Capture profile"));
         assert!(APP_JS.contains("master_archive"));
         assert!(APP_JS.contains("${profile.previewFps} FPS"));
-        assert!(APP_JS.contains("White balance ${optionLabel(\"awb\", values.awb)}"));
+        assert!(APP_JS.contains("White balance ${awb}"));
         assert!(APP_JS.contains("Denoise ${optionLabel(\"denoise\", values.denoise)}"));
         assert!(APP_JS.contains("Analogue gain ${gain}"));
         assert!(INDEX_HTML.contains("Live preview starts automatically"));

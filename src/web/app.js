@@ -40,7 +40,7 @@ const defaults = {
   rotation: 0,
   horizontal_flip: false,
   vertical_flip: false,
-  awb: "auto",
+  awb: "daylight",
   metering: "centre",
   exposure: "normal",
   ev: 0,
@@ -168,7 +168,8 @@ function previewLabel(profileName, values) {
   const profile = profiles[profileName];
   const ev = `${values.ev >= 0 ? "+" : ""}${values.ev.toFixed(1)}`;
   const gain = values.gain === 0 ? "Auto" : `${values.gain.toFixed(1)}×`;
-  return `Live · ${profile.previewWidth} × ${profile.previewHeight} · ${profile.previewFps} FPS · White balance ${optionLabel("awb", values.awb)} · Metering ${optionLabel("metering", values.metering)} · Exposure mode ${optionLabel("exposure", values.exposure)} · Denoise ${optionLabel("denoise", values.denoise)} · EV ${ev} · Analogue gain ${gain}`;
+  const awb = optionLabel("awb", values.awb).replace(" (not recommended)", "");
+  return `Live · ${profile.previewWidth} × ${profile.previewHeight} · ${profile.previewFps} FPS · White balance ${awb} · Metering ${optionLabel("metering", values.metering)} · Exposure mode ${optionLabel("exposure", values.exposure)} · Denoise ${optionLabel("denoise", values.denoise)} · EV ${ev} · Analogue gain ${gain}`;
 }
 
 function setPreviewAspect(profileName) {

@@ -201,8 +201,9 @@ removes the per-frame AWB flicker that motivated the original design.
 Leaving the control on Auto keeps libcamera's per-frame AWB, flicker
 included — the operator's choice to make. The UI note says so.
 
-`CameraSettings.colour_gains` and `ExposureOverride.colour_gains` remain as a
-manual-white-balance capability, but nothing sets them today.
+`CameraSettings.colour_gains` remains as a manual-white-balance capability
+(`AwbEnable(false)` + `ColourGains`), but nothing sets it today; the preview
+override carries exposure only.
 
 ## 7. Integration
 

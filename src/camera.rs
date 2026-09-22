@@ -41,7 +41,10 @@ impl Default for CameraSettings {
             rotation: 0,
             horizontal_flip: false,
             vertical_flip: false,
-            awb: "auto".to_owned(),
+            // Daylight, not Auto: per-frame AWB makes consecutive timelapse
+            // frames jump in colour, and a RAW/DNG keeps white balance
+            // adjustable in post anyway (docs §6).
+            awb: "daylight".to_owned(),
             metering: "centre".to_owned(),
             exposure: "normal".to_owned(),
             ev: 0.0,
@@ -364,15 +367,14 @@ pub struct StreamRequest {
 }
 
 /// A brightness-equivalent stand-in for the next scheduled frame's
-/// exposure. `shutter_us`/`gain` `0` with no `colour_gains` means auto
-/// exposure and AWB, which is what a ramp seed frame uses.
+/// exposure. `shutter_us`/`gain` `0` means auto exposure, which is what a
+/// ramp seed frame uses. White balance is never part of this: it stays the
+/// operator's (`docs/optic-daemon-exposure-ramping.md` §6).
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExposureOverride {
     pub shutter_us: u64,
     pub gain: f32,
-    #[serde(default)]
-    pub colour_gains: Option<[f32; 2]>,
 }
 
 impl StreamRequest {
@@ -381,16 +383,14 @@ impl StreamRequest {
     }
 
     /// The settings the camera actually runs the preview with: `settings`,
-    /// with `exposure_override` applied when present.
+    /// with `exposure_override` applied when present. Exposure only — white
+    /// balance stays the operator's (`docs/optic-daemon-exposure-ramping.md`
+    /// §6).
     pub(crate) fn effective_settings(&self) -> CameraSettings {
         let mut settings = self.settings.clone();
         if let Some(exposure) = self.exposure_override {
             settings.shutter_us = exposure.shutter_us;
             settings.gain = exposure.gain;
-            settings.colour_gains = exposure.colour_gains;
-            if exposure.colour_gains.is_none() {
-                settings.awb = "auto".to_owned();
-            }
         }
         settings
     }
@@ -594,15 +594,16 @@ mod tests {
         assert_eq!(plain.effective_settings().gain, 2.0);
 
         let ramped: StreamRequest = serde_json::from_str(
-            r#"{"settings": {"gain": 2.0, "shutter_us": 1000, "awb": "daylight"},
+            r#"{"settings": {"gain": 2.0, "shutter_us": 1000, "awb": "cloudy"},
                 "profile": "dci_4k",
-                "exposure_override": {"shutter_us": 110000, "gain": 12.5,
-                                      "colour_gains": [2.1, 1.7]}}"#,
+                "exposure_override": {"shutter_us": 110000, "gain": 12.5}}"#,
         )
         .unwrap();
         let effective = ramped.effective_settings();
         assert_eq!((effective.shutter_us, effective.gain), (110_000, 12.5));
-        assert_eq!(effective.colour_gains, Some([2.1, 1.7]));
+        // Exposure only: the operator's white balance survives the override.
+        assert_eq!(effective.awb, "cloudy");
+        assert_eq!(effective.colour_gains, None);
         // The staged settings keep the manual values.
         assert_eq!(
             (ramped.settings.shutter_us, ramped.settings.gain),
@@ -610,7 +611,7 @@ mod tests {
         );
         ramped.validate().unwrap();
 
-        // Seeding: auto exposure and AWB.
+        // Seeding: auto exposure, white balance still the operator's.
         let seed: StreamRequest = serde_json::from_str(
             r#"{"settings": {"awb": "daylight"}, "profile": "dci_4k",
                 "exposure_override": {"shutter_us": 0, "gain": 0.0}}"#,
@@ -618,7 +619,7 @@ mod tests {
         .unwrap();
         let effective = seed.effective_settings();
         assert_eq!((effective.shutter_us, effective.gain), (0, 0.0));
-        assert_eq!(effective.awb, "auto");
+        assert_eq!(effective.awb, "daylight");
         assert_eq!(effective.colour_gains, None);
 
         let invalid: StreamRequest = serde_json::from_str(
