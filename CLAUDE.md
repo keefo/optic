@@ -178,6 +178,7 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 - Do not use `timeout <secs> <cmd>` on the Mac (GNU coreutils `timeout` is not installed: `command not found`); for SSH use `-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2` and the Bash tool's own timeout instead.
 - Do not use `rg` in commands run on the Pi over SSH (not installed there: `rg: command not found`); use `grep -E` on the Pi and keep `rg` for the Mac checkout.
 - Do not put several SSH options in one shell variable such as `S="-o BatchMode=yes -o ConnectTimeout=10"; ssh $S host` (zsh does not word-split unquoted variables, so ssh gets one bad argument: `keyword batchmode extra arguments at end of line`); write the `-o` options out inline instead.
+- Do not use `[ "$a" \> "$b" ]` for string comparison in zsh (zsh's `[` rejects it: `condition expected: >`, so an `until` loop spins forever on errors); use `[[ "$a" > "$b" ]]` or run the loop under `bash -c` instead.
 
 ## Orca Worktree Completion Rules
 - When the task, PR, or assigned scope is finished:

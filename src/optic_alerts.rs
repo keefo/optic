@@ -20,18 +20,30 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, LazyLock},
 };
 
-use chrono::{DateTime, Duration, TimeZone as _, Utc};
+use chrono::{DateTime, Duration, NaiveTime, TimeZone as _, Utc};
+use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt as _, process::Command, sync::watch};
+use serde_json::Value;
+use tokio::{
+    io::AsyncWriteExt as _,
+    process::Command,
+    sync::{mpsc, oneshot, watch},
+};
 
 use crate::{
-    camera::AppConfig,
     durable_state,
     optic_capture_log::{CaptureLog, CaptureQueryFilter},
+    optic_digest::{
+        self, CaptureRow, Decision, Digest, DigestInput, DigestState, EventRow, HeartbeatSnapshot,
+        Sample, SyncSnapshot,
+    },
+    optic_events::SystemEventLog,
+    optic_heartbeat::{self, ArmedOn, HeartbeatPlan},
     optic_scheduler::{self, LastCapture, ScheduleConfig, ScheduleRunState, SchedulerHandle},
-    optic_sync::DataSyncManager,
+    optic_sync::{DataSyncManager, SyncStatus},
     system_status::SystemStatusReader,
 };
 
@@ -868,13 +880,13 @@ impl Outbox {
 // Configuration
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NtfyConfig {
     #[serde(default = "default_ntfy_server")]
     pub server: String,
     pub topic: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
 }
 
@@ -894,37 +906,88 @@ impl std::fmt::Debug for NtfyConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+/// Daily digest settings (`docs/optic-daemon-digest-heartbeat.md` §5.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DigestSettings {
+    pub enabled: bool,
+    /// `HH:MM`, 24 h, in the Station timezone.
+    pub send_at: String,
+}
+
+impl Default for DigestSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            send_at: "08:00".to_owned(),
+        }
+    }
+}
+
+/// External heartbeat settings. The section is opt-in: absent means off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeartbeatSettings {
+    pub enabled: bool,
+    pub interval_secs: u64,
+    pub alert_after_secs: u64,
+    pub sequence_id: String,
+}
+
+impl Default for HeartbeatSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_secs: optic_heartbeat::DEFAULT_INTERVAL_SECS,
+            alert_after_secs: optic_heartbeat::DEFAULT_ALERT_AFTER_SECS,
+            sequence_id: optic_heartbeat::DEFAULT_SEQUENCE_ID.to_owned(),
+        }
+    }
+}
+
+/// The `notifications` section of `config.json`, and the shape of the
+/// legacy `alerts.json` (imported once). Unknown fields are rejected so a
+/// misspelt setting is reported rather than ignored. `Debug` is safe: the
+/// ntfy topic and token are redacted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AlertsFileConfig {
+pub struct NotificationSettings {
     #[serde(default = "default_true")]
-    enabled: bool,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub station_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ntfy: Option<NtfyConfig>,
     #[serde(default)]
-    station_name: Option<String>,
+    pub digest: DigestSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat: Option<HeartbeatSettings>,
     #[serde(default)]
-    ntfy: Option<NtfyConfig>,
-    #[serde(default)]
-    thresholds: Thresholds,
+    pub thresholds: Thresholds,
 }
 
 fn default_true() -> bool {
     true
 }
 
-/// Result of loading `alerts.json` at startup. Always usable: any problem
+/// Settings resolved into something runnable. Always usable: any problem
 /// falls back to a dry-run notifier with the reason recorded.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AlertsSetup {
     notifier: Notifier,
     station_name: Option<String>,
     thresholds: Thresholds,
+    digest_send_at: Option<NaiveTime>,
+    heartbeat: Option<HeartbeatPlan>,
     config_error: Option<String>,
     config_warnings: Vec<String>,
+    /// The parsed settings (with secrets); `None` when missing or invalid.
+    settings: Option<NotificationSettings>,
 }
 
 /// `OPTIC_ALERTS_CONFIG` overrides the default
-/// `~/.config/optic-daemon/alerts.json` (outside git and outside the
-/// deploy-replaced `~/.local/bin`).
+/// `~/.config/optic-daemon/alerts.json`, the legacy file that is imported
+/// into `config.json` once.
 pub fn resolve_config_path() -> PathBuf {
     if let Ok(configured) = env::var("OPTIC_ALERTS_CONFIG") {
         return PathBuf::from(configured);
@@ -933,7 +996,8 @@ pub fn resolve_config_path() -> PathBuf {
     PathBuf::from(home).join(DEFAULT_CONFIG_RELATIVE_PATH)
 }
 
-/// Reads and validates the config file, logging the outcome. Never fails.
+/// Reads the legacy `alerts.json`. Never fails; a missing file is normal
+/// once it has been imported.
 pub fn load_config(path: &Path) -> AlertsSetup {
     let setup = match std::fs::read_to_string(path) {
         Ok(content) => {
@@ -943,27 +1007,19 @@ pub fn load_config(path: &Path) -> AlertsSetup {
             }
             setup
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            dry_run_setup("alerts config file not found; notifications are logged only (dry run)")
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => dry_run_setup(
+            "no notification settings (alerts config file not found); notifications are logged only (dry run)",
+        ),
         Err(error) => dry_run_setup(&format!(
             "alerts config file unreadable ({}); notifications are logged only (dry run)",
             error.kind()
         )),
     };
-    match (&setup.config_error, &setup.notifier) {
-        (Some(error), _) => {
-            tracing::warn!(path = %path.display(), %error, "health alerts running in dry-run mode");
-        }
-        (None, Notifier::Ntfy(sender)) => {
-            tracing::info!(server = %sender.config.server, "health alerts will notify via ntfy");
-        }
-        (None, Notifier::DryRun) => {
-            tracing::info!(path = %path.display(), "health alerts disabled in config; dry-run mode");
-        }
-    }
-    for warning in &setup.config_warnings {
-        tracing::warn!(path = %path.display(), %warning, "health alerts config warning");
+    if setup.settings.is_none()
+        && let Some(error) = &setup.config_error
+        && !error.contains("not found")
+    {
+        tracing::warn!(path = %path.display(), %error, "legacy alerts config not usable");
     }
     setup
 }
@@ -973,40 +1029,69 @@ fn dry_run_setup(reason: &str) -> AlertsSetup {
         notifier: Notifier::DryRun,
         station_name: None,
         thresholds: Thresholds::default(),
+        digest_send_at: None,
+        heartbeat: None,
         config_error: Some(reason.to_owned()),
         config_warnings: Vec::new(),
+        settings: None,
     }
 }
 
 fn parse_config(content: &str) -> AlertsSetup {
-    let file: AlertsFileConfig = match serde_json::from_str(content) {
-        Ok(file) => file,
-        Err(error) => {
-            // serde_json's message names the field/line, never echoes values
-            // of other fields, so it is safe to surface.
-            return dry_run_setup(&format!(
-                "alerts config is invalid ({error}); notifications are logged only (dry run)"
-            ));
+    match serde_json::from_str::<NotificationSettings>(content) {
+        Ok(settings) => resolve(&settings),
+        // serde_json's message names the field/line, never echoes values
+        // of other fields, so it is safe to surface.
+        Err(error) => dry_run_setup(&format!(
+            "notification settings are invalid ({error}); notifications are logged only (dry run)"
+        )),
+    }
+}
+
+/// Lenient resolution for settings read from disk: out-of-range values are
+/// clamped or switched off with a warning rather than rejected.
+fn resolve(settings: &NotificationSettings) -> AlertsSetup {
+    let mut warnings = settings.thresholds.warnings();
+    let digest_send_at = if settings.digest.enabled {
+        let parsed = optic_digest::parse_send_at(&settings.digest.send_at);
+        if parsed.is_none() {
+            warnings.push("digest.send_at must be HH:MM (24 h); the digest is off".to_owned());
         }
+        parsed
+    } else {
+        None
     };
-    let mut warnings = file.thresholds.warnings();
+    let heartbeat = settings
+        .heartbeat
+        .as_ref()
+        .filter(|heartbeat| heartbeat.enabled)
+        .and_then(|heartbeat| match heartbeat_plan(heartbeat, &mut warnings) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                warnings.push(format!("{error}; the heartbeat is off"));
+                None
+            }
+        });
     let base = |notifier, config_error| AlertsSetup {
         notifier,
-        station_name: file.station_name.clone(),
-        thresholds: file.thresholds.clone(),
+        station_name: settings.station_name.clone(),
+        thresholds: settings.thresholds.clone(),
+        digest_send_at,
+        heartbeat: heartbeat.clone(),
         config_error,
         config_warnings: Vec::new(),
+        settings: Some(settings.clone()),
     };
-    if !file.enabled {
+    if !settings.enabled {
         let mut setup = base(Notifier::DryRun, None);
         setup.config_warnings = warnings;
         return setup;
     }
-    let Some(mut ntfy) = file.ntfy.clone() else {
+    let Some(mut ntfy) = settings.ntfy.clone() else {
         return base(
             Notifier::DryRun,
             Some(
-                "alerts config has no \"ntfy\" section; notifications are logged only (dry run)"
+                "notification settings have no \"ntfy\" section; notifications are logged only (dry run)"
                     .to_owned(),
             ),
         );
@@ -1033,6 +1118,95 @@ fn parse_config(content: &str) -> AlertsSetup {
     setup
 }
 
+fn heartbeat_plan(
+    heartbeat: &HeartbeatSettings,
+    warnings: &mut Vec<String>,
+) -> Result<HeartbeatPlan, String> {
+    use optic_heartbeat::{
+        MAX_ALERT_AFTER_SECS, MAX_INTERVAL_SECS, MIN_ALERT_AFTER_SECS, MIN_ALERT_MARGIN_SECS,
+        MIN_INTERVAL_SECS,
+    };
+    if !optic_heartbeat::valid_sequence_id(&heartbeat.sequence_id) {
+        return Err(
+            "heartbeat.sequence_id must be 1-64 characters of A-Z, a-z, 0-9, '-' or '_'".to_owned(),
+        );
+    }
+    let interval = heartbeat
+        .interval_secs
+        .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
+    let alert_after = heartbeat
+        .alert_after_secs
+        .clamp(MIN_ALERT_AFTER_SECS, MAX_ALERT_AFTER_SECS);
+    if interval != heartbeat.interval_secs || alert_after != heartbeat.alert_after_secs {
+        warnings.push(format!(
+            "heartbeat interval must be {MIN_INTERVAL_SECS}-{MAX_INTERVAL_SECS} s and alert delay {MIN_ALERT_AFTER_SECS}-{MAX_ALERT_AFTER_SECS} s; clamped"
+        ));
+    }
+    if alert_after < interval + MIN_ALERT_MARGIN_SECS {
+        warnings.push(format!(
+            "heartbeat.alert_after_secs should be at least interval_secs + {MIN_ALERT_MARGIN_SECS}; one late check-in may false-alarm"
+        ));
+    }
+    Ok(HeartbeatPlan {
+        interval: Duration::seconds(interval as i64),
+        alert_after: Duration::seconds(alert_after as i64),
+        sequence_id: heartbeat.sequence_id.clone(),
+    })
+}
+
+/// Strict validation for a save from the Config page: anything out of range
+/// is rejected with a reason instead of clamped.
+pub fn validate_for_save(settings: &NotificationSettings) -> Result<(), String> {
+    use optic_heartbeat::{
+        MAX_ALERT_AFTER_SECS, MAX_INTERVAL_SECS, MIN_ALERT_AFTER_SECS, MIN_ALERT_MARGIN_SECS,
+        MIN_INTERVAL_SECS,
+    };
+    if let Some(name) = &settings.station_name
+        && (name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control))
+    {
+        return Err("station name must be 1-64 characters without control characters".to_owned());
+    }
+    match &settings.ntfy {
+        Some(ntfy) => validate_ntfy(ntfy)?,
+        None if settings.enabled => {
+            return Err("an ntfy topic is required to turn notifications on".to_owned());
+        }
+        None => {}
+    }
+    if optic_digest::parse_send_at(&settings.digest.send_at).is_none() {
+        return Err("digest send time must be HH:MM (24 h)".to_owned());
+    }
+    if let Some(heartbeat) = &settings.heartbeat {
+        if !optic_heartbeat::valid_sequence_id(&heartbeat.sequence_id) {
+            return Err(
+                "heartbeat sequence ID must be 1-64 characters of A-Z, a-z, 0-9, '-' or '_'"
+                    .to_owned(),
+            );
+        }
+        if !(MIN_INTERVAL_SECS..=MAX_INTERVAL_SECS).contains(&heartbeat.interval_secs) {
+            return Err(format!(
+                "heartbeat interval must be {}-{} minutes",
+                MIN_INTERVAL_SECS / 60,
+                MAX_INTERVAL_SECS / 60
+            ));
+        }
+        if !(MIN_ALERT_AFTER_SECS..=MAX_ALERT_AFTER_SECS).contains(&heartbeat.alert_after_secs) {
+            return Err(format!(
+                "heartbeat alert delay must be {} minutes to {} days",
+                MIN_ALERT_AFTER_SECS / 60,
+                MAX_ALERT_AFTER_SECS / 86_400
+            ));
+        }
+        if heartbeat.alert_after_secs < heartbeat.interval_secs + MIN_ALERT_MARGIN_SECS {
+            return Err(format!(
+                "heartbeat alert delay must be at least the interval plus {} minutes",
+                MIN_ALERT_MARGIN_SECS / 60
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_ntfy(ntfy: &NtfyConfig) -> Result<(), String> {
     let valid_topic = !ntfy.topic.is_empty()
         && ntfy.topic.len() <= 64
@@ -1051,10 +1225,14 @@ fn validate_ntfy(ntfy: &NtfyConfig) -> Result<(), String> {
     if !valid_server {
         return Err("ntfy.server must be an http(s):// URL".to_owned());
     }
+    // '*' is excluded so a masked token (`tk_a****wxyz`) can never be saved
+    // back; real ntfy tokens are `tk_` plus letters and digits.
     if let Some(token) = &ntfy.token
-        && (token.is_empty() || !token.chars().all(|c| c.is_ascii_graphic()))
+        && (token.is_empty() || !token.chars().all(|c| c.is_ascii_graphic() && c != '*'))
     {
-        return Err("ntfy.token must be non-empty printable ASCII without spaces".to_owned());
+        return Err(
+            "ntfy.token must be non-empty printable ASCII without spaces or '*'".to_owned(),
+        );
     }
     Ok(())
 }
@@ -1077,14 +1255,324 @@ fn permission_warning(_path: &Path) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Settings in config.json: masking, view, update, save
+// ---------------------------------------------------------------------------
+
+/// Paths of the global config: committed (durable + tmpfs mirror) and the
+/// staging copy the dashboard's stage/commit flow uses.
+#[derive(Debug, Clone)]
+pub struct ConfigPaths {
+    pub config_path: PathBuf,
+    pub config_cache_path: PathBuf,
+    pub preview_config_path: PathBuf,
+}
+
+/// Serializes read-modify-write saves of the `notifications` section (the
+/// Config page and the one-time import).
+static SAVE_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Masks the ntfy topic and token in a `notifications` value before it is
+/// served (`GET /api/status`). Any `topic`/`token` key at any depth is
+/// masked, so even a hand-edited, misshapen section cannot leak. The masks
+/// contain `****`, which topic and token validation reject, so a masked
+/// value can never be saved back as a real secret.
+pub fn redact_notifications(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, entry) in map.iter_mut() {
+                match (key.as_str(), &*entry) {
+                    ("topic" | "token", Value::String(secret)) => {
+                        *entry = Value::String(mask_secret(secret));
+                    }
+                    ("token", Value::Null) => {}
+                    ("topic" | "token", _) => *entry = Value::String(SECRET_MASK.to_owned()),
+                    _ => redact_notifications(entry),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(redact_notifications),
+        _ => {}
+    }
+}
+
+const SECRET_MASK: &str = "****";
+/// Secrets shorter than this are masked completely, so at least 8
+/// characters always stay hidden.
+const MIN_PARTLY_SHOWN_SECRET: usize = 16;
+
+/// First 4 and last 4 characters with `****` between (`opti****a7f3`),
+/// enough to recognise which secret is set. A generated topic (`optic-` +
+/// 24 random characters) keeps 22 random characters hidden.
+fn mask_secret(secret: &str) -> String {
+    let count = secret.chars().count();
+    if count < MIN_PARTLY_SHOWN_SECRET {
+        return SECRET_MASK.to_owned();
+    }
+    let head: String = secret.chars().take(4).collect();
+    let tail: String = secret.chars().skip(count - 4).collect();
+    format!("{head}{SECRET_MASK}{tail}")
+}
+
+/// What the Config page sees: never the topic or token themselves.
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationsView {
+    /// `config` (config.json), `alerts_file` (legacy file, import pending),
+    /// or `none`.
+    pub source: &'static str,
+    pub enabled: bool,
+    pub station_name: Option<String>,
+    pub server: String,
+    pub topic_set: bool,
+    /// Masked (`opti****a7f3`), never the topic itself.
+    pub topic_hint: Option<String>,
+    pub token_set: bool,
+    /// Masked like `topic_hint`.
+    pub token_hint: Option<String>,
+    pub digest: DigestSettings,
+    pub heartbeat: HeartbeatSettings,
+    /// Why the saved settings cannot be used, if they cannot.
+    pub error: Option<String>,
+}
+
+impl NotificationsView {
+    fn new(source: &'static str, settings: Result<&NotificationSettings, &str>) -> Self {
+        let error = settings.err().map(str::to_owned);
+        let settings = settings.ok();
+        let ntfy = settings.and_then(|settings| settings.ntfy.as_ref());
+        Self {
+            source,
+            enabled: settings.is_some_and(|settings| settings.enabled),
+            station_name: settings.and_then(|settings| settings.station_name.clone()),
+            server: ntfy.map_or_else(default_ntfy_server, |ntfy| ntfy.server.clone()),
+            topic_set: ntfy.is_some(),
+            topic_hint: ntfy.map(|ntfy| mask_secret(&ntfy.topic)),
+            token_set: ntfy.is_some_and(|ntfy| ntfy.token.is_some()),
+            token_hint: ntfy.and_then(|ntfy| ntfy.token.as_deref()).map(mask_secret),
+            digest: settings
+                .map_or_else(DigestSettings::default, |settings| settings.digest.clone()),
+            heartbeat: settings
+                .and_then(|settings| settings.heartbeat.clone())
+                .unwrap_or(HeartbeatSettings {
+                    enabled: false,
+                    ..HeartbeatSettings::default()
+                }),
+            error,
+        }
+    }
+}
+
+/// A save from the Config page. An absent or empty `topic`/`token` keeps
+/// the current one; `clear_token` removes the token.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotificationsUpdate {
+    pub enabled: bool,
+    #[serde(default)]
+    pub station_name: Option<String>,
+    #[serde(default)]
+    pub server: Option<String>,
+    #[serde(default)]
+    pub topic: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub clear_token: bool,
+    pub digest: DigestSettings,
+    pub heartbeat: HeartbeatSettings,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SaveError {
+    Invalid(String),
+    Io(String),
+}
+
+fn non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Merges an update into the current settings (pure). Thresholds are not
+/// edited in the UI and are always kept.
+fn merge_update(
+    current: Option<&NotificationSettings>,
+    update: NotificationsUpdate,
+) -> NotificationSettings {
+    let current_ntfy = current.and_then(|current| current.ntfy.as_ref());
+    let server = non_empty(update.server.as_deref())
+        .map(|server| server.trim_end_matches('/').to_owned())
+        .or_else(|| current_ntfy.map(|ntfy| ntfy.server.clone()))
+        .unwrap_or_else(default_ntfy_server);
+    let topic =
+        non_empty(update.topic.as_deref()).or_else(|| current_ntfy.map(|ntfy| ntfy.topic.clone()));
+    let token = if update.clear_token {
+        None
+    } else {
+        non_empty(update.token.as_deref())
+            .or_else(|| current_ntfy.and_then(|ntfy| ntfy.token.clone()))
+    };
+    NotificationSettings {
+        enabled: update.enabled,
+        station_name: non_empty(update.station_name.as_deref()),
+        ntfy: topic.map(|topic| NtfyConfig {
+            server,
+            topic,
+            token,
+        }),
+        digest: update.digest,
+        // Kept even when off, so the values are remembered.
+        heartbeat: Some(update.heartbeat),
+        thresholds: current.map_or_else(Thresholds::default, |current| current.thresholds.clone()),
+    }
+}
+
+async fn read_committed(cache_path: &Path) -> Option<Value> {
+    let content = durable_state::read_cached(cache_path).await.ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn notifications_of(config: &Value) -> Option<&Value> {
+    config.get("notifications").filter(|value| !value.is_null())
+}
+
+/// The settings in effect: `config.json`'s section if present, else the
+/// legacy file (only until it is imported), else none.
+fn effective_settings(
+    config: Option<&Value>,
+    legacy: &AlertsSetup,
+) -> (&'static str, Result<NotificationSettings, String>) {
+    if let Some(section) = config.and_then(notifications_of) {
+        return (
+            "config",
+            serde_json::from_value(section.clone()).map_err(|error| {
+                format!(
+                    "notification settings in config.json are invalid ({error}); notifications are logged only (dry run)"
+                )
+            }),
+        );
+    }
+    match &legacy.settings {
+        Some(settings) => ("alerts_file", Ok(settings.clone())),
+        None => (
+            "none",
+            Err(legacy.config_error.clone().unwrap_or_else(|| {
+                "no notification settings; notifications are logged only (dry run)".to_owned()
+            })),
+        ),
+    }
+}
+
+fn set_notifications(config: &mut Value, section: Value) -> std::io::Result<()> {
+    match config.as_object_mut() {
+        Some(map) => {
+            map.insert("notifications".to_owned(), section);
+            Ok(())
+        }
+        None => Err(std::io::Error::other(
+            "config.json is not a JSON object; not overwriting it",
+        )),
+    }
+}
+
+/// Writes `settings` as the `notifications` section of the committed
+/// config (durable first, then the tmpfs mirror) and of any staging copy,
+/// so a later commit of unrelated staged edits cannot bring back the old
+/// settings. When nothing was staged, nothing is staged afterwards (the
+/// staging copy is written byte-identical to the committed config). Every
+/// other field is kept as is. Callers hold `SAVE_LOCK`.
+async fn write_notifications(
+    paths: &ConfigPaths,
+    settings: &NotificationSettings,
+) -> std::io::Result<()> {
+    let section = serde_json::to_value(settings).map_err(std::io::Error::other)?;
+    let committed_text = durable_state::read_cached(&paths.config_cache_path)
+        .await
+        .ok();
+    let preview_text = tokio::fs::read_to_string(&paths.preview_config_path)
+        .await
+        .ok();
+    let was_staged = match (&preview_text, &committed_text) {
+        (Some(preview), Some(committed)) => preview != committed,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let mut committed = match &committed_text {
+        Some(text) => serde_json::from_str::<Value>(text).map_err(|error| {
+            std::io::Error::other(format!(
+                "config.json is not valid JSON ({error}); not overwriting it"
+            ))
+        })?,
+        None => Value::Object(serde_json::Map::new()),
+    };
+    set_notifications(&mut committed, section.clone())?;
+    let committed_new = serde_json::to_string_pretty(&committed).map_err(std::io::Error::other)?;
+    durable_state::write_through(&paths.config_path, &paths.config_cache_path, &committed_new)
+        .await?;
+    let Some(preview) = preview_text else {
+        return Ok(());
+    };
+    let preview_new = if was_staged {
+        // A malformed staging copy is left alone; committing it would fail
+        // on its own anyway.
+        let Ok(mut staged) = serde_json::from_str::<Value>(&preview) else {
+            return Ok(());
+        };
+        if set_notifications(&mut staged, section).is_err() {
+            return Ok(());
+        }
+        serde_json::to_string_pretty(&staged).map_err(std::io::Error::other)?
+    } else {
+        committed_new
+    };
+    let temp = paths.preview_config_path.with_extension("json.tmp");
+    tokio::fs::write(&temp, preview_new).await?;
+    tokio::fs::rename(temp, &paths.preview_config_path).await
+}
+
+/// One-time import of the legacy `alerts.json` into `config.json`.
+async fn import_legacy(paths: &ConfigPaths, legacy: &AlertsSetup) {
+    let Some(settings) = &legacy.settings else {
+        return;
+    };
+    let _guard = SAVE_LOCK.lock().await;
+    let committed = read_committed(&paths.config_cache_path).await;
+    if committed.as_ref().and_then(notifications_of).is_some() {
+        tracing::info!(
+            path = %resolve_config_path().display(),
+            "config.json already has notification settings; the legacy alerts config is not used and can be deleted"
+        );
+        return;
+    }
+    match write_notifications(paths, settings).await {
+        Ok(()) => tracing::info!(
+            path = %resolve_config_path().display(),
+            "imported the legacy alerts config into config.json; it is no longer read and can be deleted"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "could not import the legacy alerts config into config.json; using it for this run only"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Notification delivery
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Notifier {
     /// Log only. Used when no channel is configured, and in local tests.
     DryRun,
     Ntfy(NtfySender),
+}
+
+fn transition_style(transition: Transition) -> (u8, &'static str) {
+    match transition {
+        Transition::Fired | Transition::Reminder => (4, "warning"),
+        Transition::Resolved => (3, "white_check_mark"),
+    }
 }
 
 impl Notifier {
@@ -1095,33 +1583,55 @@ impl Notifier {
         }
     }
 
-    async fn deliver(
+    async fn publish(
         &self,
-        notification: &Notification,
-        station_name: Option<&str>,
+        title: &str,
+        message: &str,
+        priority: u8,
+        tag: &str,
     ) -> Result<(), String> {
-        let title = notification.title(station_name);
         match self {
             Self::DryRun => {
                 tracing::warn!(
                     %title,
-                    message = %notification.message(),
-                    "health alert (dry run; no notification channel configured)"
+                    %message,
+                    "notification (dry run; no notification channel configured)"
                 );
                 Ok(())
             }
             Self::Ntfy(sender) => {
                 sender
-                    .send(&title, &notification.message(), notification.transition)
+                    .run(publish_curl_config(
+                        &sender.config,
+                        title,
+                        message,
+                        priority,
+                        tag,
+                    ))
                     .await?;
-                tracing::info!(%title, "health alert delivered via ntfy");
+                tracing::info!(%title, "notification delivered via ntfy");
                 Ok(())
             }
         }
     }
+
+    async fn deliver(
+        &self,
+        notification: &Notification,
+        station_name: Option<&str>,
+    ) -> Result<(), String> {
+        let (priority, tag) = transition_style(notification.transition);
+        self.publish(
+            &notification.title(station_name),
+            &notification.message(),
+            priority,
+            tag,
+        )
+        .await
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct NtfySender {
     config: NtfyConfig,
     /// The `curl` binary; overridable only by tests.
@@ -1129,57 +1639,63 @@ struct NtfySender {
 }
 
 impl NtfySender {
-    async fn send(&self, title: &str, message: &str, transition: Transition) -> Result<(), String> {
-        let config = curl_config(&self.config, title, message, transition);
-        // `-q` ignores any ~/.curlrc; `--config -` reads URL, headers, and
-        // body from stdin so the token never appears in argv.
-        let mut child = Command::new(&self.curl)
-            .args([
-                "-q",
-                "--silent",
-                "--show-error",
-                "--fail",
-                "--proto",
-                "=https,http",
-                "--max-time",
-                &CURL_TIMEOUT_SECS.to_string(),
-                "--config",
-                "-",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| format!("failed to start curl: {error}"))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(config.as_bytes())
-                .await
-                .map_err(|error| format!("failed to write curl config: {error}"))?;
-        }
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(CURL_TIMEOUT_SECS + 5),
-            child.wait_with_output(),
-        )
-        .await
-        .map_err(|_| "curl did not exit in time".to_owned())?
-        .map_err(|error| format!("curl failed: {error}"))?;
-        if output.status.success() {
-            return Ok(());
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr: String = stderr.trim().chars().take(200).collect();
-        Err(format!("curl exited with {}: {stderr}", output.status))
+    /// Runs curl with `config` (a curl config file) on stdin.
+    async fn run(&self, config: String) -> Result<(), String> {
+        run_curl(&self.curl, config).await
     }
 }
 
+async fn run_curl(curl: &Path, config: String) -> Result<(), String> {
+    // `-q` ignores any ~/.curlrc; `--config -` reads URL, headers, and
+    // body from stdin so the token never appears in argv.
+    let mut child = Command::new(curl)
+        .args([
+            "-q",
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--proto",
+            "=https,http",
+            "--max-time",
+            &CURL_TIMEOUT_SECS.to_string(),
+            "--config",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("failed to start curl: {error}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(config.as_bytes())
+            .await
+            .map_err(|error| format!("failed to write curl config: {error}"))?;
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(CURL_TIMEOUT_SECS + 5),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| "curl did not exit in time".to_owned())?
+    .map_err(|error| format!("curl failed: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr: String = stderr.trim().chars().take(200).collect();
+    Err(format!("curl exited with {}: {stderr}", output.status))
+}
+
 /// Builds the curl config file (fed on stdin) for one ntfy JSON publish.
-fn curl_config(ntfy: &NtfyConfig, title: &str, message: &str, transition: Transition) -> String {
-    let (priority, tag) = match transition {
-        Transition::Fired | Transition::Reminder => (4, "warning"),
-        Transition::Resolved => (3, "white_check_mark"),
-    };
+fn publish_curl_config(
+    ntfy: &NtfyConfig,
+    title: &str,
+    message: &str,
+    priority: u8,
+    tag: &str,
+) -> String {
     let body = serde_json::json!({
         "topic": ntfy.topic,
         "title": title,
@@ -1202,7 +1718,7 @@ fn curl_config(ntfy: &NtfyConfig, title: &str, message: &str, transition: Transi
 }
 
 /// Escapes a value for a double-quoted curl config string.
-fn curl_escape(value: &str) -> String {
+pub(crate) fn curl_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
@@ -1231,10 +1747,52 @@ pub struct ConditionStatus {
     pub detail: Option<String>,
 }
 
-/// Never contains the ntfy topic, token, or config path.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DigestStatus {
+    pub enabled: bool,
+    pub send_at: Option<String>,
+    pub timezone: String,
+    pub next_due_at: Option<DateTime<Utc>>,
+    /// End of the last window sent (or skipped).
+    pub last_window_end: Option<DateTime<Utc>>,
+    pub last_sent_at: Option<DateTime<Utc>>,
+    /// A digest is waiting for delivery.
+    pub pending: bool,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HeartbeatStatus {
+    /// `disabled`, `dry_run`, `ok`, `withheld`, or `failing`.
+    pub state: &'static str,
+    pub interval_secs: Option<u64>,
+    pub alert_after_secs: Option<u64>,
+    pub last_checkin_at: Option<DateTime<Utc>>,
+    pub next_checkin_at: Option<DateTime<Utc>>,
+    pub withheld_reason: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for HeartbeatStatus {
+    fn default() -> Self {
+        Self {
+            state: "disabled",
+            interval_secs: None,
+            alert_after_secs: None,
+            last_checkin_at: None,
+            next_checkin_at: None,
+            withheld_reason: None,
+            last_error: None,
+        }
+    }
+}
+
+/// Never contains the ntfy topic, token, sequence ID, or config path.
 #[derive(Debug, Clone, Serialize)]
 pub struct AlertsStatus {
     pub channel: &'static str,
+    /// Where the settings came from: `config`, `alerts_file`, or `none`.
+    pub settings_source: &'static str,
     pub config_error: Option<String>,
     pub config_warnings: Vec<String>,
     pub poll_interval_secs: u64,
@@ -1246,6 +1804,8 @@ pub struct AlertsStatus {
     pub last_delivered_at: Option<DateTime<Utc>>,
     pub last_delivery_error: Option<String>,
     pub thresholds: Thresholds,
+    pub digest: DigestStatus,
+    pub heartbeat: HeartbeatStatus,
 }
 
 impl Monitor {
@@ -1277,6 +1837,26 @@ impl Monitor {
             })
             .collect()
     }
+
+    /// Titles of conditions that are notified and not yet resolved; with
+    /// `capture_path_only`, just the ones that withhold the heartbeat
+    /// (`docs/optic-daemon-digest-heartbeat.md` §4.3).
+    fn active_titles(&self, capture_path_only: bool) -> Vec<&'static str> {
+        self.condition_statuses()
+            .into_iter()
+            .filter(|status| matches!(status.state, "firing" | "recovering"))
+            .filter(|status| {
+                !capture_path_only
+                    || matches!(
+                        status.condition,
+                        Condition::CaptureStalled
+                            | Condition::CaptureOverdue
+                            | Condition::CaptureFailing
+                    )
+            })
+            .map(|status| status.condition.title())
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,29 +1864,62 @@ impl Monitor {
 // ---------------------------------------------------------------------------
 
 /// The existing handles the monitor reads from. All reads are
-/// non-mutating.
+/// non-mutating, except that the actor writes `config.json`'s
+/// `notifications` section once to import the legacy file, and its own
+/// digest state file.
 pub struct AlertSources {
     pub scheduler: SchedulerHandle,
     pub sync: DataSyncManager,
     pub capture_log: Option<CaptureLog>,
     pub system_status: SystemStatusReader,
-    /// The committed config's tmpfs cache — the same file the scheduler
-    /// reads on every wake.
-    pub config_cache_path: PathBuf,
+    pub config_paths: ConfigPaths,
+    pub events: Option<SystemEventLog>,
+    /// `digest_state.json` in the state directory.
+    pub digest_state_path: PathBuf,
+    /// Whether `OpticCamera::probe` found the camera at startup.
+    pub camera_detected: bool,
+    pub version: &'static str,
+}
+
+/// Why a test or on-demand digest was not sent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SendError {
+    /// No usable channel (dry run); carries the reason.
+    NotConfigured(String),
+    /// At most one test/on-demand send per `MANUAL_SEND_SPACING`.
+    RateLimited,
+    Failed(String),
+}
+
+const MANUAL_SEND_SPACING: Duration = Duration::seconds(10);
+
+enum ActorCommand {
+    /// Re-read the settings and evaluate now (sent after a save).
+    Reload,
+    Test {
+        reply: oneshot::Sender<Result<(), SendError>>,
+    },
+    DigestNow {
+        reply: oneshot::Sender<Result<(), SendError>>,
+    },
 }
 
 #[derive(Clone)]
 pub struct AlertsHandle {
     status: watch::Receiver<AlertsStatus>,
+    commands: mpsc::Sender<ActorCommand>,
+    legacy: Arc<AlertsSetup>,
+    paths: ConfigPaths,
 }
 
 impl AlertsHandle {
-    pub fn spawn(setup: AlertsSetup, sources: AlertSources) -> Self {
-        let monitor = Monitor::new(setup.thresholds.clone(), Utc::now());
+    pub fn spawn(legacy: AlertsSetup, sources: AlertSources) -> Self {
+        let monitor = Monitor::new(legacy.thresholds.clone(), Utc::now());
         let (status_tx, status) = watch::channel(AlertsStatus {
-            channel: setup.notifier.channel(),
-            config_error: setup.config_error.clone(),
-            config_warnings: setup.config_warnings.clone(),
+            channel: Notifier::DryRun.channel(),
+            settings_source: "none",
+            config_error: Some("not evaluated yet".to_owned()),
+            config_warnings: Vec::new(),
             poll_interval_secs: POLL_INTERVAL.as_secs(),
             last_evaluated_at: None,
             active_count: 0,
@@ -1314,59 +1927,80 @@ impl AlertsHandle {
             outbox_len: 0,
             last_delivered_at: None,
             last_delivery_error: None,
-            thresholds: setup.thresholds.clone(),
+            thresholds: legacy.thresholds.clone(),
+            digest: DigestStatus::default(),
+            heartbeat: HeartbeatStatus::default(),
         });
-        tokio::spawn(run_actor(setup, sources, monitor, status_tx));
-        Self { status }
+        let (commands, receiver) = mpsc::channel(8);
+        let handle = Self {
+            status,
+            commands,
+            legacy: Arc::new(legacy.clone()),
+            paths: sources.config_paths.clone(),
+        };
+        tokio::spawn(run_actor(legacy, sources, monitor, status_tx, receiver));
+        handle
     }
 
     pub fn status(&self) -> AlertsStatus {
         self.status.borrow().clone()
     }
-}
 
-async fn run_actor(
-    setup: AlertsSetup,
-    sources: AlertSources,
-    mut monitor: Monitor,
-    status_tx: watch::Sender<AlertsStatus>,
-) {
-    let mut tracker = OutcomeTracker::default();
-    let mut outbox = Outbox::default();
-    let mut delivery = DeliveryState::default();
-    let mut interval = tokio::time::interval(POLL_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        interval.tick().await;
-        let observation = gather(&sources, &mut tracker, &monitor.thresholds).await;
-        for notification in monitor.observe(&observation) {
-            tracing::info!(
-                condition = ?notification.condition,
-                transition = ?notification.transition,
-                detail = %notification.detail,
-                "health alert state change"
-            );
-            outbox.push(notification);
-        }
-        flush(
-            &mut outbox,
-            &setup.notifier,
-            setup.station_name.as_deref(),
-            &mut delivery,
-        )
-        .await;
-        status_tx.send_modify(|status| {
-            status.last_evaluated_at = monitor.last_evaluated_at;
-            status.conditions = monitor.condition_statuses();
-            status.active_count = status
-                .conditions
-                .iter()
-                .filter(|c| matches!(c.state, "firing" | "recovering"))
-                .count();
-            status.outbox_len = outbox.queue.len();
-            status.last_delivered_at = delivery.last_delivered_at;
-            status.last_delivery_error = delivery.last_error.clone();
-        });
+    pub async fn reload(&self) {
+        let _ = self.commands.send(ActorCommand::Reload).await;
+    }
+
+    async fn request(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<(), SendError>>) -> ActorCommand,
+    ) -> Result<(), SendError> {
+        let (reply, answer) = oneshot::channel();
+        let not_running = || SendError::Failed("the alerts monitor is not running".to_owned());
+        self.commands
+            .send(make(reply))
+            .await
+            .map_err(|_| not_running())?;
+        answer.await.map_err(|_| not_running())?
+    }
+
+    /// Sends a test notification through the saved channel.
+    pub async fn send_test(&self) -> Result<(), SendError> {
+        self.request(|reply| ActorCommand::Test { reply }).await
+    }
+
+    /// Sends a digest of the last 24 h now (does not affect the daily one).
+    pub async fn send_digest_now(&self) -> Result<(), SendError> {
+        self.request(|reply| ActorCommand::DigestNow { reply })
+            .await
+    }
+
+    /// The settings as the Config page sees them (no secrets).
+    pub async fn settings_view(&self) -> NotificationsView {
+        let config = read_committed(&self.paths.config_cache_path).await;
+        let (source, settings) = effective_settings(config.as_ref(), &self.legacy);
+        NotificationsView::new(source, settings.as_ref().map_err(String::as_str))
+    }
+
+    /// Validates and saves a Config page update into `config.json`, then
+    /// applies it without a restart.
+    pub async fn save_settings(
+        &self,
+        update: NotificationsUpdate,
+    ) -> Result<NotificationsView, SaveError> {
+        let merged = {
+            let _guard = SAVE_LOCK.lock().await;
+            let config = read_committed(&self.paths.config_cache_path).await;
+            let (_, current) = effective_settings(config.as_ref(), &self.legacy);
+            let merged = merge_update(current.ok().as_ref(), update);
+            validate_for_save(&merged).map_err(SaveError::Invalid)?;
+            write_notifications(&self.paths, &merged)
+                .await
+                .map_err(|error| SaveError::Io(error.to_string()))?;
+            merged
+        };
+        tracing::info!("notification settings saved from the dashboard");
+        self.reload().await;
+        Ok(NotificationsView::new("config", Ok(&merged)))
     }
 }
 
@@ -1400,12 +2034,653 @@ async fn flush(
     }
 }
 
+/// Signals gathered alongside the `Observation`, used by the digest.
+#[derive(Debug, Clone)]
+struct Extras {
+    sync: SyncStatus,
+    state_disk: Option<(u64, u64)>,
+    uptime_secs: u64,
+}
+
+#[derive(Debug, Default)]
+struct HeartbeatRuntime {
+    /// Where the pending scheduled message lives, as far as this process
+    /// knows.
+    armed_on: Option<ArmedOn>,
+    /// A message orphaned by a settings change, to cancel before
+    /// `deadline` (when it would be delivered anyway).
+    pending_cancel: Option<(ArmedOn, DateTime<Utc>)>,
+    withheld_reason: Option<String>,
+    last_error: Option<String>,
+    dry_run_logged_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Default)]
+struct DigestRuntime {
+    pending: Option<(DateTime<Utc>, Digest)>,
+    last_sent_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+}
+
+struct Actor {
+    sources: AlertSources,
+    legacy: AlertsSetup,
+    source: &'static str,
+    /// The settings currently applied; `None` before the first tick.
+    effective: Option<Result<NotificationSettings, String>>,
+    setup: AlertsSetup,
+    monitor: Monitor,
+    tracker: OutcomeTracker,
+    outbox: Outbox,
+    delivery: DeliveryState,
+    digest_state: DigestState,
+    dirty: bool,
+    started_at: DateTime<Utc>,
+    heartbeat: HeartbeatRuntime,
+    digest: DigestRuntime,
+    last_manual_send_at: Option<DateTime<Utc>>,
+    tz: Tz,
+    last_observation: Option<(Observation, Extras)>,
+    /// The `curl` binary used to cancel an orphaned heartbeat.
+    curl: PathBuf,
+}
+
+fn station_tz(schedule: &ScheduleConfig) -> Tz {
+    schedule
+        .station
+        .as_ref()
+        .and_then(|station| station.timezone.parse().ok())
+        .unwrap_or(chrono_tz::UTC)
+}
+
+fn local_time(at: DateTime<Utc>, tz: Tz) -> String {
+    at.with_timezone(&tz).format("%a %H:%M %Z").to_string()
+}
+
+async fn run_actor(
+    legacy: AlertsSetup,
+    sources: AlertSources,
+    monitor: Monitor,
+    status_tx: watch::Sender<AlertsStatus>,
+    mut commands: mpsc::Receiver<ActorCommand>,
+) {
+    import_legacy(&sources.config_paths, &legacy).await;
+    let (digest_state, warning) = DigestState::load(&sources.digest_state_path);
+    if let Some(warning) = warning {
+        tracing::warn!(%warning, path = %sources.digest_state_path.display(), "digest state");
+    }
+    let mut actor = Actor {
+        sources,
+        legacy,
+        source: "none",
+        effective: None,
+        setup: dry_run_setup("not evaluated yet"),
+        monitor,
+        tracker: OutcomeTracker::default(),
+        outbox: Outbox::default(),
+        delivery: DeliveryState::default(),
+        digest_state,
+        dirty: false,
+        started_at: Utc::now(),
+        heartbeat: HeartbeatRuntime::default(),
+        digest: DigestRuntime::default(),
+        last_manual_send_at: None,
+        tz: chrono_tz::UTC,
+        last_observation: None,
+        curl: PathBuf::from("curl"),
+    };
+    let mut interval = tokio::time::interval(POLL_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut commands_open = true;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => actor.tick().await,
+            command = commands.recv(), if commands_open => match command {
+                Some(ActorCommand::Reload) => actor.tick().await,
+                Some(ActorCommand::Test { reply }) => {
+                    let _ = reply.send(actor.send_test().await);
+                }
+                Some(ActorCommand::DigestNow { reply }) => {
+                    let _ = reply.send(actor.send_digest_now().await);
+                }
+                None => commands_open = false,
+            },
+        }
+        status_tx.send_modify(|status| actor.fill_status(status));
+    }
+}
+
+impl Actor {
+    async fn tick(&mut self) {
+        let now = Utc::now();
+        let config = read_committed(&self.sources.config_paths.config_cache_path).await;
+        let schedule = config
+            .as_ref()
+            .and_then(|config| config.get("schedule"))
+            .and_then(|schedule| serde_json::from_value::<ScheduleConfig>(schedule.clone()).ok())
+            .unwrap_or_default();
+        self.tz = station_tz(&schedule);
+        self.apply_settings(now, config.as_ref());
+
+        let (observation, extras) = gather(
+            &self.sources,
+            &mut self.tracker,
+            &self.monitor.thresholds,
+            schedule,
+            now,
+        )
+        .await;
+        for notification in self.monitor.observe(&observation) {
+            tracing::info!(
+                condition = ?notification.condition,
+                transition = ?notification.transition,
+                detail = %notification.detail,
+                "health alert state change"
+            );
+            if notification.transition == Transition::Fired {
+                self.digest_state
+                    .record_alert(now, notification.condition.title());
+                self.dirty = true;
+            }
+            self.outbox.push(notification);
+        }
+        flush(
+            &mut self.outbox,
+            &self.setup.notifier,
+            self.setup.station_name.as_deref(),
+            &mut self.delivery,
+        )
+        .await;
+
+        self.dirty |= self
+            .digest_state
+            .record_run_state(now, observation.scheduler_running);
+        self.dirty |= self.digest_state.record_sample(
+            now,
+            Sample {
+                cpu_temp_celsius: observation.cpu_temp_celsius,
+                capture_disk: observation.capture_disk,
+                transferred: Some((extras.sync.transferred_files, extras.sync.transferred_bytes)),
+            },
+        );
+        self.digest_state.prune(now);
+
+        self.heartbeat_step(now).await;
+        self.digest_step(now, &observation, &extras).await;
+        self.last_observation = Some((observation, extras));
+        self.persist().await;
+    }
+
+    /// Applies the settings in effect if they changed since the last tick.
+    fn apply_settings(&mut self, now: DateTime<Utc>, config: Option<&Value>) {
+        let (source, effective) = effective_settings(config, &self.legacy);
+        if self.source == source && self.effective.as_ref() == Some(&effective) {
+            return;
+        }
+        let setup = match (&effective, source) {
+            // Keeps the legacy file's own warnings (e.g. file mode).
+            (Ok(_), "alerts_file") => self.legacy.clone(),
+            (Ok(settings), _) => resolve(settings),
+            (Err(reason), _) => dry_run_setup(reason),
+        };
+        let new_armed = match (&setup.heartbeat, &setup.notifier) {
+            (Some(plan), Notifier::Ntfy(sender)) => {
+                Some(ArmedOn::new(&sender.config, &plan.sequence_id))
+            }
+            _ => None,
+        };
+        let last_checkin = self.digest_state.heartbeat_last_checkin;
+        if self.effective.is_none() {
+            // First tick after a start: a message armed by the previous run
+            // is assumed to be on the current channel.
+            if let Some(plan) = &setup.heartbeat
+                && optic_heartbeat::is_armed(last_checkin, now, plan.alert_after)
+            {
+                self.heartbeat.armed_on = new_armed.clone();
+            }
+        } else if optic_heartbeat::cancel_needed(
+            self.heartbeat.armed_on.as_ref(),
+            new_armed.as_ref(),
+        ) && let Some(armed) = self.heartbeat.armed_on.take()
+        {
+            let old_alert_after = self.setup.heartbeat.as_ref().map_or(
+                Duration::seconds(optic_heartbeat::MAX_ALERT_AFTER_SECS as i64),
+                |plan| plan.alert_after,
+            );
+            if let Some(last) = last_checkin
+                && optic_heartbeat::is_armed(Some(last), now, old_alert_after)
+            {
+                tracing::info!(
+                    "notification settings changed; cancelling the armed heartbeat on the previous channel"
+                );
+                self.heartbeat.pending_cancel = Some((armed, last + old_alert_after));
+            }
+            // The new channel starts fresh: check in at once, and no false
+            // "checking in again" notice.
+            self.digest_state.heartbeat_last_checkin = None;
+            self.dirty = true;
+        }
+        match &setup.config_error {
+            Some(error) => tracing::warn!(source, %error, "notifications running in dry-run mode"),
+            None => tracing::info!(
+                source,
+                channel = setup.notifier.channel(),
+                digest = setup.digest_send_at.is_some(),
+                heartbeat = setup.heartbeat.is_some(),
+                "notification settings applied"
+            ),
+        }
+        for warning in &setup.config_warnings {
+            tracing::warn!(%warning, "notification settings warning");
+        }
+        self.monitor.thresholds = setup.thresholds.clone();
+        self.setup = setup;
+        self.source = source;
+        self.effective = Some(effective);
+    }
+
+    fn heartbeat_state(&self) -> &'static str {
+        match (&self.setup.heartbeat, &self.setup.notifier) {
+            (None, _) => "disabled",
+            (Some(_), Notifier::DryRun) => "dry_run",
+            _ if self.heartbeat.withheld_reason.is_some() => "withheld",
+            _ if self.heartbeat.last_error.is_some() => "failing",
+            _ => "ok",
+        }
+    }
+
+    async fn heartbeat_step(&mut self, now: DateTime<Utc>) {
+        if let Some((armed, deadline)) = self.heartbeat.pending_cancel.clone() {
+            if now >= deadline {
+                tracing::warn!(
+                    "the heartbeat on the previous channel could not be cancelled before it was delivered"
+                );
+                self.heartbeat.pending_cancel = None;
+            } else {
+                match run_curl(&self.curl, optic_heartbeat::cancel_curl_config(&armed)).await {
+                    Ok(()) => {
+                        tracing::info!("cancelled the heartbeat armed on the previous channel");
+                        self.heartbeat.pending_cancel = None;
+                    }
+                    // Already delivered or never stored: nothing to cancel.
+                    Err(error) if error.contains("404") => {
+                        self.heartbeat.pending_cancel = None;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "cancelling the previous heartbeat failed; will retry");
+                        self.heartbeat.last_error = Some(format!("cancel failed: {error}"));
+                    }
+                }
+            }
+        }
+
+        let Some(plan) = self.setup.heartbeat.clone() else {
+            self.heartbeat.withheld_reason = None;
+            return;
+        };
+        let withheld_by = self.monitor.active_titles(true);
+        match optic_heartbeat::gate(&withheld_by, self.sources.camera_detected) {
+            Err(reason) => {
+                if self.heartbeat.withheld_reason.is_none() {
+                    tracing::warn!(%reason, "heartbeat withheld");
+                    self.digest_state.record_withheld(now);
+                    self.dirty = true;
+                }
+                self.heartbeat.withheld_reason = Some(reason);
+                return;
+            }
+            Ok(()) => {
+                if self.heartbeat.withheld_reason.take().is_some() {
+                    tracing::info!("heartbeat resumed");
+                }
+            }
+        }
+        let last = self.digest_state.heartbeat_last_checkin;
+        let station = self.setup.station_name.clone();
+        let sender = match &self.setup.notifier {
+            Notifier::DryRun => {
+                if self
+                    .heartbeat
+                    .dry_run_logged_at
+                    .is_none_or(|at| now - at >= plan.interval)
+                {
+                    tracing::info!("heartbeat (dry run): would check in");
+                    self.heartbeat.dry_run_logged_at = Some(now);
+                }
+                return;
+            }
+            Notifier::Ntfy(sender) => sender.clone(),
+        };
+        if !optic_heartbeat::is_due(last, now, &plan) {
+            return;
+        }
+        let now_local = local_time(now, self.tz);
+        let (title, message) =
+            optic_heartbeat::silent_alert(station.as_deref(), plan.alert_after, &now_local);
+        match sender
+            .run(optic_heartbeat::arm_curl_config(
+                &sender.config,
+                &plan,
+                &title,
+                &message,
+            ))
+            .await
+        {
+            Ok(()) => {
+                tracing::debug!("heartbeat checked in");
+                self.digest_state.heartbeat_last_checkin = Some(now);
+                self.dirty = true;
+                self.heartbeat.last_error = None;
+                self.heartbeat.armed_on = Some(ArmedOn::new(&sender.config, &plan.sequence_id));
+                if let (Some(previous), Some(gap)) = (
+                    last,
+                    optic_heartbeat::silent_period(last, now, plan.alert_after),
+                ) {
+                    let (title, message) = optic_heartbeat::back_notice(
+                        station.as_deref(),
+                        &local_time(previous, self.tz),
+                        &now_local,
+                        &optic_digest::format_duration(gap),
+                    );
+                    if let Err(error) = self
+                        .setup
+                        .notifier
+                        .publish(&title, &message, 3, "white_check_mark")
+                        .await
+                    {
+                        tracing::warn!(%error, "could not send the heartbeat recovery notice");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "heartbeat check-in failed; will retry next tick");
+                self.heartbeat.last_error = Some(error);
+            }
+        }
+    }
+
+    async fn digest_step(
+        &mut self,
+        now: DateTime<Utc>,
+        observation: &Observation,
+        extras: &Extras,
+    ) {
+        if let Some(send_at) = self.setup.digest_send_at {
+            match optic_digest::decide(now, self.tz, send_at, self.digest_state.last_digest_due) {
+                Decision::Idle => {}
+                Decision::Initialize { due } => {
+                    self.digest_state.last_digest_due = Some(due);
+                    self.dirty = true;
+                }
+                Decision::Skip { due } => {
+                    tracing::warn!(%due, "daily digest skipped: more than 12 h late");
+                    self.digest_state.last_digest_due = Some(due);
+                    self.dirty = true;
+                }
+                Decision::Send { start, end } => {
+                    let digest = self
+                        .build_digest(start, end, now, observation, extras)
+                        .await;
+                    self.digest.pending = Some((end, digest));
+                    self.digest_state.last_digest_due = Some(end);
+                    self.dirty = true;
+                }
+            }
+        }
+        if let Some((due, digest)) = self.digest.pending.clone() {
+            if now - due > optic_digest::CATCH_UP {
+                tracing::warn!(%due, "daily digest dropped: undelivered for 12 h");
+                self.digest.pending = None;
+                return;
+            }
+            match self
+                .setup
+                .notifier
+                .publish(&digest.title, &digest.message, 2, "bar_chart")
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(%due, "daily digest sent");
+                    self.digest.pending = None;
+                    self.digest.last_sent_at = Some(now);
+                    self.digest.last_error = None;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "daily digest delivery failed; will retry");
+                    self.digest.last_error = Some(error);
+                }
+            }
+        }
+    }
+
+    async fn build_digest(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        now: DateTime<Utc>,
+        observation: &Observation,
+        extras: &Extras,
+    ) -> Digest {
+        let rows: Vec<CaptureRow> = match &self.sources.capture_log {
+            Some(log) => log
+                .window_rows(start.timestamp(), end.timestamp())
+                .await
+                .into_iter()
+                .map(|row| CaptureRow {
+                    at: Utc
+                        .timestamp_opt(row.captured_at_unix, 0)
+                        .single()
+                        .unwrap_or(start),
+                    scheduled: row.source == "scheduler",
+                    success: row.success,
+                    bytes: row.bytes_total,
+                    error: row.error,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let events: Vec<EventRow> = match &self.sources.events {
+            Some(log) => log
+                .list(200)
+                .await
+                .into_iter()
+                .map(|event| EventRow {
+                    at: Utc
+                        .timestamp_millis_opt(event.occurred_at_unix_ms)
+                        .single()
+                        .unwrap_or(start),
+                    unexpected: event
+                        .detail
+                        .pointer("/previous_boot/ended")
+                        .and_then(Value::as_str)
+                        == Some("unexpected"),
+                    kind: event.kind,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let heartbeat = self.setup.heartbeat.as_ref().map(|_| HeartbeatSnapshot {
+            state: self.heartbeat_state().to_owned(),
+            last_checkin: self.digest_state.heartbeat_last_checkin,
+        });
+        let sync = &extras.sync;
+        optic_digest::build(&DigestInput {
+            start,
+            end,
+            tz: self.tz,
+            station_name: self.setup.station_name.as_deref(),
+            schedule: &observation.schedule,
+            rows: &rows,
+            state: &self.digest_state,
+            sync: Some(SyncSnapshot {
+                enabled: sync.enabled,
+                paused: sync.paused,
+                queued_files: sync.queued_files,
+                queued_bytes: sync.queued_bytes,
+                connectivity: serde_json::to_value(sync.connectivity)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".to_owned()),
+                last_error: sync.last_error.clone(),
+            }),
+            capture_disk: observation.capture_disk,
+            state_disk: extras.state_disk,
+            active_alerts: self
+                .monitor
+                .active_titles(false)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            events: &events,
+            heartbeat,
+            host_uptime_secs: Some(extras.uptime_secs),
+            daemon_started_at: self.started_at,
+            version: self.sources.version,
+            now,
+        })
+    }
+
+    /// Re-reads the settings (a save may have just happened) and applies the
+    /// manual-send rules shared by the test and on-demand digest.
+    async fn manual_send_allowed(&mut self, now: DateTime<Utc>) -> Result<(), SendError> {
+        let config = read_committed(&self.sources.config_paths.config_cache_path).await;
+        self.apply_settings(now, config.as_ref());
+        if matches!(self.setup.notifier, Notifier::DryRun) {
+            return Err(SendError::NotConfigured(
+                self.setup
+                    .config_error
+                    .clone()
+                    .unwrap_or_else(|| "notifications are turned off".to_owned()),
+            ));
+        }
+        if self
+            .last_manual_send_at
+            .is_some_and(|at| now - at < MANUAL_SEND_SPACING)
+        {
+            return Err(SendError::RateLimited);
+        }
+        self.last_manual_send_at = Some(now);
+        Ok(())
+    }
+
+    async fn send_test(&mut self) -> Result<(), SendError> {
+        let now = Utc::now();
+        self.manual_send_allowed(now).await?;
+        let station = self
+            .setup
+            .station_name
+            .as_deref()
+            .map(|name| format!(" {name}"))
+            .unwrap_or_default();
+        self.setup
+            .notifier
+            .publish(
+                &format!("Optic{station}: test notification"),
+                &format!(
+                    "Sent from the Config page at {}. Notifications are working.",
+                    local_time(now, self.tz)
+                ),
+                3,
+                "test_tube",
+            )
+            .await
+            .map_err(SendError::Failed)
+    }
+
+    async fn send_digest_now(&mut self) -> Result<(), SendError> {
+        let now = Utc::now();
+        self.manual_send_allowed(now).await?;
+        let Some((observation, extras)) = self.last_observation.clone() else {
+            return Err(SendError::Failed(
+                "no data gathered yet; try again in a few seconds".to_owned(),
+            ));
+        };
+        let digest = self
+            .build_digest(now - Duration::hours(24), now, now, &observation, &extras)
+            .await;
+        self.setup
+            .notifier
+            .publish(&digest.title, &digest.message, 2, "bar_chart")
+            .await
+            .map_err(SendError::Failed)
+    }
+
+    async fn persist(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let state = self.digest_state.clone();
+        let path = self.sources.digest_state_path.clone();
+        match tokio::task::spawn_blocking(move || state.save(&path)).await {
+            Ok(Ok(())) => self.dirty = false,
+            Ok(Err(error)) => tracing::warn!(%error, "could not save the digest state; will retry"),
+            Err(error) => tracing::warn!(%error, "digest state save task failed"),
+        }
+    }
+
+    fn fill_status(&self, status: &mut AlertsStatus) {
+        let now = Utc::now();
+        status.channel = self.setup.notifier.channel();
+        status.settings_source = self.source;
+        status.config_error = self.setup.config_error.clone();
+        status.config_warnings = self.setup.config_warnings.clone();
+        status.last_evaluated_at = self.monitor.last_evaluated_at;
+        status.conditions = self.monitor.condition_statuses();
+        status.active_count = status
+            .conditions
+            .iter()
+            .filter(|c| matches!(c.state, "firing" | "recovering"))
+            .count();
+        status.outbox_len = self.outbox.queue.len();
+        status.last_delivered_at = self.delivery.last_delivered_at;
+        status.last_delivery_error = self.delivery.last_error.clone();
+        status.thresholds = self.setup.thresholds.clone();
+        status.digest = DigestStatus {
+            enabled: self.setup.digest_send_at.is_some(),
+            send_at: self
+                .setup
+                .digest_send_at
+                .map(|at| at.format("%H:%M").to_string()),
+            timezone: self.tz.name().to_owned(),
+            next_due_at: self.setup.digest_send_at.map(|send_at| {
+                optic_digest::next_due(
+                    optic_digest::due_at(now, self.tz, send_at),
+                    self.tz,
+                    send_at,
+                )
+            }),
+            last_window_end: self.digest_state.last_digest_due,
+            last_sent_at: self.digest.last_sent_at,
+            pending: self.digest.pending.is_some(),
+            last_error: self.digest.last_error.clone(),
+        };
+        let plan = self.setup.heartbeat.as_ref();
+        let state = self.heartbeat_state();
+        let last_checkin = self.digest_state.heartbeat_last_checkin;
+        status.heartbeat = HeartbeatStatus {
+            state,
+            interval_secs: plan.map(|plan| plan.interval.num_seconds() as u64),
+            alert_after_secs: plan.map(|plan| plan.alert_after.num_seconds() as u64),
+            last_checkin_at: last_checkin,
+            next_checkin_at: match (state, plan) {
+                ("ok" | "failing", Some(plan)) => {
+                    Some(last_checkin.map_or(now, |at| at + plan.interval))
+                }
+                _ => None,
+            },
+            withheld_reason: self.heartbeat.withheld_reason.clone(),
+            last_error: self.heartbeat.last_error.clone(),
+        };
+    }
+}
+
 async fn gather(
     sources: &AlertSources,
     tracker: &mut OutcomeTracker,
     thresholds: &Thresholds,
-) -> Observation {
-    let now = Utc::now();
+    schedule: ScheduleConfig,
+    now: DateTime<Utc>,
+) -> (Observation, Extras) {
     let scheduler = sources.scheduler.status();
     tracker.record(scheduler.last_capture.as_ref());
     let (recent_outcomes, last_success_at) = match &sources.capture_log {
@@ -1435,17 +2710,16 @@ async fn gather(
             tracker.last_success_at,
         ),
     };
-    let schedule = match durable_state::read_cached(&sources.config_cache_path).await {
-        Ok(content) => {
-            serde_json::from_str::<AppConfig>(&content)
-                .unwrap_or_default()
-                .schedule
-        }
-        Err(_) => ScheduleConfig::default(),
-    };
     let sync = sources.sync.status();
     let system = sources.system_status.snapshot().await;
-    Observation {
+    let disk = |label: &str| {
+        system
+            .disks
+            .iter()
+            .find(|disk| disk.label == label)
+            .map(|disk| (disk.total_bytes, disk.available_bytes))
+    };
+    let observation = Observation {
         now,
         scheduler_running: scheduler.run_state == ScheduleRunState::Running,
         next_capture_at: scheduler.next_capture_at,
@@ -1458,16 +2732,18 @@ async fn gather(
             queued_files: sync.queued_files,
             queued_bytes: sync.queued_bytes,
             transferred_files: sync.transferred_files,
-            last_error: sync.last_error,
+            last_error: sync.last_error.clone(),
         }),
-        capture_disk: system
-            .disks
-            .iter()
-            .find(|disk| disk.label == "capture")
-            .map(|disk| (disk.total_bytes, disk.available_bytes)),
+        capture_disk: disk("capture"),
         cpu_temp_celsius: system.cpu_temp_celsius,
         throttled: read_throttled().await,
-    }
+    };
+    let extras = Extras {
+        state_disk: disk("state"),
+        uptime_secs: system.uptime_seconds,
+        sync,
+    };
+    (observation, extras)
 }
 
 fn scheduled_filter(success: Option<bool>, limit: u32) -> CaptureQueryFilter {
@@ -2214,6 +3490,16 @@ mod tests {
         }
     }
 
+    fn curl_config(
+        ntfy: &NtfyConfig,
+        title: &str,
+        message: &str,
+        transition: Transition,
+    ) -> String {
+        let (priority, tag) = transition_style(transition);
+        publish_curl_config(ntfy, title, message, priority, tag)
+    }
+
     #[test]
     fn curl_config_carries_url_body_and_bearer_token() {
         let config = curl_config(
@@ -2399,10 +3685,457 @@ mod tests {
             last_delivered_at: None,
             last_delivery_error: None,
             thresholds: setup.thresholds,
+            settings_source: "config",
+            digest: DigestStatus::default(),
+            heartbeat: HeartbeatStatus::default(),
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("\"channel\":\"ntfy\""));
         assert!(json.contains("\"condition\":\"capture_stalled\""));
         assert!(!json.contains("secret-topic") && !json.contains("tk_secret"));
+    }
+
+    // --- notification settings in config.json ------------------------------
+
+    const SECRET_TOPIC: &str = "optic-secret-topic-a7f3";
+    const SECRET_TOKEN: &str = "tk_supersecret";
+
+    fn settings_json() -> String {
+        format!(
+            r#"{{"station_name": "optic",
+                "ntfy": {{"topic": "{SECRET_TOPIC}", "token": "{SECRET_TOKEN}"}},
+                "digest": {{"send_at": "07:30"}},
+                "heartbeat": {{"interval_secs": 300, "alert_after_secs": 1200}},
+                "thresholds": {{"sync_backlog_after_secs": 600}}}}"#
+        )
+    }
+
+    #[test]
+    fn digest_and_heartbeat_sections_resolve_and_the_heartbeat_is_opt_in() {
+        let setup = parse_config(&settings_json());
+        assert_eq!(setup.config_error, None);
+        assert_eq!(setup.digest_send_at, NaiveTime::from_hms_opt(7, 30, 0));
+        let plan = setup.heartbeat.unwrap();
+        assert_eq!(plan.interval, Duration::minutes(5));
+        assert_eq!(plan.alert_after, Duration::minutes(20));
+        assert_eq!(plan.sequence_id, optic_heartbeat::DEFAULT_SEQUENCE_ID);
+
+        let minimal = parse_config(r#"{"ntfy": {"topic": "x"}}"#);
+        assert_eq!(minimal.digest_send_at, NaiveTime::from_hms_opt(8, 0, 0));
+        assert!(minimal.heartbeat.is_none(), "no section = no heartbeat");
+        let off = parse_config(
+            r#"{"ntfy": {"topic": "x"}, "heartbeat": {"enabled": false}, "digest": {"enabled": false}}"#,
+        );
+        assert!(off.heartbeat.is_none() && off.digest_send_at.is_none());
+    }
+
+    #[test]
+    fn out_of_range_values_on_disk_are_clamped_or_switched_off_with_warnings() {
+        let setup = parse_config(
+            r#"{"ntfy": {"topic": "x"}, "digest": {"send_at": "8am"},
+                "heartbeat": {"interval_secs": 5, "alert_after_secs": 999999999}}"#,
+        );
+        assert_eq!(setup.config_error, None);
+        assert!(setup.digest_send_at.is_none());
+        let plan = setup.heartbeat.unwrap();
+        assert_eq!(plan.interval, Duration::seconds(60));
+        assert_eq!(plan.alert_after, Duration::days(3));
+        assert!(
+            setup
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("digest is off"))
+        );
+        assert!(setup.config_warnings.iter().any(|w| w.contains("clamped")));
+        let bad_seq =
+            parse_config(r#"{"ntfy": {"topic": "x"}, "heartbeat": {"sequence_id": "a b"}}"#);
+        assert!(bad_seq.heartbeat.is_none());
+        assert!(
+            bad_seq
+                .config_warnings
+                .iter()
+                .any(|w| w.contains("heartbeat is off"))
+        );
+    }
+
+    fn valid_settings() -> NotificationSettings {
+        serde_json::from_str(&settings_json()).unwrap()
+    }
+
+    #[test]
+    fn save_validation_is_strict_and_rejects_masked_secrets() {
+        assert_eq!(validate_for_save(&valid_settings()), Ok(()));
+        type Mutation = Box<dyn Fn(&mut NotificationSettings)>;
+        let cases: Vec<(Mutation, &str)> = vec![
+            (Box::new(|s| s.ntfy = None), "topic is required"),
+            (
+                Box::new(|s| s.ntfy.as_mut().unwrap().topic = "opti****a7f3".to_owned()),
+                "ntfy.topic",
+            ),
+            (
+                Box::new(|s| s.ntfy.as_mut().unwrap().token = Some("tk_s****cret".to_owned())),
+                "ntfy.token",
+            ),
+            (Box::new(|s| s.digest.send_at = "25:00".to_owned()), "HH:MM"),
+            (
+                Box::new(|s| s.heartbeat.as_mut().unwrap().interval_secs = 30),
+                "interval",
+            ),
+            (
+                Box::new(|s| s.heartbeat.as_mut().unwrap().alert_after_secs = 400),
+                "at least the interval",
+            ),
+            (
+                Box::new(|s| s.heartbeat.as_mut().unwrap().sequence_id = "x/y".to_owned()),
+                "sequence ID",
+            ),
+            (
+                Box::new(|s| s.station_name = Some("a\nb".to_owned())),
+                "station name",
+            ),
+        ];
+        for (mutate, needle) in cases {
+            let mut settings = valid_settings();
+            mutate(&mut settings);
+            let error = validate_for_save(&settings).unwrap_err();
+            assert!(error.contains(needle), "{needle}: {error}");
+        }
+        let mut disabled = valid_settings();
+        disabled.enabled = false;
+        disabled.ntfy = None;
+        assert_eq!(
+            validate_for_save(&disabled),
+            Ok(()),
+            "off without a topic is fine"
+        );
+    }
+
+    #[test]
+    fn secrets_show_only_4_plus_4_characters_and_short_ones_nothing() {
+        assert_eq!(mask_secret("optic-abcdefghijkmnpqrstuvwx"), "opti****uvwx");
+        assert_eq!(
+            mask_secret("tk_abcdefghijklmnopqrstuvwxyz123"),
+            "tk_a****z123"
+        );
+        assert_eq!(mask_secret("exactly16chars!!"), "exac****rs!!");
+        assert_eq!(mask_secret("fifteen-chars-x"), "****");
+        assert_eq!(mask_secret(""), "****");
+        // Masks never validate as secrets.
+        let masked = NtfyConfig {
+            server: DEFAULT_NTFY_SERVER.to_owned(),
+            topic: "opti****uvwx".to_owned(),
+            token: None,
+        };
+        assert!(validate_ntfy(&masked).is_err());
+        let masked_token = NtfyConfig {
+            topic: "optic-x".to_owned(),
+            token: Some("tk_a****z123".to_owned()),
+            ..masked
+        };
+        assert!(validate_ntfy(&masked_token).is_err());
+    }
+
+    #[test]
+    fn redaction_masks_topic_and_token_at_any_depth() {
+        let mut value: Value = serde_json::from_str(&settings_json()).unwrap();
+        value["misplaced"] =
+            serde_json::json!({"topic": "short", "token": 42, "list": [{"token": "tk_x"}]});
+        redact_notifications(&mut value);
+        let text = value.to_string();
+        assert!(
+            !text.contains(SECRET_TOPIC) && !text.contains(SECRET_TOKEN),
+            "{text}"
+        );
+        assert!(!text.contains("tk_x") && !text.contains("short"));
+        assert_eq!(value["ntfy"]["topic"], "opti****a7f3");
+        assert_eq!(
+            value["ntfy"]["token"], "****",
+            "14 characters: fully masked"
+        );
+        assert_eq!(value["station_name"], "optic");
+        let mut no_token: Value = serde_json::json!({"ntfy": {"topic": "abc", "token": null}});
+        redact_notifications(&mut no_token);
+        assert_eq!(no_token["ntfy"]["token"], Value::Null);
+        assert_eq!(no_token["ntfy"]["topic"], "****");
+        // A masked value can never be saved back.
+        let masked: NotificationSettings = serde_json::from_value(
+            value
+                .get("ntfy")
+                .map(|ntfy| serde_json::json!({"ntfy": ntfy}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(validate_for_save(&masked).is_err());
+    }
+
+    #[test]
+    fn app_config_keeps_the_notifications_section_through_a_staging_round_trip() {
+        // What every staging handler does: parse, change one field, re-serialize.
+        let text = format!(
+            r#"{{"save_dng": false, "notifications": {}}}"#,
+            settings_json()
+        );
+        let mut config: crate::camera::AppConfig = serde_json::from_str(&text).unwrap();
+        config.save_dng = true;
+        let restaged: crate::camera::AppConfig =
+            serde_json::from_str(&serde_json::to_string_pretty(&config).unwrap()).unwrap();
+        let section: NotificationSettings =
+            serde_json::from_value(restaged.notifications.unwrap()).unwrap();
+        assert_eq!(section, valid_settings());
+        // A malformed section never breaks the rest of the config.
+        let broken: crate::camera::AppConfig =
+            serde_json::from_str(r#"{"save_dng": true, "notifications": {"ntfy": 7}}"#).unwrap();
+        assert!(broken.save_dng);
+        // And a config without the section serializes without it.
+        let plain = serde_json::to_string(&crate::camera::AppConfig::default()).unwrap();
+        assert!(!plain.contains("notifications"));
+    }
+
+    fn update(topic: Option<&str>, token: Option<&str>, clear_token: bool) -> NotificationsUpdate {
+        NotificationsUpdate {
+            enabled: true,
+            station_name: Some("  roof  ".to_owned()),
+            server: Some("https://ntfy.example/".to_owned()),
+            topic: topic.map(str::to_owned),
+            token: token.map(str::to_owned),
+            clear_token,
+            digest: DigestSettings::default(),
+            heartbeat: HeartbeatSettings::default(),
+        }
+    }
+
+    #[test]
+    fn merge_keeps_secrets_unless_replaced_or_cleared_and_always_keeps_thresholds() {
+        let current = valid_settings();
+        let kept = merge_update(Some(&current), update(Some(""), None, false));
+        let ntfy = kept.ntfy.as_ref().unwrap();
+        assert_eq!(
+            (ntfy.topic.as_str(), ntfy.token.as_deref()),
+            (SECRET_TOPIC, Some(SECRET_TOKEN))
+        );
+        assert_eq!(ntfy.server, "https://ntfy.example");
+        assert_eq!(kept.station_name.as_deref(), Some("roof"));
+        assert_eq!(kept.thresholds.sync_backlog_after_secs, 600);
+        assert!(kept.heartbeat.is_some());
+
+        let replaced = merge_update(
+            Some(&current),
+            update(Some(" optic-new "), Some("tk_new"), false),
+        );
+        let ntfy = replaced.ntfy.unwrap();
+        assert_eq!(
+            (ntfy.topic.as_str(), ntfy.token.as_deref()),
+            ("optic-new", Some("tk_new"))
+        );
+
+        let cleared = merge_update(Some(&current), update(None, Some("ignored"), true));
+        assert_eq!(cleared.ntfy.unwrap().token, None);
+
+        let fresh = merge_update(None, update(None, None, false));
+        assert!(fresh.ntfy.is_none());
+        assert_eq!(fresh.thresholds, Thresholds::default());
+    }
+
+    fn config_paths(dir: &Path) -> ConfigPaths {
+        ConfigPaths {
+            config_path: dir.join("state/config.json"),
+            config_cache_path: dir.join("cache/config.json"),
+            preview_config_path: dir.join("capture/preview_config.json"),
+        }
+    }
+
+    #[tokio::test]
+    async fn saving_updates_committed_and_staged_config_and_preserves_everything_else() {
+        let dir = temp_dir("save-staged");
+        let paths = config_paths(&dir);
+        let committed = r#"{"save_dng": true, "schedule": {"rules": []}}"#;
+        durable_state::write_through(&paths.config_path, &paths.config_cache_path, committed)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(dir.join("capture")).unwrap();
+        // A staged, uncommitted edit (save_dng off).
+        std::fs::write(
+            &paths.preview_config_path,
+            r#"{"save_dng": false, "schedule": {"rules": []}}"#,
+        )
+        .unwrap();
+
+        write_notifications(&paths, &valid_settings())
+            .await
+            .unwrap();
+        let durable: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.config_path).unwrap()).unwrap();
+        let cache = std::fs::read_to_string(&paths.config_cache_path).unwrap();
+        assert_eq!(durable, serde_json::from_str::<Value>(&cache).unwrap());
+        assert_eq!(durable["save_dng"], true);
+        assert_eq!(durable["notifications"]["ntfy"]["topic"], SECRET_TOPIC);
+        let staged: Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.preview_config_path).unwrap())
+                .unwrap();
+        assert_eq!(staged["save_dng"], false, "the staged edit survives");
+        assert_eq!(
+            staged["notifications"]["ntfy"]["topic"], SECRET_TOPIC,
+            "a later commit keeps the new settings"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saving_with_an_unstaged_preview_leaves_nothing_staged() {
+        let dir = temp_dir("save-unstaged");
+        let paths = config_paths(&dir);
+        let committed = r#"{"save_dng": true}"#;
+        durable_state::write_through(&paths.config_path, &paths.config_cache_path, committed)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(dir.join("capture")).unwrap();
+        std::fs::write(&paths.preview_config_path, committed).unwrap();
+        write_notifications(&paths, &valid_settings())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&paths.preview_config_path).unwrap(),
+            std::fs::read_to_string(&paths.config_cache_path).unwrap(),
+            "byte-identical, so config_is_staged stays false"
+        );
+
+        // No preview at all: none is created.
+        std::fs::remove_file(&paths.preview_config_path).unwrap();
+        write_notifications(&paths, &valid_settings())
+            .await
+            .unwrap();
+        assert!(!paths.preview_config_path.exists());
+
+        // A committed config that is not JSON is never overwritten.
+        durable_state::write_through(&paths.config_path, &paths.config_cache_path, "{broken")
+            .await
+            .unwrap();
+        assert!(
+            write_notifications(&paths, &valid_settings())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.config_path).unwrap(),
+            "{broken"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_file_is_imported_once_and_never_overwrites_config_json() {
+        let dir = temp_dir("import");
+        let paths = config_paths(&dir);
+        durable_state::write_through(
+            &paths.config_path,
+            &paths.config_cache_path,
+            r#"{"save_dng": true}"#,
+        )
+        .await
+        .unwrap();
+        let legacy = parse_config(&settings_json());
+        import_legacy(&paths, &legacy).await;
+        let config = read_committed(&paths.config_cache_path).await.unwrap();
+        assert_eq!(config["save_dng"], true);
+        let (source, settings) = effective_settings(Some(&config), &legacy);
+        assert_eq!((source, settings.unwrap()), ("config", valid_settings()));
+
+        // A second import with different legacy content changes nothing.
+        let other = parse_config(r#"{"ntfy": {"topic": "other-topic"}}"#);
+        import_legacy(&paths, &other).await;
+        let again = read_committed(&paths.config_cache_path).await.unwrap();
+        assert_eq!(again["notifications"]["ntfy"]["topic"], SECRET_TOPIC);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn effective_settings_prefer_config_json_then_the_legacy_file() {
+        let legacy = parse_config(&settings_json());
+        let empty = serde_json::json!({"save_dng": true});
+        assert_eq!(effective_settings(Some(&empty), &legacy).0, "alerts_file");
+        let with_section = serde_json::json!({"notifications": {"enabled": false}});
+        let (source, settings) = effective_settings(Some(&with_section), &legacy);
+        assert_eq!(source, "config");
+        assert!(!settings.unwrap().enabled);
+        let invalid = serde_json::json!({"notifications": {"ntfy": {"topic": "x", "tokn": "y"}}});
+        let (source, settings) = effective_settings(Some(&invalid), &legacy);
+        assert_eq!(source, "config");
+        assert!(settings.unwrap_err().contains("config.json are invalid"));
+        let none = load_config(Path::new("/nonexistent/optic/alerts.json"));
+        let (source, settings) = effective_settings(None, &none);
+        assert_eq!(source, "none");
+        assert!(settings.unwrap_err().contains("not found"));
+    }
+
+    #[test]
+    fn settings_view_never_contains_the_topic_or_token() {
+        let view = NotificationsView::new("config", Ok(&valid_settings()));
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(
+            !json.contains(SECRET_TOPIC) && !json.contains(SECRET_TOKEN),
+            "{json}"
+        );
+        assert!(view.topic_set && view.token_set);
+        assert_eq!(view.topic_hint.as_deref(), Some("opti****a7f3"));
+        assert_eq!(view.token_hint.as_deref(), Some("****"));
+        assert!(view.heartbeat.enabled);
+        let none = NotificationsView::new("none", Err("no settings"));
+        assert!(!none.enabled && !none.topic_set && !none.heartbeat.enabled);
+        assert_eq!(none.server, DEFAULT_NTFY_SERVER);
+        assert_eq!(none.error.as_deref(), Some("no settings"));
+    }
+
+    #[test]
+    fn active_titles_split_capture_path_conditions() {
+        let mut monitor = Monitor::new(Thresholds::default(), t(0, 0, 0));
+        let failing = |now| Observation {
+            recent_outcomes: (0..3)
+                .map(|i| outcome(now - Duration::seconds(i), false))
+                .collect(),
+            capture_disk: Some((100, 1)),
+            ..running(now)
+        };
+        monitor.observe(&failing(t(0, 1, 0)));
+        assert_eq!(monitor.active_titles(true), vec!["captures failing"]);
+        assert_eq!(
+            monitor.active_titles(false),
+            vec!["captures failing", "capture tmpfs low"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn heartbeat_arm_passes_the_token_on_stdin_only() {
+        let dir = temp_dir("heartbeat-curl");
+        let sender = NtfySender {
+            config: ntfy(Some("tk_secret")),
+            curl: fake_curl(&dir, 0),
+        };
+        let plan = HeartbeatPlan {
+            interval: Duration::minutes(10),
+            alert_after: Duration::minutes(30),
+            sequence_id: "optic-heartbeat".to_owned(),
+        };
+        let (title, message) =
+            optic_heartbeat::silent_alert(None, plan.alert_after, "Mon 14:05 PDT");
+        sender
+            .run(optic_heartbeat::arm_curl_config(
+                &sender.config,
+                &plan,
+                &title,
+                &message,
+            ))
+            .await
+            .unwrap();
+        let stdin = std::fs::read_to_string(dir.join("stdin.txt")).unwrap();
+        assert!(stdin.contains("url = \"https://ntfy.sh/optic-test/optic-heartbeat\""));
+        assert!(stdin.contains("X-Delay: 30m"));
+        assert!(stdin.contains("Authorization: Bearer tk_secret"));
+        let args = std::fs::read_to_string(dir.join("args.txt")).unwrap();
+        assert!(
+            !args.contains("tk_secret") && !args.contains("optic-test"),
+            "{args}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

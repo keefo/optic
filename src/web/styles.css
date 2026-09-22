@@ -232,11 +232,29 @@ button.good:hover:not(:disabled) { border-color: var(--green); }
 .control-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
 .station-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }
 .station-grid > label { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 0.82rem; }
+.input-with-button { display: flex; gap: 10px; }
+.input-with-button > input { flex: 1; min-width: 0; }
+.input-with-button > button { flex: none; }
+.toggle-switch {
+  position: relative; align-self: flex-start; width: 84px; height: 36px; min-height: 36px;
+  padding: 0 12px 0 40px; border: 0; border-radius: 999px; background: var(--line); color: var(--muted);
+  font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; text-align: center;
+  transition: background 150ms ease, padding 150ms ease;
+}
+.toggle-switch::after {
+  content: ""; position: absolute; top: 4px; left: 4px; width: 28px; height: 28px; border-radius: 50%;
+  background: #d7dfdf; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45); transition: left 150ms ease;
+}
+.toggle-switch[aria-checked="true"] { padding: 0 40px 0 12px; background: var(--green); color: #07130e; }
+.toggle-switch[aria-checked="true"]::after { left: calc(100% - 32px); background: #fff; }
+.notifications-card h3 { margin: 24px 0 10px; }
+.notifications-card .controls-help { margin-top: 10px; }
+.notifications-card .section-heading + .controls-help { margin-top: -4px; }
 .control-grid > label { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 0.82rem; }
 .control-grid > label:nth-last-child(-n+3), fieldset { grid-column: 1 / -1; }
 output { float: right; color: var(--text); }
 
-select, input[type="number"], input[type="text"], input[type="time"] {
+select, input[type="number"], input[type="text"], input[type="time"], input[type="url"], input[type="password"] {
   width: 100%;
   min-height: 40px;
   border: 1px solid var(--line);

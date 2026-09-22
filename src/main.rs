@@ -7,7 +7,9 @@ mod native_codec;
 mod optic_alerts;
 mod optic_camera;
 mod optic_capture_log;
+mod optic_digest;
 mod optic_events;
+mod optic_heartbeat;
 mod optic_scheduler;
 mod optic_sync;
 mod system_status;
@@ -170,8 +172,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         initial_run_state,
     );
 
-    // Passive health monitor (docs/optic-daemon-alerts.md): reads the
-    // handles above, never changes them.
+    // Passive health monitor, daily digest and heartbeat
+    // (docs/optic-daemon-alerts.md, docs/optic-daemon-digest-heartbeat.md):
+    // reads the handles above, never changes them. Its settings live in
+    // config.json's `notifications` section; the legacy alerts.json is
+    // imported once.
     let alerts = optic_alerts::AlertsHandle::spawn(
         optic_alerts::load_config(&optic_alerts::resolve_config_path()),
         optic_alerts::AlertSources {
@@ -179,7 +184,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sync: sync.clone(),
             capture_log: capture_log.clone(),
             system_status: system_status.clone(),
-            config_cache_path: config_cache_path.clone(),
+            config_paths: optic_alerts::ConfigPaths {
+                config_path: config_path.clone(),
+                config_cache_path: config_cache_path.clone(),
+                // Same staging file AppState uses (web.rs AppState::new).
+                preview_config_path: capture_dir.join("preview_config.json"),
+            },
+            events: events.clone(),
+            digest_state_path: state_dir.join("digest_state.json"),
+            camera_detected: sensor.is_some(),
+            version: env!("CARGO_PKG_VERSION"),
         },
     );
 

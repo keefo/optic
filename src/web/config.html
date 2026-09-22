@@ -8,6 +8,7 @@
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
   <script src="/config.js" defer></script>
+  <script src="/notifications.js" defer></script>
   <script src="/footer.js" defer></script>
 </head>
 <body>
@@ -84,6 +85,87 @@
         <button id="ntp-sync-now" type="button">Sync now</button>
       </div>
       <p id="time-notice" class="notice" role="status"></p>
+    </section>
+
+    <section class="notifications-card" aria-labelledby="notifications-title">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">ALERTS</p>
+          <h2 id="notifications-title">Notifications (ntfy)</h2>
+        </div>
+        <span id="notif-source" class="muted"></span>
+      </div>
+      <p class="controls-help">Health alerts, the daily digest and the heartbeat go to an <a class="nav-link" href="https://ntfy.sh" target="_blank" rel="noopener noreferrer">ntfy</a> topic; subscribe to the same topic in the ntfy app. Anyone who knows the topic can read and post to it, so it is never shown again after saving: leave the topic and token empty to keep the saved ones.</p>
+      <div class="station-grid">
+        <label>
+          <span>Notifications</span>
+          <button id="notif-enabled" class="toggle-switch" type="button" role="switch" aria-checked="false">Off</button>
+        </label>
+        <label>
+          <span>Station name (shown in titles)</span>
+          <input id="notif-station" type="text" maxlength="64" placeholder="optional, e.g. optic">
+        </label>
+        <label>
+          <span>Server</span>
+          <input id="notif-server" type="url" spellcheck="false" placeholder="https://ntfy.sh">
+        </label>
+        <label>
+          <span>Topic</span>
+          <span class="input-with-button">
+            <input id="notif-topic" type="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="optic-…">
+            <button id="notif-generate-topic" type="button">Generate topic</button>
+          </span>
+        </label>
+        <label>
+          <span>Access token</span>
+          <input id="notif-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="optional">
+        </label>
+        <label>
+          <span>Saved token</span>
+          <select id="notif-token-action">
+            <option value="keep">Keep</option>
+            <option value="clear">Remove</option>
+          </select>
+        </label>
+      </div>
+
+      <h3>Daily digest</h3>
+      <div class="station-grid">
+        <label>
+          <span>Digest</span>
+          <button id="notif-digest-enabled" class="toggle-switch" type="button" role="switch" aria-checked="false">Off</button>
+        </label>
+        <label>
+          <span>Send at (Station timezone)</span>
+          <input id="notif-digest-time" type="time" step="60">
+        </label>
+      </div>
+      <p id="notif-digest-status" class="controls-help"></p>
+
+      <h3>Heartbeat (dead-man's switch)</h3>
+      <p class="controls-help">The Pi keeps re-arming a delayed ntfy message. If it stops checking in (power loss, crash, network down, or failing scheduled captures), ntfy delivers the message after the alert delay.</p>
+      <div class="station-grid">
+        <label>
+          <span>Heartbeat</span>
+          <button id="notif-hb-enabled" class="toggle-switch" type="button" role="switch" aria-checked="false">Off</button>
+        </label>
+        <label>
+          <span>Check in every (minutes)</span>
+          <input id="notif-hb-interval" type="number" min="1" max="60" step="1">
+        </label>
+        <label>
+          <span>Alert after silence (minutes)</span>
+          <input id="notif-hb-delay" type="number" min="2" max="4320" step="1">
+        </label>
+      </div>
+      <p id="notif-hb-status" class="controls-help"></p>
+
+      <div class="button-row margin-top-10">
+        <button id="notif-save" class="accent good" type="button">Save notifications</button>
+        <button id="notif-test" type="button">Send test notification</button>
+        <button id="notif-digest-now" type="button">Send digest now</button>
+      </div>
+      <p id="notif-notice" class="notice" role="status"></p>
     </section>
 
     <section class="celestial-card" aria-labelledby="celestial-title">
