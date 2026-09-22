@@ -83,7 +83,7 @@ deserializes as `Dashboard`.
 | `min_shutter_us` | 100 ..= `max_shutter_us` | Shortest shutter the ramp uses. |
 | `max_shutter_us` | ..= 5,000,000 | Longest shutter (the `CameraSettings` cap). |
 | `max_gain` | 1 ..= 16 | Highest analogue gain. |
-| `day_bias_ev` | −3 ..= 3 | Target brightness in daylight, in EV relative to 18% grey. |
+| `day_bias_ev` | −3 ..= 3 | *Brightness compensation* in the UI: shifts the whole curve (day **and** night), in EV relative to 18% grey. The config key keeps its original name so saved configs stay valid. |
 | `night_drop_ev` | 0 ..= 6 | How much darker the night target is than the day target. |
 | `max_step_ev` | 0.05 ..= 2 | Largest exposure change between two consecutive ramped frames. |
 | `smoothing` | 0 ..= 0.95 | Weight of the previous scene estimate (0 = react fully to each frame). |
@@ -264,7 +264,42 @@ exposure already lives:
   gains. Brightness and colour match the next scheduled frame; noise is
   higher. `reconfigure_stream` stages only `settings`, so the override is
   never saved.
-- **Three simple controls.** *Night look* (Dark ↔ Bright, which maps to
-  `night_drop_ev` 4 … 0 EV), *Max shutter* and *Max gain*. Day brightness,
-  max step, smoothing, white-balance rate and min shutter sit under
-  *Advanced*.
+- **Three simple controls.** *Brightness compensation* (a slider in 1/3 EV
+  steps; it shifts the whole curve, day and night), *Night look* (Dark ↔
+  Bright, which maps to `night_drop_ev` 4 … 0 EV), and *Max shutter* /
+  *Max gain*. Max step, smoothing, white-balance rate and min shutter sit
+  under *Advanced*.
+
+## 11. The Ramp Learns From Live Preview Frames
+
+Metering only captured frames left the UI unable to show anything before the
+first scheduled capture: with no ramp state there is no exposure to preview,
+so the preview fell back to the camera's own auto exposure, which ignores
+these settings. Exposure compensation (`ExposureValue`) would have been the
+small fix, but this pipeline accepts and ignores it — measured on the
+IMX477: identical exposure and identical image brightness at −3, 0 and +3 EV
+(`worklogs/2026-09-21-exposure-ramping.md`).
+
+So the preview is metered too:
+
+- `PreviewFrame.meter` carries §5.1's meter for each preview frame.
+- One shared `RampStore` (`Arc<Mutex<Option<RampState>>>`) lives on
+  `SchedulerHandle` and is read by scheduled captures, by `live_exposure_plan`
+  and by a task `SchedulerHandle::spawn` starts, which subscribes to preview
+  frames and folds them in with `exposure_ramp::observe_preview`. It re-reads
+  the staged config once a second, and in `Dashboard` mode it measures
+  nothing and clears the state.
+- `observe_preview` updates the smoothed scene estimate and eases white
+  balance but never writes `planned_log2_exposure`, the anchor for the
+  capture sequence's per-frame step limit. Preview frames therefore inform
+  the ramp without letting a preview restart or a passing cloud jump a
+  running timelapse.
+- Effects: unsaved settings show up in the preview within about a second of
+  it running, with the scheduler paused; the locked fields show real values
+  instead of "Auto"; and a scheduled run starts from a converged estimate
+  instead of a seed frame, removing the ~1 EV first-frame overshoot measured
+  in the first hardware test.
+- The loop stays correct because each observation uses the frame's *actual*
+  exposure from its metadata, even when the preview cannot reach the planned
+  exposure (a multi-second night shutter clamps to the preview frame time and
+  makes up the difference in gain, up to 16×).

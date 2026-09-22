@@ -449,6 +449,44 @@ pub fn observe(
     }
 }
 
+/// Folds a *live preview* frame into the ramp state (design doc §11).
+///
+/// Same measurement as `observe`, with one deliberate difference: it never
+/// touches `planned_log2_exposure`, which anchors the capture sequence's
+/// per-frame step limit. Preview frames therefore teach the ramp the scene
+/// (so unsaved settings show up live, and a scheduled run starts converged)
+/// without letting a preview restart or a passing cloud jump a running
+/// timelapse. With no state yet it seeds, taking colour gains from the
+/// preview's own AWB.
+pub fn observe_preview(
+    state: Option<&RampState>,
+    observation: &FrameObservation,
+    now: DateTime<Utc>,
+    settings: &RampSettings,
+) -> Option<RampState> {
+    let exposure = (observation.exposure_us.max(1.0) * observation.analogue_gain.max(1.0)).log2();
+    let scene_ev = observation.meter.luminance.max(MIN_LUMINANCE).log2() - exposure;
+    let Some(state) = state else {
+        return observation.colour_gains.map(|colour_gains| RampState {
+            updated_at: now,
+            scene_ev,
+            planned_log2_exposure: None,
+            colour_gains: colour_gains.map(|gain| gain.clamp(COLOUR_GAIN_MIN, COLOUR_GAIN_MAX)),
+        });
+    };
+    let blend = 1.0 - settings.smoothing;
+    let applied = observation
+        .colour_gains
+        .unwrap_or(state.colour_gains)
+        .map(f64::from);
+    Some(RampState {
+        updated_at: now,
+        scene_ev: state.scene_ev + blend * (scene_ev - state.scene_ev),
+        planned_log2_exposure: state.planned_log2_exposure,
+        colour_gains: ease_colour_gains(state.colour_gains, applied, &observation.meter, settings),
+    })
+}
+
 /// Moves colour gains toward the grey-world suggestion `applied × (G/R,
 /// G/B)`, smoothed and limited to `wb_max_step_pct` per frame (design doc
 /// §6). Holds them on frames too dark to judge.
@@ -998,6 +1036,62 @@ mod tests {
         }
         assert!((f64::from(state.colour_gains[0]) - truth[0]).abs() < 0.02);
         assert!((f64::from(state.colour_gains[1]) - truth[1]).abs() < 0.02);
+    }
+
+    #[test]
+    fn preview_frames_seed_the_ramp_and_keep_the_capture_step_anchor() {
+        let settings = RampSettings::default();
+        let observation = FrameObservation {
+            exposure_us: 2_000.0,
+            analogue_gain: 1.0,
+            colour_gains: Some([3.1, 1.4]),
+            meter: meter(MID_GREY, None),
+        };
+        // No state: the preview seeds it, with no capture anchor.
+        let seeded_state = observe_preview(None, &observation, at(0), &settings).unwrap();
+        assert!((seeded_state.scene_ev - (MID_GREY.log2() - 2_000_f64.log2())).abs() < 1e-9);
+        assert_eq!(seeded_state.colour_gains, [3.1, 1.4]);
+        assert_eq!(seeded_state.planned_log2_exposure, None);
+
+        // With a capture-driven state, the anchor survives so a running
+        // timelapse keeps its 1/3 EV step limit (design doc §11).
+        let running = RampState {
+            planned_log2_exposure: Some(18.0),
+            ..seeded(-20.0, at(0))
+        };
+        let brighter = FrameObservation {
+            meter: meter(MID_GREY * 4.0, None),
+            ..observation
+        };
+        let next = observe_preview(Some(&running), &brighter, at(1), &settings).unwrap();
+        assert_eq!(next.planned_log2_exposure, Some(18.0));
+        // Smoothed toward the newly measured scene, not jumped.
+        let measured = (MID_GREY * 4.0).log2() - 2_000_f64.log2();
+        assert!((next.scene_ev - (-20.0 + 0.5 * (measured + 20.0))).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_preview_seeded_ramp_plans_without_a_step_limit() {
+        // The first plan after preview seeding may jump straight to the
+        // target: there is no capture sequence to keep smooth yet.
+        let settings = RampSettings::default();
+        let observation = FrameObservation {
+            exposure_us: 2_000.0,
+            analogue_gain: 1.0,
+            colour_gains: Some([3.1, 1.4]),
+            meter: meter(MID_GREY / 16.0, None),
+        };
+        let state = observe_preview(None, &observation, at(0), &settings).unwrap();
+        let RampPlan::Manual { log2_exposure, .. } =
+            plan(Some(&state), at(1), None, &settings, 5_000_000)
+        else {
+            panic!("expected a manual plan");
+        };
+        // Metered 4 EV dark at 2 ms -> 32 ms.
+        assert!(
+            (log2_exposure - 32_000_f64.log2()).abs() < 1e-3,
+            "{log2_exposure}"
+        );
     }
 
     #[test]

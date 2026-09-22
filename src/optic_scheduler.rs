@@ -9,7 +9,11 @@
 //! "what should fire next" (the actor) and "what would the next 48h look
 //! like" (the design doc's future Shot Forecaster, 1d) — see design doc §3.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use chrono::{DateTime, Datelike, Duration, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
@@ -952,10 +956,22 @@ pub struct SchedulerStatus {
     pub last_capture: Option<LastCapture>,
     /// The last auto-ramped capture; `None` in `Dashboard` mode.
     pub exposure: Option<RampSnapshot>,
-    /// The ramp's state for `live_exposure_plan` (the dashboard's live
-    /// values); internal, not part of the status JSON.
-    #[serde(skip)]
-    pub ramp_state: Option<RampState>,
+}
+
+/// The one ramp state, shared by scheduled captures, the live preview
+/// task, and `/api/status`'s live plan (design doc §11).
+pub type RampStore = Arc<Mutex<Option<RampState>>>;
+
+/// Reads the store without letting a poisoned lock take the daemon down:
+/// a missed live value is not worth a panic.
+fn ramp_snapshot(store: &RampStore) -> Option<RampState> {
+    store.lock().ok().and_then(|state| *state)
+}
+
+fn store_ramp(store: &RampStore, next: Option<RampState>) {
+    if let Ok(mut state) = store.lock() {
+        *state = next;
+    }
 }
 
 /// The next scheduled frame's exposure as of now — what the dashboard's
@@ -1085,6 +1101,7 @@ enum SchedulerCommand {
 pub struct SchedulerHandle {
     commands: mpsc::Sender<SchedulerCommand>,
     status: watch::Receiver<SchedulerStatus>,
+    ramp: RampStore,
 }
 
 impl SchedulerHandle {
@@ -1105,10 +1122,15 @@ impl SchedulerHandle {
             next_capture_rules: Vec::new(),
             last_capture: None,
             exposure: None,
-            ramp_state: None,
         });
+        let ramp = RampStore::default();
+        tokio::spawn(observe_preview_frames(
+            camera.clone(),
+            config_cache_path.clone(),
+            ramp.clone(),
+        ));
         tokio::spawn(run_actor(
-            camera,
+            camera.clone(),
             capture_log,
             capture_dir,
             config_cache_path,
@@ -1117,11 +1139,18 @@ impl SchedulerHandle {
             initial_run_state,
             commands_rx,
             status_tx,
+            ramp.clone(),
         ));
         Self {
             commands: commands_tx,
             status: status_rx,
+            ramp,
         }
+    }
+
+    /// The ramp's current state, for `live_exposure_plan`.
+    pub fn ramp_state(&self) -> Option<RampState> {
+        ramp_snapshot(&self.ramp)
     }
 
     pub fn status(&self) -> SchedulerStatus {
@@ -1172,9 +1201,8 @@ async fn run_actor(
     mut run_state: ScheduleRunState,
     mut commands: mpsc::Receiver<SchedulerCommand>,
     status_tx: watch::Sender<SchedulerStatus>,
+    ramp: RampStore,
 ) {
-    // In memory only: a restart reseeds from auto exposure (design doc §5.4).
-    let mut ramp: Option<RampState> = None;
     loop {
         if run_state == ScheduleRunState::Paused {
             publish_status(&status_tx, run_state, None, Vec::new());
@@ -1217,11 +1245,10 @@ async fn run_actor(
                 );
                 tokio::select! {
                     () = tokio::time::sleep(sleep_for) => {
-                        let (outcome, exposure) = fire_capture(&camera, &capture_log, &capture_dir, &config, &shot, gap, &mut ramp).await;
+                        let (outcome, exposure) = fire_capture(&camera, &capture_log, &capture_dir, &config, &shot, gap, &ramp).await;
                         let mut status = status_tx.borrow().clone();
                         status.last_capture = Some(outcome);
                         status.exposure = exposure;
-                        status.ramp_state = ramp;
                         let _ = status_tx.send(status);
                     }
                     command = commands.recv() => {
@@ -1319,6 +1346,66 @@ async fn persist_run_state(
     }
 }
 
+/// How often the preview task re-reads the staged config. Frames arrive up
+/// to 8x a second; the config only changes when an operator edits it.
+const PREVIEW_CONFIG_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Teaches the ramp the scene from live preview frames (design doc §11), so
+/// unsaved exposure settings show in the preview even with the scheduler
+/// paused and no capture yet. Runs for the daemon's lifetime; when no
+/// preview is streaming there are simply no frames.
+async fn observe_preview_frames(camera: OpticCamera, config_cache_path: PathBuf, ramp: RampStore) {
+    let mut settings: Option<exposure_ramp::RampSettings> = None;
+    let mut refreshed_at = std::time::Instant::now() - PREVIEW_CONFIG_REFRESH;
+    loop {
+        let Ok(mut frames) = camera.subscribe().await else {
+            tokio::time::sleep(PREVIEW_CONFIG_REFRESH).await;
+            continue;
+        };
+        loop {
+            let frame = match frames.recv().await {
+                Ok(frame) => frame,
+                // Lagged: preview frames outran this task, which is
+                // harmless — the next frame is just as good a measurement.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if refreshed_at.elapsed() >= PREVIEW_CONFIG_REFRESH {
+                let config = read_app_config(&config_cache_path).await;
+                settings = match config.schedule.exposure {
+                    ScheduleExposure::AutoRamp(settings) => Some(settings.sanitized()),
+                    // Dashboard mode: measure nothing, and drop any state so
+                    // switching back to AutoRamp starts fresh.
+                    ScheduleExposure::Dashboard => {
+                        store_ramp(&ramp, None);
+                        None
+                    }
+                };
+                refreshed_at = std::time::Instant::now();
+            }
+            let (Some(settings), Some(meter)) = (settings.as_ref(), frame.meter) else {
+                continue;
+            };
+            let (Some(exposure_us), Some(analogue_gain)) = (frame.exposure_us, frame.analogue_gain)
+            else {
+                continue;
+            };
+            let observation = FrameObservation {
+                exposure_us: f64::from(exposure_us),
+                analogue_gain: f64::from(analogue_gain),
+                colour_gains: frame.colour_gains,
+                meter,
+            };
+            let current = ramp_snapshot(&ramp);
+            if let Some(next) =
+                exposure_ramp::observe_preview(current.as_ref(), &observation, Utc::now(), settings)
+            {
+                store_ramp(&ramp, Some(next));
+            }
+        }
+    }
+}
+
 /// The ramp inputs for one `AutoRamp` shot.
 struct RampShot {
     settings: exposure_ramp::RampSettings,
@@ -1389,11 +1476,11 @@ fn plan_ramp_shot(
     config: &AppConfig,
     shot: &ForecastedShot,
     gap: Option<Duration>,
-    ramp: &mut Option<RampState>,
+    ramp: &RampStore,
     now: DateTime<Utc>,
 ) -> Option<RampShot> {
     let ScheduleExposure::AutoRamp(settings) = &config.schedule.exposure else {
-        *ramp = None;
+        store_ramp(ramp, None);
         return None;
     };
     let settings = settings.sanitized();
@@ -1405,7 +1492,7 @@ fn plan_ramp_shot(
     let max_shutter_us = exposure_ramp::max_shutter_for_gap(gap, &settings);
     Some(RampShot {
         plan: exposure_ramp::plan(
-            ramp.as_ref(),
+            ramp_snapshot(ramp).as_ref(),
             now,
             sun_elevation_deg,
             &settings,
@@ -1430,7 +1517,7 @@ async fn fire_capture(
     config: &AppConfig,
     shot: &ForecastedShot,
     gap: Option<Duration>,
-    ramp: &mut Option<RampState>,
+    ramp: &RampStore,
 ) -> (LastCapture, Option<RampSnapshot>) {
     let ramp_shot = plan_ramp_shot(config, shot, gap, ramp, Utc::now());
     let request = build_capture_request(
@@ -1478,13 +1565,13 @@ async fn fire_capture(
                 meter,
             };
             if let Some(next) = exposure_ramp::observe(
-                ramp.as_ref(),
+                ramp_snapshot(ramp).as_ref(),
                 &ramp_shot.plan,
                 &observation,
                 Utc::now(),
                 &ramp_shot.settings,
             ) {
-                *ramp = Some(next);
+                store_ramp(ramp, Some(next));
             }
         }
         RampSnapshot {
@@ -2181,20 +2268,22 @@ mod actor_tests {
             at: now.with_timezone(&chrono_tz::UTC),
             rule_slugs: vec!["dusk".to_owned()],
         };
-        let mut ramp = Some(RampState {
+        let ramp: RampStore = Arc::new(Mutex::new(Some(RampState {
             updated_at: now,
             scene_ev: -12.0,
             planned_log2_exposure: Some(10.0),
             colour_gains: [2.0, 1.6],
-        });
+        })));
+        // Dashboard mode drops the state, so switching back to AutoRamp
+        // starts from a fresh measurement.
         let dashboard = committed_config();
-        assert!(plan_ramp_shot(&dashboard, &shot, None, &mut ramp, now).is_none());
-        assert!(ramp.is_none());
+        assert!(plan_ramp_shot(&dashboard, &shot, None, &ramp, now).is_none());
+        assert!(ramp_snapshot(&ramp).is_none());
 
         let mut auto = committed_config();
         auto.schedule.exposure = ScheduleExposure::AutoRamp(exposure_ramp::RampSettings::default());
         let ramp_shot =
-            plan_ramp_shot(&auto, &shot, Some(Duration::seconds(30)), &mut ramp, now).unwrap();
+            plan_ramp_shot(&auto, &shot, Some(Duration::seconds(30)), &ramp, now).unwrap();
         assert_eq!(ramp_shot.plan, RampPlan::Seed);
         assert_eq!(ramp_shot.max_shutter_us, 2_045_454);
         // No station: the target stays at the day level.

@@ -406,6 +406,10 @@ pub struct PreviewFrame {
     pub exposure_us: Option<i32>,
     pub analogue_gain: Option<f32>,
     pub colour_gains: Option<[f32; 2]>,
+    /// Brightness/colour of this preview frame. The ramp learns the scene
+    /// from it, so unsaved exposure settings show in the live preview even
+    /// before any capture (`docs/optic-daemon-exposure-ramping.md` §11).
+    pub meter: Option<crate::exposure_ramp::FrameMeter>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

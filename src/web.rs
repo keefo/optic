@@ -512,7 +512,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
         sync: state.sync.status(),
         exposure_plan: optic_scheduler::live_exposure_plan(
             &config.schedule,
-            schedule.ramp_state.as_ref(),
+            state.scheduler.ramp_state().as_ref(),
             chrono::Utc::now(),
         ),
         schedule,
@@ -2239,6 +2239,7 @@ mod tests {
             exposure_us: Some(12_500),
             analogue_gain: Some(2.5),
             colour_gains: Some([1.25, 1.5]),
+            meter: None,
         });
         let text = String::from_utf8(part.to_vec()).unwrap();
 

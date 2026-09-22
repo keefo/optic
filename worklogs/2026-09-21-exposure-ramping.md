@@ -644,3 +644,59 @@ again. The stepped Day brightness slider (separate commit) is kept.
 **Consequence:** the Part 4 requirement ("unsaved settings must show in the
 live preview, whatever the scheduler is doing") is still unmet while the
 ramp has no state. The remaining options are in the next section.
+
+## Part 5: The ramp learns from live preview frames (2026-09-22)
+
+### Why
+
+Exposure compensation is ignored by this pipeline (previous section), and the
+ramp only ever measured *captured* frames. So with no capture yet, nothing
+knows the scene and the preview can't show the user's settings. Metering the
+preview closes that gap with the ramp maths already proven on hardware.
+
+### Design
+
+- `PreviewFrame.meter`: the preview path meters its own YUV frame
+  (`exposure_ramp::meter_yuv420`, 1/16 sampling, already unit-tested).
+- One shared ramp state (`RampStore = Arc<Mutex<Option<RampState>>>`) owned
+  by `SchedulerHandle`, used by scheduled captures, by the live plan, and by
+  a new preview task that `SchedulerHandle::spawn` starts (so `main.rs` is
+  untouched). The task subscribes to preview frames, re-reads the staged
+  config at most once a second, and only observes while the mode is
+  `AutoRamp`.
+- `exposure_ramp::observe_preview`: updates the smoothed scene estimate and
+  eases white balance, but leaves `planned_log2_exposure` alone. That field
+  anchors the *capture* sequence's 1/3 EV step limit, so preview frames
+  inform the ramp without disturbing the smoothness of a running timelapse.
+  With no state it seeds (scene estimate plus the preview's AWB gains).
+- Consequences: with the scheduler paused and nothing saved, the plan has
+  real values within a second of the preview running, the locked fields show
+  them, and the preview override makes Day brightness/Night look visible
+  immediately (the plan is unlimited until a capture sets the anchor). A
+  scheduled run then starts from a converged estimate instead of a seed,
+  which also removes the 1 EV first-frame overshoot seen in Part 1.
+- Feedback safety: observations use each frame's *actual* exposure from its
+  metadata, so the loop stays correct even when the preview can't reach the
+  planned exposure (long night shutters clamp to the frame time).
+
+### Acceptance criteria
+
+C1. With `AutoRamp` staged (not saved) and the scheduler paused, a running
+    preview produces a non-seeding `exposure_plan` within a few seconds.
+C2. Moving Day brightness changes the preview's brightness and the locked
+    values, unsaved, with the scheduler paused.
+C3. Scheduled captures still step by at most `max_step_ev`: preview
+    observations must not move `planned_log2_exposure`.
+C4. `Dashboard` mode meters nothing and changes no behaviour.
+C5. Metering costs little: the preview frame rate is unchanged.
+
+### Test plan
+
+- Rust: `observe_preview` seeds without state, keeps
+  `planned_log2_exposure`, updates the scene estimate and eases WB;
+  a preview-derived state yields a `Manual` live plan whose exposure
+  matches the target (no step limit before the first capture); the capture
+  path still limits steps afterwards.
+- Hardware (dashboard closed, per the Part 4 pitfall): confirm C1/C2 by
+  sweeping Day brightness and measuring frame luma; confirm the preview
+  frame rate is unchanged (C5).

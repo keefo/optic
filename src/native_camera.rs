@@ -949,6 +949,7 @@ mod imp {
                     .ok_or_else(|| backend_error("preview request lost its buffer"))?,
             )?;
             let jpeg = encode_yuv420_jpeg(&yuv, info.width, info.height, info.stride, 95)?;
+            let meter = meter_yuv420(&yuv, info.width, info.height, info.stride);
             let _ = frames.send(PreviewFrame {
                 jpeg: Bytes::from(jpeg),
                 sequence: request.sequence(),
@@ -970,6 +971,7 @@ mod imp {
                     .get::<controls::ColourGains>()
                     .ok()
                     .map(|value| value.0),
+                meter,
             });
         }
         request.reuse(ReuseFlag::REUSE_BUFFERS);
