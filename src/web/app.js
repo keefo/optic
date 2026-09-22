@@ -300,6 +300,7 @@ function hidePreview(state = "Starting automatically") {
   elements.preview.removeAttribute("src");
   elements.preview.hidden = true;
   window.OpticFocus?.clear();
+  window.OpticScheduledExposure?.clearPreview();
   elements.placeholder.hidden = false;
   elements.streamState.textContent = state;
 }
@@ -420,6 +421,7 @@ async function renderMjpegFrame(jpeg, headers, generation) {
   recordRenderedFrame(headers, paintedAt);
   // After the measurement, so focus-tool processing never skews it.
   window.OpticFocus?.onFrame(elements.preview);
+  window.OpticScheduledExposure?.onPreviewFrame(frameMetadata(headers));
 }
 
 function beginMeasurement(label, needsAe, needsAwb) {

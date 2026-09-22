@@ -82,10 +82,36 @@ test("shutter and EV formatting", () => {
 
 test("plan descriptions for the locked fields", () => {
   assert.equal(ramp.describePlan(null), null);
-  assert.equal(ramp.describePlan({ seeding: true }).shutter, "Auto (seeding)");
+  // Seeding without a running preview: nothing measured yet.
+  assert.deepEqual(ramp.describePlan({ seeding: true }), {
+    shutter: "Auto",
+    gain: "Auto",
+    whiteBalance: "AWB",
+  });
   assert.deepEqual(ramp.describePlan(manualPlan(4226589, 1.1454139, [2.6337, 1.8228])), {
     shutter: "4.2 s",
     gain: "1.15×",
     whiteBalance: "Eased · R 2.63 / B 1.82",
   });
+});
+
+test("while seeding, the locked fields show the preview's live auto exposure", () => {
+  const preview = { exposureUs: 66654, analogueGain: 15.515152, colourGains: [2.6476793, 1.8268075] };
+  assert.deepEqual(ramp.describePlan({ seeding: true }, preview), {
+    shutter: "1/15 s",
+    gain: "15.5×",
+    whiteBalance: "AWB · R 2.65 / B 1.83",
+  });
+  // Partial or missing metadata falls back per field.
+  assert.deepEqual(
+    ramp.describePlan({ seeding: true }, { exposureUs: 8000, analogueGain: null, colourGains: null }),
+    { shutter: "1/125 s", gain: "Auto", whiteBalance: "AWB" },
+  );
+  assert.equal(ramp.describePlan({ seeding: true }, { exposureUs: 0 }).shutter, "Auto");
+});
+
+test("a ramped plan ignores the preview's (override) values", () => {
+  const preview = { exposureUs: 118750, analogueGain: 16, colourGains: [2.6, 1.8] };
+  assert.equal(ramp.describePlan(manualPlan(3843022, 1), preview).shutter, "3.8 s");
+  assert.equal(ramp.describePlan(manualPlan(3843022, 1), preview).gain, "1.00×");
 });

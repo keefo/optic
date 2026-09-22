@@ -531,3 +531,7 @@ footer { padding: 0 0 36px; color: var(--muted); font-size: 0.78rem; text-align:
 }
 @media (prefers-reduced-motion: reduce) { .ramp-pulse { animation: none; } }
 @media (max-width: 520px) { .ramp-grid { grid-template-columns: 1fr; } }
+/* Rotation lives in the Transform group, inline with the flips. */
+fieldset:has(> .transform-rotation) { align-items: center; flex-wrap: wrap; }
+.transform-rotation { display: flex; flex-basis: 100%; align-items: center; gap: 8px; color: var(--muted); font-size: 0.82rem; }
+.transform-rotation select { width: auto; }

@@ -198,14 +198,6 @@
           </label>
 
           <label>
-            <span>Rotation</span>
-            <select id="rotation">
-              <option value="0">0°</option>
-              <option value="180">180°</option>
-            </select>
-          </label>
-
-          <label>
             <span>Analogue gain <output id="gain-value">1.0</output></span>
             <input id="gain" type="range" min="1" max="16" step="0.1" value="1">
             <output id="gain-ramp-value" class="ramp-value" hidden></output>
@@ -270,6 +262,13 @@
 
           <fieldset>
             <legend>Transform</legend>
+            <label class="transform-rotation">
+              <span>Rotation</span>
+              <select id="rotation">
+                <option value="0">0°</option>
+                <option value="180">180°</option>
+              </select>
+            </label>
             <label class="check"><input id="hflip" type="checkbox"> Horizontal flip</label>
             <label class="check"><input id="vflip" type="checkbox"> Vertical flip</label>
           </fieldset>

@@ -71,17 +71,34 @@
     return `${rounded > 0 ? "+" : rounded < 0 ? "−" : ""}${Math.abs(rounded).toFixed(1)} EV`;
   }
 
+  function formatGains(gains) {
+    return `R ${gains[0].toFixed(2)} / B ${gains[1].toFixed(2)}`;
+  }
+
   // Display strings for the locked fields; also used to detect changes.
-  function describePlan(plan) {
+  // A ramped plan shows its planned values. While seeding, the next frame
+  // uses the camera's auto exposure, and so does the preview, so the fields
+  // show what auto exposure is choosing right now: `preview` is the latest
+  // preview frame's metadata ({ exposureUs, analogueGain, colourGains },
+  // app.js `frameMetadata`), or null when no preview is running.
+  function describePlan(plan, preview = null) {
     if (!plan) return null;
     if (plan.seeding) {
-      return { shutter: "Auto (seeding)", gain: "Auto (seeding)", whiteBalance: "Auto (seeding)" };
+      const exposureUs = preview?.exposureUs > 0 ? preview.exposureUs : null;
+      const gain = preview?.analogueGain > 0 ? preview.analogueGain : null;
+      const gains = preview?.colourGains ?? null;
+      return {
+        shutter: exposureUs ? formatShutter(exposureUs) : "Auto",
+        // One decimal: auto exposure jitters, and the field shouldn't flicker.
+        gain: gain ? `${gain.toFixed(1)}×` : "Auto",
+        whiteBalance: gains ? `AWB · ${formatGains(gains)}` : "AWB",
+      };
     }
     const gains = plan.colour_gains;
     return {
       shutter: formatShutter(plan.shutter_us),
       gain: `${plan.gain.toFixed(2)}×`,
-      whiteBalance: gains ? `Eased · R ${gains[0].toFixed(2)} / B ${gains[1].toFixed(2)}` : "Eased",
+      whiteBalance: gains ? `Eased · ${formatGains(gains)}` : "Eased",
     };
   }
 
@@ -144,6 +161,10 @@
   let lastPlanKey = "null";
   let lastShown = null;
   let previewShortfallEv = 0;
+  let previewMetadata = null;
+  // Live preview values can change several times a second; pulse at most
+  // this often per field.
+  const PULSE_MIN_INTERVAL_MS = 2000;
 
   function autoRamp() {
     return exposure.mode === "AutoRamp";
@@ -188,6 +209,9 @@
   }
 
   function pulse(element) {
+    const now = Date.now();
+    if (now - (Number(element.dataset.pulsedAt) || 0) < PULSE_MIN_INTERVAL_MS) return;
+    element.dataset.pulsedAt = String(now);
     element.classList.remove("ramp-pulse");
     // Restart the animation on every change.
     void element.offsetWidth;
@@ -201,7 +225,11 @@
       lastShown = null;
       return;
     }
-    const shown = describePlan(plan) ?? { shutter: "…", gain: "…", whiteBalance: "…" };
+    const shown = describePlan(plan, previewMetadata) ?? {
+      shutter: "…",
+      gain: "…",
+      whiteBalance: "…",
+    };
     for (const [key, element] of [
       ["shutter", ui.shutterLive],
       ["gain", ui.gainLive],
@@ -224,7 +252,10 @@
         : `sun ${current.sun_elevation_deg.toFixed(1).replace("-", "−")}°`;
     const target = `target ${formatEv(current.target_bias_ev)} (${sun})`;
     if (current.seeding) {
-      return `Next scheduled frame is a seed: auto exposure and white balance, then the ramp takes over · ${target}`;
+      const live = previewMetadata
+        ? "showing the camera's live auto exposure"
+        : "start the preview to see its auto exposure";
+      return `Next scheduled frame is a seed: auto exposure and white balance (${live}), then the ramp takes over · ${target}`;
     }
     const learned = current.ramp_updated_at
       ? ` · learned ${new Date(current.ramp_updated_at).toLocaleTimeString()}`
@@ -311,6 +342,20 @@
     }
   }
 
+  // Called with every rendered preview frame's metadata. Only a seeding
+  // plan shows it: a ramped plan's preview runs the brightness-equivalent
+  // override, whose values aren't the ones the scheduled frame will use.
+  function onPreviewFrame(metadata) {
+    previewMetadata = metadata?.exposureUs > 0 ? metadata : null;
+    if (autoRamp() && plan?.seeding) renderPlan();
+  }
+
+  // Called when the preview stops, so stale values aren't shown.
+  function clearPreview() {
+    previewMetadata = null;
+    if (autoRamp() && plan?.seeding) renderPlan();
+  }
+
   // The preview-only override for the next stream request (or null).
   function previewOverride(previewFps) {
     const equivalent = previewEquivalent(autoRamp() ? plan : null, previewFps);
@@ -322,5 +367,12 @@
 
   renderSettings();
   renderPlan();
-  window.OpticScheduledExposure = { ...pure, applyConfig, onStatus, previewOverride };
+  window.OpticScheduledExposure = {
+    ...pure,
+    applyConfig,
+    onStatus,
+    previewOverride,
+    onPreviewFrame,
+    clearPreview,
+  };
 })();

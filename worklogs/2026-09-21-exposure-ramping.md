@@ -555,3 +555,53 @@ brightness matches the scheduled frames.
    should follow them (see the caption for any preview shortfall).
 4. Move **Night look** and watch the target in the caption. Turn the toggle
    off and check that your manual values come back.
+
+## Part 3: Follow-ups on the Pi (2026-09-22, user-requested)
+
+### Live values while seeding
+
+- Request: "instead of showing Auto (seeding), can we show real calculated
+  value? coloring is good."
+- Change (web only): while the plan is seeding, the locked fields show the
+  live preview's own auto exposure. The preview runs the same auto
+  exposure/AWB the seed frame uses, and every MJPEG part already carries
+  `X-Optic-Exposure-Us`/`-Analogue-Gain`/`-Colour-Gains`. Ramped plans still
+  show the planned values, ignoring the preview's brightness-equivalent
+  override values. Gain is shown to one decimal while seeding, and pulses are
+  throttled to one per 2 s per field (auto exposure jitters at preview frame
+  rate). Without a running preview the fields read "Auto"/"AWB". Files:
+  `src/web/scheduled-exposure.js`, `src/web/app.js` (+2 lines:
+  `onPreviewFrame(frameMetadata(headers))`, `clearPreview()`),
+  `tests/web/scheduled-exposure.test.js` (+2 tests), `src/web.rs` wiring test.
+- Checks (Mac): Biome pass; node 24 passed; `cargo test` 238 passed;
+  clippy clean.
+- Deployed (user-approved, assets only:
+  `./scripts/build-deploy-optic-daemon.sh --assets`, no service restart):
+  "SUCCESS: static web assets deployed and verified"; the served `app.js`
+  and `scheduled-exposure.js` contain the new hooks.
+- Hardware check in Chrome on `optic.local` (daylight, sun +25.9°): with the
+  toggle on (staged only), the locked fields read **1/683 s · 1.0× · AWB ·
+  R 3.66 / B 1.46** in amber with the glow; caption "showing the camera's
+  live auto exposure". Toggle then turned off: mode Dashboard, nothing
+  staged, manual fields editable.
+- Observed while testing: (1) in one run, the toggle and a pre-existing
+  staged edit were reverted within seconds of my click, which fits a Discard
+  from another dashboard tab (the user was active); a retrace showed the
+  toggle staying on. (2) With the full-resolution Master Archive preview
+  (2 FPS, ~2.7 MB/frame over Wi-Fi), no frames arrived for >6 s after the
+  toggle's reconfigure, and the tab's renderer stopped answering DevTools
+  for 45 s. With downsampled preview on (as it then was), frames and values
+  flowed normally. This is a pre-existing cost of the full-resolution
+  preview, not specific to this change.
+
+### Rotation moved under Transform
+
+- Request: "I think we could put Rotation under Transform". Rotation's
+  select moved into the Transform fieldset (its own line, the two flips
+  below); it stays inside `.control-grid`, so app.js' control listener and
+  `#rotation` lookups are unchanged. Removing it from the grid also removes
+  the half-width row it sat on. `src/web/index.html` + 3 CSS lines appended.
+- Checked on a local daemon in Chrome: layout (Rotation / H flip + V flip);
+  selecting 180° updates `settings().rotation` and starts a preview
+  measurement ("Rotation · revision 2").
+- Not yet deployed.

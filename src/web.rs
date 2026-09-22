@@ -1800,6 +1800,11 @@ mod tests {
         assert!(APP_JS.contains("window.OpticScheduledExposure?.previewOverride("));
         assert!(APP_JS.contains("window.OpticScheduledExposure?.applyConfig(status.config)"));
         assert!(APP_JS.contains("window.OpticScheduledExposure?.onStatus(status)"));
+        assert!(
+            APP_JS
+                .contains("window.OpticScheduledExposure?.onPreviewFrame(frameMetadata(headers))")
+        );
+        assert!(APP_JS.contains("window.OpticScheduledExposure?.clearPreview()"));
         assert!(APP_JS.contains("\"scheduled-exposure-change\""));
         let mut checked = 0;
         for chunk in SCHEDULED_EXPOSURE_JS.split("$(\"#").skip(1) {
