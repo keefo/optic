@@ -11,7 +11,8 @@
       "src/web/capture-history.html",
       "src/web/config.js",
       "src/web/config.html",
-      "src/web/footer.js"
+      "src/web/footer.js",
+      "src/web/notifications.js"
     ]
   },
   "assist": { "actions": { "source": { "organizeImports": "on" } } },

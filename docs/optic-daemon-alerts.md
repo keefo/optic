@@ -5,6 +5,12 @@ ntfy delivery from the Pi was confirmed on the user's phone, and the user
 accepted the work on 2026-09-21. Not soak-tested. Implementation record:
 `worklogs/2026-09-20-health-alerts.md`. Code: `src/optic_alerts.rs`.
 
+**Update 2026-09-21 (branch `digest-heartbeat`, not yet deployed):** the
+settings moved from `alerts.json` into the `notifications` section of the
+global `config.json`, editable on the Config page, and a daily digest and an
+external heartbeat were added. See `docs/optic-daemon-digest-heartbeat.md`;
+§3 and §7 below describe the original file, which is now only imported once.
+
 ## 1. Purpose
 
 Nothing notified the operator when the station stopped doing its job during
@@ -38,7 +44,7 @@ here because they are only useful if they are delivered when the iMac is down.
 | Decision | Choice |
 | --- | --- |
 | Channel | **ntfy** (default server `https://ntfy.sh`), private unguessable topic, optional access token. JSON publish via the system `curl` binary — no new crate (same shell-out pattern as `optic_sync` → `ssh`). |
-| Credential location | `~/.config/optic-daemon/alerts.json`, mode `0600`, never in git. Path overridable with `OPTIC_ALERTS_CONFIG`. No change to the tracked systemd unit (readable under `ProtectHome=read-only`). |
+| Credential location | Originally `~/.config/optic-daemon/alerts.json`, mode `0600`, never in git (`OPTIC_ALERTS_CONFIG` override). Since 2026-09-21: `config.json` → `notifications`, with `alerts.json` imported once (`docs/optic-daemon-digest-heartbeat.md` §5). |
 | Thresholds | "Balanced" preset (§5) as built-in defaults; every value overridable in `alerts.json`. |
 | Dashboard | Read-only `GET /api/alerts` **and** a footer badge on every page. |
 
@@ -131,6 +137,11 @@ threshold conditions, is the anti-spam mechanism.
 
 ## 7. Configuration File
 
+> Superseded 2026-09-21: the same fields now live in `config.json` →
+> `notifications` and are edited on the Config page; this file is read only
+> for the one-time import (`docs/optic-daemon-digest-heartbeat.md` §5). The
+> thresholds below keep their names and defaults there.
+
 `~/.config/optic-daemon/alerts.json` (override: `OPTIC_ALERTS_CONFIG`).
 Unknown fields are rejected so a typo in a threshold name is reported rather
 than silently ignored. A group- or world-readable file is still loaded but
@@ -200,10 +211,10 @@ already shows the scheduler state.
 
 ## 9. Limitations
 
-- **Not a dead-man's switch.** A crashed daemon, a crash-looping service, a
-  powered-off Pi, or a lost network sends nothing. Covering that needs an
-  external heartbeat check (e.g. a periodic ping to a hosted monitor that
-  alerts on silence) — a follow-up, not part of this design.
+- **Not a dead-man's switch by itself.** A crashed daemon, a crash-looping
+  service, a powered-off Pi, or a lost network sends nothing from these
+  alerts. The external heartbeat (`docs/optic-daemon-digest-heartbeat.md`
+  §4) covers that when it is turned on.
 - Requires outbound HTTPS from the Pi to the ntfy server.
 - Uses the wall clock; a large NTP step can shorten or lengthen a time window
   once.

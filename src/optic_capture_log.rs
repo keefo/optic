@@ -427,6 +427,57 @@ impl CaptureLog {
     }
 }
 
+impl CaptureLog {
+    /// Every capture with `since_unix <= captured_at < until_unix` (unix
+    /// seconds), oldest first, as a few small columns — for the daily
+    /// digest (`docs/optic-daemon-digest-heartbeat.md` §3.2), which only
+    /// counts and sums, so it never parses `detail_json`. Read-only and
+    /// best-effort: a query failure yields an empty list.
+    pub async fn window_rows(&self, since_unix: i64, until_unix: i64) -> Vec<CaptureWindowRow> {
+        const MAX_ROWS: i64 = 200_000;
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let connection = inner.db.lock().expect("capture log db mutex poisoned");
+            (|| -> rusqlite::Result<Vec<CaptureWindowRow>> {
+                let mut statement = connection.prepare(
+                    "SELECT captured_at, source, success, bytes_total, error FROM captures
+                     WHERE captured_at >= ?1 AND captured_at < ?2
+                     ORDER BY captured_at LIMIT ?3",
+                )?;
+                let rows = statement.query_map(
+                    rusqlite::params![since_unix, until_unix, MAX_ROWS],
+                    |row| {
+                        Ok(CaptureWindowRow {
+                            captured_at_unix: row.get(0)?,
+                            source: row.get(1)?,
+                            success: row.get(2)?,
+                            bytes_total: row.get::<_, i64>(3)?.max(0) as u64,
+                            error: row.get(4)?,
+                        })
+                    },
+                )?;
+                rows.collect()
+            })()
+            .unwrap_or_else(|error| {
+                warn!(%error, "capture window query failed");
+                Vec::new()
+            })
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
+/// One row of `CaptureLog::window_rows`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureWindowRow {
+    pub captured_at_unix: i64,
+    pub source: String,
+    pub success: bool,
+    pub bytes_total: u64,
+    pub error: Option<String>,
+}
+
 fn build_where_clause(filter: &CaptureQueryFilter) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -1080,5 +1131,38 @@ mod tests {
             })
             .await;
         assert_eq!(until_old.total, 1);
+    }
+
+    #[tokio::test]
+    async fn window_rows_returns_small_columns_inside_the_half_open_window() {
+        let dir = unique_temp_dir("window-rows");
+        let log = CaptureLog::open(&dir.join("history.db"), dir.clone()).expect("open");
+        {
+            let connection = log.inner.db.lock().unwrap();
+            for (id, at, source, success, bytes, error) in [
+                ("a", 99, "scheduler", true, 10, None),
+                ("b", 100, "scheduler", true, 20, None),
+                ("c", 150, "web_ui", true, 30, None),
+                ("d", 160, "scheduler", false, 0, Some("camera timeout")),
+                ("e", 200, "scheduler", true, 40, None),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO captures (capture_id, captured_at, source, profile, save_dng,
+                         success, duration_ms, bytes_total, error, detail_json)
+                         VALUES (?1, ?2, ?3, 'binning_2k', 0, ?4, 1, ?5, ?6, '{}')",
+                        rusqlite::params![id, at, source, success, bytes, error],
+                    )
+                    .unwrap();
+            }
+        }
+        let rows = log.window_rows(100, 200).await;
+        let ids: Vec<i64> = rows.iter().map(|row| row.captured_at_unix).collect();
+        assert_eq!(ids, vec![100, 150, 160]);
+        assert_eq!(rows[1].source, "web_ui");
+        assert_eq!(rows[2].error.as_deref(), Some("camera timeout"));
+        assert!(!rows[2].success);
+        assert_eq!(rows[0].bytes_total, 20);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

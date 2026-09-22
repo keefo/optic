@@ -106,6 +106,14 @@ pub struct AppConfig {
     /// this field existed still deserializes fine, filling it with
     /// `ScheduleConfig::default()` (no rules, nothing scheduled).
     pub schedule: crate::optic_scheduler::ScheduleConfig,
+    /// Notification settings (ntfy channel, digest, heartbeat, alert
+    /// thresholds) — `docs/optic-daemon-digest-heartbeat.md` §5. Kept as
+    /// raw JSON and parsed by `optic_alerts`, so a malformed section can
+    /// never make the whole config fail to parse (which would silently
+    /// fall back to defaults, schedule included). Holds the ntfy topic and
+    /// token: `/api/status` masks it (`optic_alerts::redact_notifications`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<serde_json::Value>,
 }
 
 impl Default for AppConfig {
@@ -115,6 +123,7 @@ impl Default for AppConfig {
             settings: CameraSettings::default(),
             save_dng: false,
             schedule: crate::optic_scheduler::ScheduleConfig::default(),
+            notifications: None,
         }
     }
 }

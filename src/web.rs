@@ -22,7 +22,9 @@ use crate::{
         StreamRequest,
     },
     durable_state,
-    optic_alerts::{AlertsHandle, AlertsStatus},
+    optic_alerts::{
+        AlertsHandle, AlertsStatus, NotificationsUpdate, NotificationsView, SaveError, SendError,
+    },
     optic_camera::{CameraBackendKind, OpticCamera},
     optic_capture_log::{CaptureHealthStatus, CaptureLog, CaptureLogEntry, CaptureQueryFilter},
     optic_events::{SystemEvent, SystemEventKind, SystemEventLog},
@@ -193,11 +195,75 @@ async fn list_events(
 pub fn alerts_router(alerts: AlertsHandle) -> Router {
     Router::new()
         .route("/api/alerts", get(alerts_status))
+        .route(
+            "/api/notifications",
+            get(notifications_settings).put(save_notifications_settings),
+        )
+        .route("/api/notifications/test", post(send_test_notification))
+        .route("/api/notifications/digest-now", post(send_digest_now))
         .with_state(alerts)
 }
 
 async fn alerts_status(State(alerts): State<AlertsHandle>) -> Json<AlertsStatus> {
     Json(alerts.status())
+}
+
+/// Notification settings for the Config page
+/// (`docs/optic-daemon-digest-heartbeat.md` §6.2). Never returns the ntfy
+/// topic or token.
+async fn notifications_settings(State(alerts): State<AlertsHandle>) -> Json<NotificationsView> {
+    Json(alerts.settings_view().await)
+}
+
+async fn save_notifications_settings(
+    State(alerts): State<AlertsHandle>,
+    Json(update): Json<NotificationsUpdate>,
+) -> Result<Json<NotificationsView>, AppError> {
+    alerts
+        .save_settings(update)
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            SaveError::Invalid(message) => AppError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message,
+            },
+            SaveError::Io(message) => AppError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: format!("could not save notification settings: {message}"),
+            },
+        })
+}
+
+fn manual_send_response(
+    result: Result<(), SendError>,
+    sent: &'static str,
+) -> Result<Json<Message>, AppError> {
+    match result {
+        Ok(()) => Ok(Json(Message::new(sent))),
+        Err(SendError::NotConfigured(reason)) => Err(AppError {
+            status: StatusCode::CONFLICT,
+            message: reason,
+        }),
+        Err(SendError::RateLimited) => Err(AppError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "wait a few seconds before sending again".to_owned(),
+        }),
+        Err(SendError::Failed(error)) => Err(AppError {
+            status: StatusCode::BAD_GATEWAY,
+            message: format!("delivery failed: {error}"),
+        }),
+    }
+}
+
+async fn send_test_notification(
+    State(alerts): State<AlertsHandle>,
+) -> Result<Json<Message>, AppError> {
+    manual_send_response(alerts.send_test().await, "test notification sent")
+}
+
+async fn send_digest_now(State(alerts): State<AlertsHandle>) -> Result<Json<Message>, AppError> {
+    manual_send_response(alerts.send_digest_now().await, "digest sent")
 }
 
 async fn index(State(state): State<AppState>) -> Response {
@@ -415,7 +481,12 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
     let camera = state.camera.status();
     let config_staged =
         config_is_staged(&state.preview_config_path, &state.config_cache_path).await;
-    let config = current_app_config(&state).await;
+    let mut config = current_app_config(&state).await;
+    // Every page polls this; the ntfy topic and token must never reach a
+    // browser (docs/optic-daemon-digest-heartbeat.md §6.1).
+    if let Some(notifications) = config.notifications.as_mut() {
+        crate::optic_alerts::redact_notifications(notifications);
+    }
     Ok(Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.started.elapsed().as_secs(),

@@ -181,6 +181,7 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 - Do not use `node --test tests/web` in CI (the ubuntu-24.04 runner's Node 22 treats a bare directory as a module path: `Cannot find module '.../tests/web'`; only newer Node, such as the Mac's 26, discovers tests in it); use `node --test tests/web/*.test.js` instead.
 - Do not use bare `swapon` (or other `/usr/sbin` tools) in non-interactive SSH commands on the Pi (`liam`'s PATH there is `/usr/local/bin:/usr/bin:/bin:/usr/games`: `swapon: command not found`); use the full path such as `/usr/sbin/swapon --show`, or `cat /proc/swaps`, instead.
 - Do not use `iw` or `rfkill` on the Pi (not installed); use `nmcli -t device wifi list --rescan no` and `/sys/class/rfkill/rfkill*/{name,type,soft,hard}` instead.
+- Do not use `[ "$a" \> "$b" ]` for string comparison in zsh (zsh's `[` rejects it: `condition expected: >`, so an `until` loop spins forever on errors); use `[[ "$a" > "$b" ]]` or run the loop under `bash -c` instead.
 
 ## Orca Worktree Completion Rules
 - When the task, PR, or assigned scope is finished:

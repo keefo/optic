@@ -251,6 +251,39 @@ async function refreshHeaderStatus() {
   }
 }
 
+// Heartbeat and digest lines appended to the Alerts pill's hover text
+// (docs/optic-daemon-digest-heartbeat.md §6.4). Absent on older daemons.
+function alertsExtraLines(alerts) {
+  const lines = [];
+  const timezone = alerts.digest?.timezone;
+  const when = (iso) =>
+    iso
+      ? new Intl.DateTimeFormat(undefined, {
+          timeZone: timezone || undefined,
+          weekday: "short",
+          hour: "numeric",
+          minute: "2-digit",
+        }).format(new Date(iso))
+      : "never";
+  const heartbeat = alerts.heartbeat;
+  if (heartbeat) {
+    let line = `Heartbeat: ${heartbeat.state.replaceAll("_", " ")}`;
+    if (heartbeat.withheld_reason) line += ` (${heartbeat.withheld_reason})`;
+    if (heartbeat.state !== "disabled")
+      line += `, last check-in ${when(heartbeat.last_checkin_at)}`;
+    lines.push(line);
+  }
+  const digest = alerts.digest;
+  if (digest) {
+    lines.push(
+      digest.enabled
+        ? `Digest: next ${when(digest.next_due_at)}${digest.last_error ? `, last error: ${digest.last_error}` : ""}`
+        : "Digest: off",
+    );
+  }
+  return lines;
+}
+
 function renderHeaderAlerts(alerts) {
   const active = alerts.conditions.filter(
     (condition) => condition.state === "firing" || condition.state === "recovering",
@@ -272,6 +305,7 @@ function renderHeaderAlerts(alerts) {
       ? `Last delivery failed: ${alerts.last_delivery_error}`
       : "No active health alerts.";
   }
+  headerAlerts.title = [headerAlerts.title, ...alertsExtraLines(alerts)].join("\n");
   headerAlerts.hidden = false;
 }
 
