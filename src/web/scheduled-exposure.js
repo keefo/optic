@@ -142,6 +142,7 @@
     maxShutter: $("#ramp-max-shutter"),
     maxGain: $("#ramp-max-gain"),
     maxGainValue: $("#ramp-max-gain-value"),
+    dayBiasValue: $("#ramp-day-bias-value"),
     dayBias: $("#ramp-day-bias"),
     maxStep: $("#ramp-max-step"),
     smoothing: $("#ramp-smoothing"),
@@ -161,7 +162,7 @@
     [ui.nightLook, "night_drop_ev", nightLookFromDrop, dropFromNightLook],
     [ui.maxShutter, "max_shutter_us", (us) => us / 1e6, (s) => Math.round(s * 1e6)],
     [ui.maxGain, "max_gain", (v) => v, (v) => v],
-    [ui.dayBias, "day_bias_ev", (v) => v, (v) => v],
+    [ui.dayBias, "day_bias_ev", (v) => Math.round(v * 3) / 3, (v) => Math.round(v * 3) / 3],
     [ui.maxStep, "max_step_ev", (v) => Math.round(v * 100) / 100, (v) => v],
     [ui.smoothing, "smoothing", (v) => v, (v) => v],
     [ui.wbStep, "wb_max_step_pct", (v) => v, (v) => v],
@@ -205,6 +206,7 @@
           ? "Bright"
           : `${formatEv(-dropFromNightLook(look))} at night`;
     ui.maxGainValue.value = `${Number(ui.maxGain.value).toFixed(1)}×`;
+    ui.dayBiasValue.value = formatEv(Number(ui.dayBias.value));
   }
 
   function setLocked(locked) {

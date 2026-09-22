@@ -223,6 +223,11 @@
                   <small class="ramp-scale"><span>Dark</span><span>Bright</span></small>
                 </label>
                 <label>
+                  <span>Day brightness <output id="ramp-day-bias-value">0.0 EV</output></span>
+                  <input id="ramp-day-bias" type="range" min="-3" max="3" step="0.3333333333333333" value="0" data-ramp-input>
+                  <small class="ramp-scale"><span>Darker</span><span>Brighter</span></small>
+                </label>
+                <label>
                   <span>Max gain (noise limit) <output id="ramp-max-gain-value">8.0×</output></span>
                   <input id="ramp-max-gain" type="range" min="1" max="16" step="0.5" value="8" data-ramp-input>
                 </label>
@@ -234,10 +239,6 @@
               <details class="ramp-advanced">
                 <summary>Advanced</summary>
                 <div class="ramp-grid">
-                  <label>
-                    <span>Day brightness (EV)</span>
-                    <input id="ramp-day-bias" type="number" min="-3" max="3" step="0.1" value="0" data-ramp-input>
-                  </label>
                   <label>
                     <span>Max step per frame (EV)</span>
                     <input id="ramp-max-step" type="number" min="0.05" max="2" step="0.05" value="0.33" data-ramp-input>
