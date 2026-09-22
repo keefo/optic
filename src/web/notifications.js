@@ -4,8 +4,8 @@
 // only by config.html, beside config.js.
 //
 // The ntfy topic and token are write-only: GET /api/notifications only says
-// whether they are set, masked as first 4 + **** + last 4. Leaving the
-// fields empty keeps the saved values.
+// whether they are set, masked as first 4 + **** + last 4, and the page
+// shows that mask as the field's value (see secretField).
 
 const notif = {
   source: document.querySelector("#notif-source"),
@@ -14,7 +14,6 @@ const notif = {
   server: document.querySelector("#notif-server"),
   topic: document.querySelector("#notif-topic"),
   token: document.querySelector("#notif-token"),
-  tokenAction: document.querySelector("#notif-token-action"),
   generateTopic: document.querySelector("#notif-generate-topic"),
   digestEnabled: document.querySelector("#notif-digest-enabled"),
   digestTime: document.querySelector("#notif-digest-time"),
@@ -71,9 +70,28 @@ function isToggleOn(button) {
   return button.getAttribute("aria-checked") === "true";
 }
 
-function setNotifDirty(dirty) {
-  notifDirty = dirty;
-  notif.save.disabled = !dirty;
+// The form's values as last loaded or saved; Save is enabled only while
+// the form differs from it, so undoing a change disables Save again.
+let notifSavedForm = null;
+
+function notifFormState() {
+  return JSON.stringify([
+    isToggleOn(notif.enabled),
+    notif.station.value,
+    notif.server.value,
+    notif.topic.value,
+    notif.token.value,
+    isToggleOn(notif.digestEnabled),
+    notif.digestTime.value,
+    isToggleOn(notif.hbEnabled),
+    notif.hbInterval.value,
+    notif.hbDelay.value,
+  ]);
+}
+
+function updateNotifDirty() {
+  notifDirty = notifFormState() !== notifSavedForm;
+  notif.save.disabled = !notifDirty;
 }
 
 function renderNotifSettings(view) {
@@ -82,22 +100,19 @@ function renderNotifSettings(view) {
   setToggle(notif.enabled, view.enabled);
   notif.station.value = view.station_name || "";
   notif.server.value = view.server || "";
-  notif.topic.value = "";
-  notif.topic.placeholder = view.topic_set
-    ? `saved (${view.topic_hint}); type to replace`
-    : "optic-… (required to turn notifications on)";
-  notif.token.value = "";
-  notif.token.placeholder = view.token_set
-    ? `saved (${view.token_hint}); type to replace`
-    : "optional";
-  notif.tokenAction.value = "keep";
-  notif.tokenAction.disabled = !view.token_set;
+  // Saved secrets are shown masked (opti****bd45) as the field's value:
+  // left as is = keep, cleared = remove, anything else = replace.
+  notif.topic.value = view.topic_set ? view.topic_hint : "";
+  notif.topic.placeholder = "optic-… (required to turn notifications on)";
+  notif.token.value = view.token_set ? view.token_hint : "";
+  notif.token.placeholder = "optional";
   setToggle(notif.digestEnabled, view.digest.enabled);
   notif.digestTime.value = view.digest.send_at;
   setToggle(notif.hbEnabled, view.heartbeat.enabled);
   notif.hbInterval.value = Math.round(view.heartbeat.interval_secs / 60);
   notif.hbDelay.value = Math.round(view.heartbeat.alert_after_secs / 60);
-  setNotifDirty(false);
+  notifSavedForm = notifFormState();
+  updateNotifDirty();
   if (view.error) showNotifNotice(view.error, "warning");
 }
 
@@ -173,15 +188,31 @@ function generateTopic() {
   return `optic-${Array.from(bytes, (byte) => alphabet[byte % alphabet.length]).join("")}`;
 }
 
+// What to send for a masked secret field: unchanged = keep (empty value),
+// cleared = remove, otherwise the new value. A partly edited mask is an
+// error: the rest of the secret is unknown to the page.
+function secretField(input, saved, hint, name) {
+  const value = input.value.trim();
+  if (saved && value === hint) return { value: "", clear: false };
+  if (saved && value === "") return { value: "", clear: true };
+  if (value.includes("*")) {
+    throw new Error(`type the full new ${name}, or clear the field to remove it`);
+  }
+  return { value, clear: false };
+}
+
 function notifPayload() {
   const minutes = (input) => Math.round(Number(input.value) * 60);
+  const topic = secretField(notif.topic, notifSaved?.topic_set, notifSaved?.topic_hint, "topic");
+  const token = secretField(notif.token, notifSaved?.token_set, notifSaved?.token_hint, "token");
   return {
     enabled: isToggleOn(notif.enabled),
     station_name: notif.station.value,
     server: notif.server.value,
-    topic: notif.topic.value,
-    token: notif.token.value,
-    clear_token: notif.tokenAction.value === "clear",
+    topic: topic.value,
+    clear_topic: topic.clear,
+    token: token.value,
+    clear_token: token.clear,
     digest: {
       enabled: isToggleOn(notif.digestEnabled),
       send_at: notif.digestTime.value,
@@ -235,25 +266,24 @@ for (const input of [
   notif.server,
   notif.topic,
   notif.token,
-  notif.tokenAction,
   notif.digestTime,
   notif.hbInterval,
   notif.hbDelay,
 ]) {
-  input.addEventListener("input", () => setNotifDirty(true));
-  input.addEventListener("change", () => setNotifDirty(true));
+  input.addEventListener("input", updateNotifDirty);
+  input.addEventListener("change", updateNotifDirty);
 }
 
 for (const toggle of [notif.enabled, notif.digestEnabled, notif.hbEnabled]) {
   toggle.addEventListener("click", () => {
     setToggle(toggle, !isToggleOn(toggle));
-    setNotifDirty(true);
+    updateNotifDirty();
   });
 }
 
 notif.generateTopic.addEventListener("click", () => {
   notif.topic.value = generateTopic();
-  setNotifDirty(true);
+  updateNotifDirty();
   showNotifNotice(
     "New topic generated. Subscribe to it in the ntfy app now; it is not shown again after saving.",
     "warning",

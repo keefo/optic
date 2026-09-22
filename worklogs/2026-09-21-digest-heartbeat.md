@@ -345,6 +345,41 @@ it and ran the check directly. Logged in `AGENTS.md` per the repo rules.
   a switch click toggles and marks the form unsaved; `biome ci` clean.
 - Committed to PR #15 and deployed to the Pi with `--assets` (user-approved).
 
+### Revision: masked secrets as field values; no Keep/Remove control (user request, 2026-09-22)
+
+- First tried a Remove token button (shown only with a saved token); the
+  user then asked for a simpler rule, now implemented: topic and token
+  fields show the saved mask as their value (`opti****a7f3`,
+  `tk_a****z123`); unchanged = keep, cleared = remove, new value = replace;
+  a partly edited mask (still contains `*`) is refused on the page.
+  Token field changed from `password` to `text` so the mask is readable.
+- API: `clear_topic` added to `PUT /api/notifications` (next to
+  `clear_token`); clearing the topic removes the channel and is rejected
+  while notifications are on. Unit test extended. **Daemon and page must
+  deploy together**: the running daemon rejects unknown fields, so this
+  page against an older daemon cannot save.
+- Save-button bug (user report): Save stayed enabled after toggling a
+  switch back. Replaced the "dirty" flag with a comparison against the form
+  state last loaded or saved.
+- Checks: `cargo fmt --check`, clippy `-D warnings`, **206 tests** pass,
+  `biome ci` clean. Local Chrome run (after fixing my own stale local daemon
+  on port 18080, PID 89941, which caused a spurious 422): toggle on → Save
+  enabled, toggle back → disabled; edit + undo → disabled; keep (masks
+  untouched, station changed) → saved, both secrets kept; partial token edit
+  → "type the full new token, or clear the field to remove it", nothing
+  saved; token cleared → removed, topic kept; topic cleared with
+  notifications on → "an ntfy topic is required to turn notifications on";
+  token replaced → new mask `tk_z****a987`; topic cleared with notifications
+  off → channel removed.
+- Deployed (user-approved), with the heartbeat paused so the build could
+  not trigger a false alarm: read-then-save turned only the heartbeat off
+  at 07:33:32 (pending message cancelled 07:33:32.28; the station name was
+  already `optic` again — changed by the user since 07:16 — and was
+  preserved). Full deploy: 209 tests on the Pi, `SUCCESS`. Heartbeat back
+  on (read-then-save, only that field): check-in 07:36:39, ntfy.sh holds
+  one heartbeat message due in 1794 s. Pi serves the new page (no
+  Keep/Remove control, `secretField` present). Committed to PR #15.
+
 ## Incident: my cancel test overwrote the user's own settings
 
 The `--assets` deploy printed the journal, which showed the user had used

@@ -1362,7 +1362,9 @@ impl NotificationsView {
 }
 
 /// A save from the Config page. An absent or empty `topic`/`token` keeps
-/// the current one; `clear_token` removes the token.
+/// the current one; `clear_topic`/`clear_token` remove it (the page sends
+/// these when a field that showed a saved value is cleared). Removing the
+/// topic removes the whole ntfy channel, token included.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NotificationsUpdate {
@@ -1375,6 +1377,8 @@ pub struct NotificationsUpdate {
     pub topic: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub clear_topic: bool,
     #[serde(default)]
     pub clear_token: bool,
     pub digest: DigestSettings,
@@ -1405,8 +1409,11 @@ fn merge_update(
         .map(|server| server.trim_end_matches('/').to_owned())
         .or_else(|| current_ntfy.map(|ntfy| ntfy.server.clone()))
         .unwrap_or_else(default_ntfy_server);
-    let topic =
-        non_empty(update.topic.as_deref()).or_else(|| current_ntfy.map(|ntfy| ntfy.topic.clone()));
+    let topic = if update.clear_topic {
+        None
+    } else {
+        non_empty(update.topic.as_deref()).or_else(|| current_ntfy.map(|ntfy| ntfy.topic.clone()))
+    };
     let token = if update.clear_token {
         None
     } else {
@@ -3898,6 +3905,7 @@ mod tests {
             server: Some("https://ntfy.example/".to_owned()),
             topic: topic.map(str::to_owned),
             token: token.map(str::to_owned),
+            clear_topic: false,
             clear_token,
             digest: DigestSettings::default(),
             heartbeat: HeartbeatSettings::default(),
@@ -3930,6 +3938,27 @@ mod tests {
 
         let cleared = merge_update(Some(&current), update(None, Some("ignored"), true));
         assert_eq!(cleared.ntfy.unwrap().token, None);
+
+        // Clearing the topic removes the channel; with notifications on,
+        // the save is then rejected.
+        let no_topic = merge_update(
+            Some(&current),
+            NotificationsUpdate {
+                clear_topic: true,
+                ..update(Some("ignored"), None, false)
+            },
+        );
+        assert!(no_topic.ntfy.is_none());
+        assert!(
+            validate_for_save(&no_topic)
+                .unwrap_err()
+                .contains("topic is required")
+        );
+        let off_without_topic = NotificationSettings {
+            enabled: false,
+            ..no_topic
+        };
+        assert_eq!(validate_for_save(&off_without_topic), Ok(()));
 
         let fresh = merge_update(None, update(None, None, false));
         assert!(fresh.ntfy.is_none());

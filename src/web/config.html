@@ -98,7 +98,7 @@
         </div>
         <span id="notif-source" class="muted"></span>
       </div>
-      <p class="controls-help">Health alerts, the daily digest and the heartbeat go to an <a class="nav-link" href="https://ntfy.sh" target="_blank" rel="noopener noreferrer">ntfy</a> topic; subscribe to the same topic in the ntfy app. Anyone who knows the topic can read and post to it, so it is never shown again after saving: leave the topic and token empty to keep the saved ones.</p>
+      <p class="controls-help">Health alerts, the daily digest and the heartbeat go to an <a class="nav-link" href="https://ntfy.sh" target="_blank" rel="noopener noreferrer">ntfy</a> topic; subscribe to the same topic in the ntfy app. Anyone who knows the topic can read and post to it, so after saving only its first and last 4 characters are shown. Leave a field as it is to keep it, clear it to remove it, or type a new value to replace it.</p>
       <div class="station-grid">
         <label>
           <span>Server</span>
@@ -117,13 +117,7 @@
         </label>
         <label>
           <span>Access token</span>
-          <span class="input-with-button">
-            <input id="notif-token" type="password" autocomplete="new-password" spellcheck="false" placeholder="optional">
-            <select id="notif-token-action" aria-label="Saved token">
-              <option value="keep">Keep saved</option>
-              <option value="clear">Remove saved</option>
-            </select>
-          </span>
+          <input id="notif-token" type="text" autocomplete="off" spellcheck="false" placeholder="optional">
         </label>
       </div>
 

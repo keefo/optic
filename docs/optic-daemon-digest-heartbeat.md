@@ -330,8 +330,11 @@ be saved back as a real secret. No other endpoint returns
   never the topic or token. `alerts_file` appears only when the one-time
   import could not be written.
 - `PUT /api/notifications` with `{enabled, station_name, server, topic?,
-  token?, clear_token?, digest, heartbeat}`. An absent or empty `topic`
-  or `token` keeps the current one; `clear_token: true` removes the token.
+  clear_topic?, token?, clear_token?, digest, heartbeat}`. An absent or
+  empty `topic` or `token` keeps the current one; `clear_topic` /
+  `clear_token` remove it (the page sends them when a field that showed a
+  saved value is cleared). Removing the topic removes the channel, token
+  included, and is rejected while notifications are on.
   Validates (422 with the reason), saves (§5.3), wakes the alerts actor to
   apply at once, and returns the `GET` view.
 - `POST /api/notifications/test` sends
@@ -366,12 +369,13 @@ or sequence ID):
   `style-src 'self'` rules out inline styles, so all styling is in
   `styles.css`). A **Generate topic** button beside the Topic
   field fills a random `optic-` + 24 characters, shown once so it can be
-  entered in the ntfy app; a Keep saved / Remove saved selector sits
-  beside the token field the same way. Also **Save notifications**,
-  **Send test notification** and **Send digest now**, plus live digest and
-  heartbeat status lines. The test buttons use the saved settings and ask
-  for a save first when the form has unsaved changes. The card's heading
-  shows a hint only when something needs attention ("Not set up yet").
+  entered in the ntfy app. Saved secrets appear masked as the fields'
+  own text (`opti****bd45`, `tk_a****wxyz`): left as is = keep, cleared =
+  remove, a new value = replace; a partly edited mask is refused on the
+  page. Save is enabled only while the form differs from what was last
+  loaded or saved. The test buttons use the saved settings and ask for a
+  save first when the form has unsaved changes. The card's heading shows a
+  hint only when something needs attention ("Not set up yet").
   Code: `src/web/notifications.js`.
 - `src/web/footer.js` appends a `Heartbeat: …` and a `Digest: …` line to the
   Alerts pill's hover text. The pill's colour and text are unchanged.
