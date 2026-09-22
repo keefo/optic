@@ -606,3 +606,41 @@ brightness matches the scheduled frames.
   measurement ("Rotation · revision 2").
 - Deployed (user-approved, assets only, no service restart): the served
   `index.html` and `styles.css` contain `transform-rotation`.
+
+### Result: exposure compensation does not work on this pipeline (reverted)
+
+Implemented as designed (`ExposureValue` + `AeEnable(true)` +
+`ExposureTimeMode::Auto`/`AnalogueGainMode::Auto`, only for the biased-auto
+case), deployed to the Pi (full deploy, 235 tests on the Pi, clippy, release,
+exit 0), then measured on the camera in daylight.
+
+**libcamera accepts the control and ignores it.** No "unsupported control"
+warning appears in the journal, but neither the reported exposure nor the
+image changes:
+
+| `ev` requested | Reported shutter × gain | Mean image luma (160×120) |
+|---|---|---|
+| −3 | 193 µs | 29.0 |
+| 0 | 193 µs | 29.1 |
+| +3 | 193 µs | 29.1 |
+
+Method: `/api/stream/reconfigure` with `exposure_override {shutter_us: 0,
+gain: 0, ev}`, 9–12 s settle, then one frame pulled from
+`/api/stream/mjpeg`; headers for the exposure, and a canvas decode for the
+luma. AE reported `converged` throughout.
+
+Measurement pitfall worth recording: a first sweep *seemed* to work
+(386 → 939 → 3924 µs). That was the dashboard racing the test — it
+re-applies its own override on every 3 s status poll, so the page was
+overwriting the value under test. Re-run from `capture-history.html` (same
+origin, no preview logic) with the stream started by the test itself, the
+values are flat. Any future camera-control experiment must run with no
+dashboard tab open.
+
+Reverted in `101798b` so the capture path keeps its proven control set
+rather than an unverified AE branch. `RampPlan::Seed` is a unit variant
+again. The stepped Day brightness slider (separate commit) is kept.
+
+**Consequence:** the Part 4 requirement ("unsaved settings must show in the
+live preview, whatever the scheduler is doing") is still unmet while the
+ramp has no state. The remaining options are in the next section.
