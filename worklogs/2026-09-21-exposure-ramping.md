@@ -786,3 +786,60 @@ seconds. Workaround given immediately: turn the toggle off.
 - The user's staged config still carried the old `3.0`, since serde defaults
   only fill missing fields; it was set to `0.0` to match their decision.
   Mode AutoRamp, scheduler still Paused, nothing committed.
+
+## Part 7: White balance leaves the ramp (2026-09-22)
+
+### Decision
+
+User: "when I say locked, I mean it should follow user's manual selection.
+not a fixed value." So the ramp controls exposure only, and scheduled
+captures use the dashboard's own White balance control, exactly like a
+manual capture. The field stays editable with the toggle on.
+
+Two earlier designs are recorded in the design doc §6 as rejected: eased
+grey-world (neutralizes the sunset the shot exists for, and drifted once
+preview frames fed it at frame rate — Part 6) and locked-to-AWB-seed
+(stable, but replaces the operator's choice with an arbitrary camera
+reading).
+
+### Changes
+
+- Removed colour gains from `RampState`, `RampPlan::Manual`,
+  `FrameObservation`, `LiveExposurePlan`, `ExposureOverride`, the preview
+  override and the UI; removed `ease_colour_gains`, `wb_max_step_pct` and
+  the Advanced field. Net −363/+83 lines.
+- `StreamRequest::effective_settings` no longer forces `awb: "auto"` when
+  overriding exposure — a leftover that overrode the operator's setting.
+- Seed captures keep the operator's white balance (they only zero shutter
+  and gain for auto exposure).
+- Default white balance is now **Daylight** (`CameraSettings::default`,
+  app.js `defaults`, and the HTML `selected`), and the dropdown labels Auto
+  "(not recommended)". The preview caption strips that suffix.
+- UI note explains the choice: pick a fixed preset to avoid colour flicker;
+  Auto re-evaluates per frame.
+- Docs: design doc §6 rewritten ("White Balance Is Not Ramped"), §2/§3/§4/
+  §10 updated.
+
+### Checks and deploy
+
+- Mac: `cargo fmt --check`, 239 tests, clippy `-D warnings`, Biome, 24 node
+  tests — all pass.
+- Deployed twice (the removal, then the defaults), each `DEPLOY_EXIT=0`
+  with 234 tests passing on the Pi; the served dropdown shows
+  `Auto (not recommended)` with Daylight selected.
+- Existing configs keep their stored value: the user's committed `awb` is
+  still `auto` until they pick Daylight and save. Flagged to the user.
+- Observed after the deploy: the staged AutoRamp edit was gone (mode
+  `Dashboard`, nothing staged) — discarded outside this session, left alone.
+
+### Reference answer recorded for the user
+
+How professional timelapse handles white balance day-to-night: shoot RAW
+with a **fixed** white balance, then keyframe and interpolate it across the
+whole sequence in post (LRTimelapse + Lightroom/ACR is the common pairing),
+finishing with a deflicker pass. Some instead smooth the camera's own
+per-frame AWB values across the sequence afterwards. The common thread is
+that the smoothing is *non-causal* — it sees every frame — which a live
+camera loop cannot be. Night is usually left warmer rather than neutralized.
+Optic's Master Archive DNG keeps white balance fully adjustable in post;
+JPEG-only profiles bake it in, so a fixed preset matters most there.
