@@ -380,6 +380,23 @@ it and ran the check directly. Logged in `AGENTS.md` per the repo rules.
   one heartbeat message due in 1794 s. Pi serves the new page (no
   Keep/Remove control, `secretField` present). Committed to PR #15.
 
+### Merge of `origin/main` (PR #15 conflicts, 2026-09-22)
+
+- `main` gained PR #13 (focus tools) and #14 (Pi services audit). Merged
+  `origin/main` into `digest-heartbeat` (merge commit, no rebase or
+  force-push, same as #14 did).
+- Only textual conflict: `CLAUDE.md` constraints list (both sides appended
+  bullets); kept all, main's first. `biome.json`, `src/web.rs` and
+  `src/web/styles.css` auto-merged; checked by hand: both new JS files in
+  the biome list, all routes present, and `styles.css` differs from main
+  by exactly this branch's rules. The duplicate `.controls-card
+  .controls-panel` selector already exists on main (not from the merge).
+- Removed two rules left unused by the masked-field change
+  (`.input-with-button > select`, `input[type="password"]`).
+- Checks on the merged tree: `cargo fmt --check`, clippy `-D warnings`,
+  **207 tests** (206 + 1 from main), `biome ci` (12 files),
+  `node --test tests/web/*.test.js` **13/13** (CI's command).
+
 ## Incident: my cancel test overwrote the user's own settings
 
 The `--assets` deploy printed the journal, which showed the user had used

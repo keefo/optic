@@ -71,7 +71,7 @@ tests; changing the runtime layout on the Pi (`~/.local/bin/optic-daemon`,
 
 ```text
 push / PR ─► ci.yml
-             ├─ web-lint        ubuntu-24.04     Biome 2.5.14 `biome ci` on src/web
+             ├─ web-lint        ubuntu-24.04     Biome 2.5.14 `biome ci` on src/web; node --test tests/web/*.test.js
              └─ rust-arm64      ubuntu-24.04-arm, container debian:trixie
                   fmt → test → clippy -D warnings → release build
                   → ldd / version checks → upload artifact (14 days)
@@ -122,7 +122,11 @@ Mac (human) ─► ./scripts/build-deploy-optic-daemon.sh --release X.Y.Z
 - **`web-lint`** uses `biomejs/setup-biome` with version `2.5.14`, then runs
   `biome ci`. The checked file list lives in `biome.json` `files.includes`.
   The deploy script runs `biome check` with no paths, so both use the same
-  list. Biome also checks `biome.json` itself.
+  list. Biome also checks `biome.json` itself. A second step runs
+  `node --test tests/web/*.test.js` (the dashboard JS unit tests, `node:test` only, on
+  the runner's preinstalled Node; added 2026-09-21,
+  `worklogs/2026-09-21-focus-tools.md`). `tests/web/**` is not
+  documentation, so a change there always runs CI.
 - **`rust-arm64`**:
   1. `runs-on: ubuntu-24.04-arm`, `container: debian:trixie`.
   2. Run `scripts/ci-install-build-deps.sh`. It:

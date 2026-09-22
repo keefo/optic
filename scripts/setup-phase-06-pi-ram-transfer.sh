@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 
-# Configure the Pi side of Phase 6: RAM capture staging and verified iMac transfer.
+# Configure the Pi side of Phase 6: RAM capture staging and the key and pinned
+# host key that optic-daemon's optic_sync uses to reach the iMac receiver.
+#
+# The original shell transfer (optic-capture-transfer.timer) is retired:
+# optic_sync replaced it, and the timer ships and then deletes every
+# non-hidden file in /mnt/capture. This script no longer installs it and
+# retires any copy left from an earlier run (docs/pi-services-audit.md §3.8).
 
 set -euo pipefail
 
@@ -19,14 +25,17 @@ REMOTE_HOST="imacpro.local"
 REMOTE_PORT="2222"
 REMOTE_USER="admin"
 BACKUP_DIR="/var/backups/optic-hardening"
-CONFIG_DIR="/etc/optic"
-CONFIG_FILE="$CONFIG_DIR/capture-transfer.conf"
 MOUNT_UNIT="/etc/systemd/system/mnt-capture.mount"
-SERVICE_UNIT="/etc/systemd/system/optic-capture-transfer.service"
-TIMER_UNIT="/etc/systemd/system/optic-capture-transfer.timer"
-SENDER_SOURCE="$(cd "$(dirname "$0")" && pwd)/optic-capture-transfer.sh"
-SENDER_TARGET="/usr/local/libexec/optic-capture-transfer"
 USER_HOME="/home/$CAPTURE_USER"
+# Retired shell transfer, removed if present.
+RETIRED_CONFIG_DIR="/etc/optic"
+RETIRED_FILES=(
+    /etc/systemd/system/optic-capture-transfer.timer
+    /etc/systemd/system/optic-capture-transfer.service
+    "$RETIRED_CONFIG_DIR/capture-transfer.conf"
+    /usr/local/libexec/optic-capture-transfer
+    "$USER_HOME/.local/bin/optic-capture-transfer.sh"
+)
 PRIVATE_KEY="$USER_HOME/.ssh/optic_capture_ed25519"
 PUBLIC_KEY="$PRIVATE_KEY.pub"
 KNOWN_HOSTS="$USER_HOME/.ssh/optic_capture_known_hosts"
@@ -37,8 +46,9 @@ usage() {
     cat <<'EOF'
 Usage: setup-phase-06-pi-ram-transfer.sh [--dry-run] [--host-key FILE] [--help]
 
-Configures a 256 MiB tmpfs capture stage and a verified SSH push service to
-the dedicated iMac receiver at imacpro.local:2222.
+Configures a 256 MiB tmpfs capture stage, the capture key, and the pinned host
+key of the dedicated iMac receiver at imacpro.local:2222 that optic_sync uses.
+Retires the old shell transfer timer and its files if present.
 
   --dry-run        Report required changes without modifying the system.
   --host-key FILE  Pin the exported iMac receiver public host key.
@@ -74,69 +84,6 @@ Options=mode=0750,uid=$CAPTURE_UID,gid=$CAPTURE_GID,size=256M,nosuid,nodev,noexe
 
 [Install]
 WantedBy=local-fs.target
-EOF
-)
-
-config_content=$(cat <<EOF
-# Managed by Project Optic setup-phase-06-pi-ram-transfer.sh
-STAGING_DIR=$CAPTURE_DIR
-REMOTE_HOST=$REMOTE_HOST
-REMOTE_PORT=$REMOTE_PORT
-REMOTE_USER=$REMOTE_USER
-IDENTITY_FILE=$PRIVATE_KEY
-KNOWN_HOSTS_FILE=$KNOWN_HOSTS
-EOF
-)
-
-service_content=$(cat <<EOF
-# Managed by Project Optic setup-phase-06-pi-ram-transfer.sh
-[Unit]
-Description=Project Optic verified capture transfer
-Requires=mnt-capture.mount
-After=mnt-capture.mount network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-User=$CAPTURE_USER
-Group=$CAPTURE_GROUP
-ExecStart=$SENDER_TARGET
-UMask=0027
-Nice=10
-IOSchedulingClass=idle
-NoNewPrivileges=true
-PrivateDevices=true
-PrivateTmp=true
-ProtectClock=true
-ProtectControlGroups=true
-ProtectHome=read-only
-ProtectHostname=true
-ProtectKernelLogs=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-ProtectSystem=strict
-ReadWritePaths=$CAPTURE_DIR
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-RestrictNamespaces=true
-RestrictSUIDSGID=true
-SystemCallArchitectures=native
-EOF
-)
-
-timer_content=$(cat <<'EOF'
-# Managed by Project Optic setup-phase-06-pi-ram-transfer.sh
-[Unit]
-Description=Project Optic capture transfer schedule
-
-[Timer]
-OnBootSec=30s
-OnUnitActiveSec=15s
-AccuracySec=1s
-RandomizedDelaySec=3s
-Unit=optic-capture-transfer.service
-
-[Install]
-WantedBy=timers.target
 EOF
 )
 
@@ -196,17 +143,26 @@ install_managed_file() {
     printf 'Installed %s\n' "$path"
 }
 
+retired_present() {
+    local path
+    for path in "${RETIRED_FILES[@]}"; do
+        [[ -e "$path" ]] && printf '%s\n' "$path"
+    done
+    return 0
+}
+
 if ((DRY_RUN)); then
     printf '%s\n' 'Project Optic Phase 6 Pi dry run'
-    [[ -x "$SENDER_SOURCE" ]] || {
-        printf '[BLOCKED] Transfer helper is missing or not executable: %s\n' "$SENDER_SOURCE"
-        exit 69
-    }
     show_file_plan "$MOUNT_UNIT" "$mount_content"
-    show_file_plan "$CONFIG_FILE" "$config_content"
-    show_file_plan "$SERVICE_UNIT" "$service_content"
-    show_file_plan "$TIMER_UNIT" "$timer_content"
     show_file_plan "$BESZEL_DROPIN" "$beszel_content"
+    retired=$(retired_present)
+    if [[ -z "$retired" ]]; then
+        printf '%s\n' '[OK] The retired shell capture transfer is not installed.'
+    else
+        while IFS= read -r path; do
+            printf '[CHANGE] Retire %s (move it into %s/retired-capture-transfer.<time>/).\n' "$path" "$BACKUP_DIR"
+        done <<< "$retired"
+    fi
     [[ -f "$PRIVATE_KEY" ]] && printf '%s\n' '[OK] Capture transfer key already exists.' ||
         printf '%s\n' '[CHANGE] Generate a dedicated capture transfer key.'
     if [[ -n "$HOST_KEY_FILE" ]]; then
@@ -228,10 +184,6 @@ if ((EUID != 0)); then
     exit 77
 fi
 
-[[ -x "$SENDER_SOURCE" ]] || {
-    printf 'Transfer helper is missing or not executable: %s\n' "$SENDER_SOURCE" >&2
-    exit 69
-}
 [[ "$(id -u "$CAPTURE_USER")" == "$CAPTURE_UID" ]] || {
     printf 'Unexpected UID for %s.\n' "$CAPTURE_USER" >&2
     exit 69
@@ -241,19 +193,14 @@ fi
     exit 69
 }
 
-printf '%s\n' 'Configuring Project Optic Phase 6 Pi RAM stage and transfer service'
+printf '%s\n' 'Configuring Project Optic Phase 6 Pi RAM stage and sync credentials'
 
-install -d -m 0755 "$CONFIG_DIR" /usr/local/libexec
 install -d -m 0700 -o "$CAPTURE_USER" -g "$CAPTURE_GROUP" "$USER_HOME/.ssh"
 install -d -m 0755 -o "$CAPTURE_USER" -g "$CAPTURE_GROUP" \
     "$USER_HOME/.config/systemd/user/beszel-agent.service.d"
 install -d -m 0750 -o "$CAPTURE_USER" -g "$CAPTURE_GROUP" "$CAPTURE_DIR"
 
-install -m 0755 -o root -g root "$SENDER_SOURCE" "$SENDER_TARGET"
 install_managed_file "$MOUNT_UNIT" "$mount_content"
-install_managed_file "$CONFIG_FILE" "$config_content" 0644 root root
-install_managed_file "$SERVICE_UNIT" "$service_content"
-install_managed_file "$TIMER_UNIT" "$timer_content"
 install_managed_file "$BESZEL_DROPIN" "$beszel_content" 0644 "$CAPTURE_USER" "$CAPTURE_GROUP"
 
 if [[ ! -f "$PRIVATE_KEY" ]]; then
@@ -279,7 +226,21 @@ if [[ -n "$HOST_KEY_FILE" ]]; then
     printf 'Pinned receiver host key in %s.\n' "$KNOWN_HOSTS"
 fi
 
-systemd-analyze verify "$MOUNT_UNIT" "$SERVICE_UNIT" "$TIMER_UNIT"
+retired=$(retired_present)
+if [[ -n "$retired" ]]; then
+    # Stop first: the retired service deletes files from /mnt/capture.
+    systemctl disable --now optic-capture-transfer.timer 2>/dev/null || true
+    systemctl stop optic-capture-transfer.service 2>/dev/null || true
+    retired_dir="$BACKUP_DIR/retired-capture-transfer.$(date +%Y%m%dT%H%M%S)"
+    install -d -m 0700 "$retired_dir"
+    while IFS= read -r path; do
+        mv -- "$path" "$retired_dir/"
+        printf 'Retired %s (moved to %s).\n' "$path" "$retired_dir"
+    done <<< "$retired"
+    rmdir --ignore-fail-on-non-empty "$RETIRED_CONFIG_DIR" 2>/dev/null || true
+fi
+
+systemd-analyze verify "$MOUNT_UNIT"
 systemctl daemon-reload
 systemctl enable --now mnt-capture.mount
 chown "$CAPTURE_USER:$CAPTURE_GROUP" "$CAPTURE_DIR"
@@ -290,13 +251,13 @@ sudo -u "$CAPTURE_USER" XDG_RUNTIME_DIR="/run/user/$CAPTURE_UID" \
 sudo -u "$CAPTURE_USER" XDG_RUNTIME_DIR="/run/user/$CAPTURE_UID" \
     systemctl --user restart beszel-agent.service
 
+for path in "${RETIRED_FILES[@]}"; do
+    [[ ! -e "$path" ]]
+done
 if [[ -s "$KNOWN_HOSTS" ]]; then
-    systemctl enable --now optic-capture-transfer.timer
-    systemctl start optic-capture-transfer.service
-    printf '%s\n' 'Capture transfer timer is enabled.'
+    printf '%s\n' 'Pi setup complete; optic_sync can reach the pinned iMac receiver.'
 else
-    systemctl disable --now optic-capture-transfer.timer 2>/dev/null || true
-    printf '%s\n' 'Pi setup complete; transfer timer awaits the pinned iMac host key.'
+    printf '%s\n' 'Pi setup complete; rerun with --host-key to pin the iMac receiver for optic_sync.'
 fi
 
 printf 'Pi capture public key: %s\n' "$PUBLIC_KEY"

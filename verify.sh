@@ -599,6 +599,58 @@ for unit in pulseaudio.socket pulseaudio.service pipewire.socket pipewire.servic
     global_user_unit_masked "$unit"
 done
 
+# Unused services from the 2026-09-21 audit (docs/pi-services-audit.md).
+for unit in man-db.timer udisks2.service; do
+    unit_disabled "$unit"
+done
+if apt-config dump 2>/dev/null | grep -q '^APT::Periodic::'; then
+    info "apt timers are kept" "APT::Periodic is configured"
+else
+    for unit in apt-daily.timer apt-daily-upgrade.timer; do
+        unit_disabled "$unit"
+    done
+fi
+root_source=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+if [[ "$root_source" == /dev/mapper/* || "$(lsblk -no TYPE "$root_source" 2>/dev/null)" == "lvm" ]]; then
+    info "e2scrub units are kept" "/ is on LVM"
+else
+    for unit in e2scrub_all.timer e2scrub_reap.service; do
+        unit_disabled "$unit"
+    done
+fi
+
+mpris_state=$(systemctl --global is-enabled mpris-proxy.service 2>/dev/null || true)
+if [[ -z "$mpris_state" || "$mpris_state" == "disabled" || "$mpris_state" == "masked" || "$mpris_state" == "not-found" ]]; then
+    pass "User unit mpris-proxy.service is not enabled globally" "state=${mpris_state:-absent}"
+else
+    fail "User unit mpris-proxy.service must not be enabled globally" "state=$mpris_state"
+fi
+
+# The setup script skips these three when a safety check fails, so they
+# warn rather than fail.
+cron_active=$(systemctl is-active cron.service 2>/dev/null || true)
+cron_enabled=$(systemctl is-enabled cron.service 2>/dev/null || true)
+if [[ "$cron_active" != "active" && "$cron_enabled" != "enabled" ]]; then
+    pass "cron.service is not running" "active=${cron_active:-absent}, enabled=${cron_enabled:-absent}"
+else
+    warn "cron.service is still enabled" "Phase 4 keeps it only if a cron job needs it"
+fi
+
+if ! command -v cloud-init >/dev/null 2>&1; then
+    pass "cloud-init is absent"
+elif [[ -e /etc/cloud/cloud-init.disabled ]]; then
+    pass "cloud-init is disabled" "/etc/cloud/cloud-init.disabled"
+else
+    warn "cloud-init still runs at every boot" "status=$(cloud-init status 2>/dev/null | awk -F': *' '/^status:/ { print $2; exit }')"
+fi
+
+autologin_files=$(grep -l -e '--autologin' /etc/systemd/system/getty@tty1.service.d/*.conf 2>/dev/null || true)
+if [[ -z "$autologin_files" ]]; then
+    pass "No console autologin on tty1"
+else
+    warn "Console autologin is enabled on tty1" "$(paste -sd ' ' - <<< "$autologin_files")"
+fi
+
 avahi_active=$(systemctl is-active avahi-daemon.service 2>/dev/null || true)
 avahi_enabled=$(systemctl is-enabled avahi-daemon.service 2>/dev/null || true)
 if [[ "$avahi_active" == "active" && "$avahi_enabled" != "disabled" && "$avahi_enabled" != "masked" ]]; then
@@ -825,6 +877,21 @@ if [[ "$legacy_timer_active" == "active" || "$legacy_timer_enabled" == "enabled"
         "optic-capture-transfer.timer active=$legacy_timer_active, enabled=$legacy_timer_enabled; optic_sync replaces it"
 else
     pass "Retired shell capture transfer timer is not running"
+fi
+
+retired_transfer=""
+for path in /etc/systemd/system/optic-capture-transfer.timer \
+    /etc/systemd/system/optic-capture-transfer.service \
+    /etc/optic/capture-transfer.conf \
+    /usr/local/libexec/optic-capture-transfer \
+    "$HOME/.local/bin/optic-capture-transfer.sh"; do
+    [[ -e "$path" ]] && retired_transfer+=" $path"
+done
+if [[ -z "$retired_transfer" ]]; then
+    pass "Retired shell capture transfer files are removed"
+else
+    fail "Retired shell capture transfer files remain" \
+        "run setup-phase-06-pi-ram-transfer.sh:$retired_transfer"
 fi
 
 # /api/status serializes SyncStatus as a flat JSON object (src/optic_sync.rs).
