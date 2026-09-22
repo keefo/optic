@@ -348,3 +348,21 @@ latency hook order.
   image drops Node, add a SHA-pinned `actions/setup-node`.
 - README mismatch, outside this track: it still says "systemd user
   service" (it has been a system service since PR #12).
+
+## CI fix (2026-09-21, after PR #13 opened)
+
+PR #13 CI: `Biome (web assets)` failed on both the push and pull_request
+runs. `biome ci` passed; the new step failed. The runner has Node
+**v22.23.2**, which treats `node --test tests/web` as a module path:
+`Error: Cannot find module '/home/runner/work/optic/optic/tests/web'`,
+with 0 tests run. Local Node 26 discovers test files in a directory, which
+is why it passed locally. The other checks passed: Rust (Debian 13
+arm64), Timelapse tool (macOS) and Detect changed scope.
+
+Fix: CI now runs `node --test tests/web/*.test.js` (bash expands the glob;
+this works on every Node that has `node:test`). The same form is now used
+in the test-file header comment, `docs/optic-daemon-ci-cd.md` (§4 and
+§5.1) and `docs/optic-daemon-focus-tools.md`. The lesson is recorded in
+`AGENTS.md`, under Environment and Tooling Constraints.
+
+Local check: `node --test tests/web/*.test.js` gives 13/13.

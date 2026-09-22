@@ -1,7 +1,7 @@
 "use strict";
 
 // Unit tests for the pure functions in src/web/focus-tools.js.
-// Run: node --test tests/web
+// Run: node --test tests/web/*.test.js
 
 const test = require("node:test");
 const assert = require("node:assert/strict");

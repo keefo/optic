@@ -178,6 +178,7 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 - Do not use `timeout <secs> <cmd>` on the Mac (GNU coreutils `timeout` is not installed: `command not found`); for SSH use `-o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=2` and the Bash tool's own timeout instead.
 - Do not use `rg` in commands run on the Pi over SSH (not installed there: `rg: command not found`); use `grep -E` on the Pi and keep `rg` for the Mac checkout.
 - Do not put several SSH options in one shell variable such as `S="-o BatchMode=yes -o ConnectTimeout=10"; ssh $S host` (zsh does not word-split unquoted variables, so ssh gets one bad argument: `keyword batchmode extra arguments at end of line`); write the `-o` options out inline instead.
+- Do not use `node --test tests/web` in CI (the ubuntu-24.04 runner's Node 22 treats a bare directory as a module path: `Cannot find module '.../tests/web'`; only newer Node, such as the Mac's 26, discovers tests in it); use `node --test tests/web/*.test.js` instead.
 
 ## Orca Worktree Completion Rules
 - When the task, PR, or assigned scope is finished:

@@ -37,7 +37,7 @@ viewing computer, not the Pi.
 
 1. **Pure functions** on `{ data, width, height }` RGBA pixel data, exported
    through `module.exports` for Node tests (`tests/web/focus-tools.test.js`,
-   run with `node --test tests/web`):
+   run with `node --test tests/web/*.test.js`):
 
    | Function | Result |
    | --- | --- |
