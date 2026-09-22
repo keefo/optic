@@ -604,4 +604,5 @@ brightness matches the scheduled frames.
 - Checked on a local daemon in Chrome: layout (Rotation / H flip + V flip);
   selecting 180° updates `settings().rotation` and starts a preview
   measurement ("Rotation · revision 2").
-- Not yet deployed.
+- Deployed (user-approved, assets only, no service restart): the served
+  `index.html` and `styles.css` contain `transform-rotation`.
