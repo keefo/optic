@@ -48,8 +48,8 @@ either, only to watch.
 **Request identity/provenance**
 - Unique capture ID (correlates the log file, the SQLite row, and the
   output JPEG/DNG filenames — see §3.1 on the shared-basename convention)
-- Requester/source: `web_ui` today; `scheduler` once `optic_scheduler`
-  exists (see `worklogs/2026-09-18-timelapse-scheduler.md`)
+- Requester/source: `web_ui` or `scheduler`, with `triggered_by` listing
+  the contributing rule slugs (`worklogs/2026-09-20-scheduler-phase2e-capture-log-source-fix-and-doc-resolution.md`)
 - Trigger detail (manual click vs. scheduled tick vs. retry, once those
   distinctions exist)
 
@@ -241,11 +241,12 @@ partition was provisioned. Rationale: the live Pi is plain writable ext4
 and Phase 9 has no scheduled enablement date, so building a dedicated
 mount now would be speculative work against a timeline that doesn't exist
 yet. This is a traded-off decision, not a silent one: if Phase 9 is ever
-enabled, `history.db` writes will start failing — `CaptureLog::open`
-already logs a warning and disables history recording gracefully rather
-than crashing the daemon (see `src/main.rs`), so the failure mode is loud
-and non-fatal, but the feature itself would go dark until this is
-revisited (likely by moving to Option B — a dedicated writable
+enabled as `raspi-config` does it, `history.db` writes will **not** fail:
+they succeed into the RAM overlay and are silently lost at every reboot
+(`docs/phase9-readonly-root.md`, "Consequences"). The graceful
+`CaptureLog::open` warning in `src/main.rs` would not fire. This corrects
+an earlier version of this section, which expected a loud failure. The
+fix is required before Phase 9, not optional (likely by moving to Option B — a dedicated writable
 partition/bind-mount for `~/.local/state/` and `~/.local/bin/` together —
 at whatever point Phase 9 is actually scheduled).
 
@@ -260,9 +261,9 @@ at whatever point Phase 9 is actually scheduled).
 - **`optic_sync`:** transports the per-capture `.log.json` file exactly
   like it transports JPEG/DNG files (§3.1). `is_capture_filename` is
   extended to match the `.log.json` suffix; no protocol changes.
-- **`optic_scheduler`:** once implemented, becomes a second source of
-  capture events alongside the web UI, distinguished via the
-  requester/source field (§2, currently hardcoded to `"web_ui"`). No
+- **`optic_scheduler`:** a second source of capture events alongside the
+  web UI, distinguished via the requester/source field (§2) and
+  `triggered_by`. No
   dependency in the other direction — this module doesn't need the
   scheduler to exist first.
 

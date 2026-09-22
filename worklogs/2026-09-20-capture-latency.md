@@ -1,7 +1,8 @@
 # Dated Worklog: 2026-09-20 - Still-Capture Latency Fix
 
 Status: **user-accepted** — deployed, hardware-tested (H1, H3, H4 at 1 s),
-and visually accepted by the user (H2). Not committed. Follow-ups listed below.
+and visually accepted by the user (H2). Merged to `main` in PR #10 (95381e0,
+2026-09-21); `main` is not yet redeployed as its own version. Follow-ups listed below.
 
 ## Objective
 

@@ -1,6 +1,7 @@
 # Dated Worklog: 2026-09-21 - CI: Classify a New Branch's First Push Against `main`
 
-Status: **implemented and locally tested**; GitHub run pending.
+Status: **implemented, merged (PR #9), new-branch path confirmed live**; a
+docs-only first-push skip not yet observed on GitHub.
 
 ## Objective
 
@@ -94,3 +95,15 @@ branch forked from. **12/12 as expected**:
 | Normal push `a6e1509^..a6e1509` (docs) | | | `docs_only=true` (unchanged) |
 | Unknown `before` | | | full CI (unchanged) |
 | `workflow_dispatch` | | | full CI (unchanged) |
+
+## GitHub Validation (recorded 2026-09-21, after merge)
+
+- Run `35575800715` (`push`, the branch's own first push): the `changes`
+  log lists `.github/workflows/ci.yml`, `docs/optic-daemon-ci-cd.md` and
+  this worklog, taken from the new `origin/main...SHA` range rather than
+  "No usable diff range". All jobs then ran in full, which is correct for a CI change.
+- Independent review re-ran the docs-only case locally: PR #8's head
+  `a5d92c2` against its fork base `b8ecbed` gives `docs_only=true
+  timelapse=false`.
+- Still to observe: a new docs-only branch whose first push skips the
+  build jobs on GitHub.

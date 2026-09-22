@@ -10,8 +10,8 @@ done — so it's directly felt by the operator as "the button just hangs."
 
 This document records the measurement methodology, the raw findings, the
 root-cause conclusion, and open directions for actually fixing it. It is a
-reference for future iteration, not a worklog. A fix (§7) is implemented
-on branch `feat/capture-latency` was measured on hardware and accepted by the user on 2026-09-21.
+reference for future iteration, not a worklog. A fix (§7) was measured on
+hardware, accepted by the user on 2026-09-21, and merged in PR #10.
 
 ## 2. Methodology
 
@@ -197,8 +197,9 @@ Ordered roughly by expected effort-to-payoff:
    duration for the warmup loop specifically could plausibly cut the
    ~5 second warmup down to a few hundred milliseconds. This is the
    highest-leverage, most concretely-supported-by-data next step.
-   **Not yet tried** — needs a real on-hardware test after the change,
-   same as everything else in this doc.
+   **Done** in §7 (merged in PR #10). One gap remains: `camera.start()`
+   still passes no frame-duration limit, so the first frames keep the
+   previous preview's pacing (§7).
 2. **Re-examine why `CAPTURE_WARMUP_FRAMES = 8` is needed at all.** The
    original rationale for a warmup period is almost always AE/AWB
    convergence — but AE is fully disabled in this code path (§3.3.1), and
@@ -341,7 +342,7 @@ All logging described in §2.1 is live in `src/native_camera.rs` and
 cheap (`tracing::info!` calls with primitive fields) and directly useful
 for verifying any future change against this document's baseline numbers.
 
-## 7. Fix (2026-09-20/21; hardware-tested, user-accepted, not yet merged)
+## 7. Fix (2026-09-20/21; hardware-tested, user-accepted, merged in PR #10)
 
 Tracked in `worklogs/2026-09-20-capture-latency.md`.
 

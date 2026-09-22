@@ -1,6 +1,7 @@
 # Dated Worklog: 2026-09-21 - Preview Downsample Toggle and Stop/Resume
 
-Status: **downsample user-accepted; Stop/Resume Pi-tested** — not committed.
+Status: **downsample user-accepted; Stop/Resume Pi-tested** — merged to `main`
+in PR #10 (95381e0, 2026-09-21).
 Stop/Resume browser behaviour has not been confirmed by the user yet.
 
 ## Objective

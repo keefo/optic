@@ -245,13 +245,13 @@ Each phase gets its own dated worklog, per `CLAUDE.md`.
 
 ## 8. Decisions Needed From the User
 
-- **D1**: Protect branch `main` so the `ci.yml` checks must pass before
-  merge. This is a GitHub setting that the user controls.
+- **D1** (resolved): `main` is protected by a ruleset that requires a
+  pull request and the `Biome (web assets)` and `Rust (Debian 13 arm64)`
+  checks.
 - **D2** (resolved 2026-09-20): add `rust-toolchain.toml`. The Mac's
   Homebrew `cargo` ignores it; rustup-managed `cargo` honours it.
-- **D3**: Whether a macOS job is worth its cost. macOS minutes cost about
-  10× Linux on private repos. The recommendation is to keep the macOS check
-  local.
+- **D3** (resolved): a `Timelapse tool (macOS)` job was added, gated to
+  run only when the tool or the CI definition changes (§9 O3).
 - **D4**: Release cadence. The options are tag every version bump, or tag
   only builds that are candidates for deployment.
 
@@ -267,6 +267,5 @@ Each phase gets its own dated worklog, per `CLAUDE.md`.
   roughly 2–5 billed minutes per push. `timelapse-macos` runs only when
   the tool or the CI definition changes, because macOS minutes are billed
   at about 10× Linux on this private repo.
-- **O4**: `CLAUDE.md` imports `@AGENTS.md`, but no `AGENTS.md` exists in
-  this checkout, so the tooling-constraints section it references is
-  missing.
+- **O4** (resolved): `AGENTS.md` is a symlink to `CLAUDE.md`, which has
+  the tooling-constraints section.

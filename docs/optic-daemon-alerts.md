@@ -1,8 +1,8 @@
 # Design Note: Health Alerts (`optic_alerts`)
 
-Status: **design accepted 2026-09-20; implemented and tested locally
-(macOS unit tests + local end-to-end delivery through real `curl`); not yet
-deployed or validated on the Pi.** Implementation record:
+Status: **implemented, merged (PR #6), and validated on the Pi**: live
+ntfy delivery from the Pi was confirmed on the user's phone, and the user
+accepted the work on 2026-09-21. Not soak-tested. Implementation record:
 `worklogs/2026-09-20-health-alerts.md`. Code: `src/optic_alerts.rs`.
 
 ## 1. Purpose

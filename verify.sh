@@ -758,17 +758,30 @@ else
         "active=${capture_mount_active:-unknown}, enabled=${capture_mount_enabled:-unknown}"
 fi
 
-transfer_config=/etc/optic/capture-transfer.conf
-transfer_host=$(unquote "$(file_value "$transfer_config" REMOTE_HOST)")
-transfer_user=$(unquote "$(file_value "$transfer_config" REMOTE_USER)")
-transfer_port=$(unquote "$(file_value "$transfer_config" REMOTE_PORT)")
-if [[ "$transfer_host" == "$EXPECTED_CAPTURE_HOST" &&
-      "$transfer_user" == "$EXPECTED_CAPTURE_USER" &&
-      "$transfer_port" == "$EXPECTED_CAPTURE_PORT" ]]; then
-    pass "Capture transfer target" "$transfer_user@$transfer_host:$transfer_port"
+# Capture transfer is optic_sync inside optic-daemon (docs/optic-daemon.md
+# §6), configured by OPTIC_SYNC_* in the user unit; unset port/user fall
+# back to the daemon defaults (src/main.rs DEFAULT_SYNC_REMOTE_*).
+daemon_environment=$(systemctl --user show optic-daemon.service -p Environment --value 2>/dev/null || true)
+sync_env_value() {
+    local key=$1 entry
+    for entry in $daemon_environment; do
+        [[ "$entry" == "$key="* ]] && { printf '%s' "${entry#*=}"; return 0; }
+    done
+    return 1
+}
+sync_host=$(sync_env_value OPTIC_SYNC_REMOTE_HOST || true)
+sync_user=$(sync_env_value OPTIC_SYNC_REMOTE_USER || echo admin)
+sync_port=$(sync_env_value OPTIC_SYNC_REMOTE_PORT || echo 2222)
+sync_enabled_env=$(sync_env_value OPTIC_SYNC_ENABLED || true)
+if [[ "$sync_enabled_env" == "false" ]]; then
+    fail "Capture sync is force-disabled" "OPTIC_SYNC_ENABLED=false in optic-daemon.service"
+elif [[ "$sync_host" == "$EXPECTED_CAPTURE_HOST" &&
+        "$sync_user" == "$EXPECTED_CAPTURE_USER" &&
+        "$sync_port" == "$EXPECTED_CAPTURE_PORT" ]]; then
+    pass "Capture sync target" "$sync_user@$sync_host:$sync_port"
 else
-    fail "Capture transfer target differs from the plan" \
-        "expected=$EXPECTED_CAPTURE_USER@$EXPECTED_CAPTURE_HOST:$EXPECTED_CAPTURE_PORT, actual=${transfer_user:-missing}@${transfer_host:-missing}:${transfer_port:-missing}"
+    fail "Capture sync target differs from the plan" \
+        "expected=$EXPECTED_CAPTURE_USER@$EXPECTED_CAPTURE_HOST:$EXPECTED_CAPTURE_PORT, actual=${sync_user:-missing}@${sync_host:-missing}:${sync_port:-missing}"
 fi
 
 for secret_file in "$HOME/.ssh/optic_capture_ed25519" "$HOME/.ssh/optic_capture_known_hosts"; do
@@ -788,24 +801,31 @@ else
     fail "iMac SSH host key is not pinned" "$EXPECTED_CAPTURE_HOST"
 fi
 
-transfer_timer_active=$(systemctl is-active optic-capture-transfer.timer 2>/dev/null || true)
-transfer_timer_enabled=$(systemctl is-enabled optic-capture-transfer.timer 2>/dev/null || true)
-if [[ "$transfer_timer_active" == "active" && "$transfer_timer_enabled" == "enabled" ]]; then
-    pass "Capture transfer timer is active and enabled"
+# The retired Phase 6 shell transfer ships and then deletes every
+# non-hidden file in /mnt/capture (including the daemon's
+# preview_config.json) and races optic_sync, so it must not run.
+legacy_timer_active=$(systemctl is-active optic-capture-transfer.timer 2>/dev/null || true)
+legacy_timer_enabled=$(systemctl is-enabled optic-capture-transfer.timer 2>/dev/null || true)
+if [[ "$legacy_timer_active" == "active" || "$legacy_timer_enabled" == "enabled" ]]; then
+    fail "Retired shell capture transfer timer is still running" \
+        "optic-capture-transfer.timer active=$legacy_timer_active, enabled=$legacy_timer_enabled; optic_sync replaces it"
 else
-    fail "Capture transfer timer is not active and enabled" \
-        "active=${transfer_timer_active:-unknown}, enabled=${transfer_timer_enabled:-unknown}"
+    pass "Retired shell capture transfer timer is not running"
 fi
 
-transfer_load=$(systemctl show optic-capture-transfer.service -p LoadState --value 2>/dev/null || true)
-transfer_result=$(systemctl show optic-capture-transfer.service -p Result --value 2>/dev/null || true)
-transfer_invocation=$(systemctl show optic-capture-transfer.service -p InvocationID --value 2>/dev/null || true)
-if [[ "$transfer_load" == "loaded" && "$transfer_result" == "success" &&
-      -n "$transfer_invocation" ]]; then
-    pass "Latest capture transfer completed successfully"
+# /api/status serializes SyncStatus as a flat JSON object (src/optic_sync.rs).
+sync_status_json=$(curl -fsS --max-time 5 http://127.0.0.1:8000/api/status 2>/dev/null |
+    sed -n 's/.*"sync":{\([^}]*\)}.*/\1/p' || true)
+if [[ -z "$sync_status_json" ]]; then
+    fail "Capture sync status unavailable" "GET http://127.0.0.1:8000/api/status"
+elif [[ "$sync_status_json" != *'"enabled":true'* ]]; then
+    fail "Capture sync is disabled in the running daemon" "$sync_status_json"
+elif [[ "$sync_status_json" != *'"last_error":null'* ]]; then
+    fail "Capture sync reports an error" \
+        "$(sed -n 's/.*"last_error":\("[^"]*"\).*/\1/p' <<< "$sync_status_json")"
 else
-    fail "Latest capture transfer did not complete successfully" \
-        "Result=${transfer_result:-never-run}"
+    pass "Capture sync is enabled with no error" \
+        "$(sed -n 's/.*"connectivity":"\([^"]*\)".*/connectivity=\1/p' <<< "$sync_status_json")"
 fi
 
 receiver_probe=$(timeout 10 ssh -n -T \

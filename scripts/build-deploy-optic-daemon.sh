@@ -122,8 +122,12 @@ ssh "${SSH_OPTIONS[@]}" "$DEPLOY_TARGET" 'test "$(id -un)" = liam'
 
 if [[ $MODE == full ]]; then
     printf 'Uploading the versioned source tree\n'
+    # `tar -m` gives every source file the extraction time instead of the
+    # Mac's mtime. Otherwise cargo can treat the source as older than newer
+    # artifacts in the shared CARGO_TARGET_DIR and skip the build, installing
+    # a stale binary (worklogs/2026-09-20-health-alerts.md).
     cat "$ARCHIVE" | ssh "${SSH_OPTIONS[@]}" "$DEPLOY_TARGET" \
-        "set -eu; incoming=\"\$HOME/.local/src/.optic-daemon-$EXPECTED_VERSION.incoming\"; release=\"\$HOME/.local/src/optic-daemon-$EXPECTED_VERSION\"; rm -rf \"\$incoming\"; mkdir -p \"\$incoming\"; tar -xzf - -C \"\$incoming\"; rm -rf \"\$release\"; mv \"\$incoming\" \"\$release\""
+        "set -eu; incoming=\"\$HOME/.local/src/.optic-daemon-$EXPECTED_VERSION.incoming\"; release=\"\$HOME/.local/src/optic-daemon-$EXPECTED_VERSION\"; rm -rf \"\$incoming\"; mkdir -p \"\$incoming\"; tar -xzmf - -C \"\$incoming\"; rm -rf \"\$release\"; mv \"\$incoming\" \"\$release\""
     printf 'Bootstrapping, building, and deploying on %s\n' "$DEPLOY_TARGET"
 else
     printf 'Uploading static web assets\n'
@@ -393,11 +397,17 @@ CLIPPY_WRAPPER_SCRIPT
     CLIPPY_WRAPPER=""
 
     printf '%s\n' '==> Building the optimized release with staged libclang'
+    BUILD_MARKER="$CARGO_TARGET_DIR/.optic-build-started"
+    mkdir -p "$CARGO_TARGET_DIR"
+    touch "$BUILD_MARKER"
     LD_LIBRARY_PATH="$OPTIC_NATIVE_LIB" \
         rustup run "$RUST_TOOLCHAIN" cargo build --locked --release
 
     BINARY="$CARGO_TARGET_DIR/release/optic-daemon"
     [[ -x $BINARY ]] || fail "release binary is missing: $BINARY"
+    # The version-string check below cannot catch a stale artifact of the
+    # same version, so require the binary to be linked by this build.
+    [[ $BINARY -nt $BUILD_MARKER ]] || fail "release binary was not rebuilt by this deploy (stale artifact): $BINARY"
     LD_LIBRARY_PATH="$OPTIC_NATIVE_LIB" ldd "$BINARY" | tee /tmp/optic-daemon.ldd
     if grep -q 'not found' /tmp/optic-daemon.ldd; then
         fail 'the release binary has unresolved shared libraries'
