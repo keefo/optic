@@ -1114,6 +1114,7 @@ impl SchedulerHandle {
         run_state_path: PathBuf,
         run_state_cache_path: PathBuf,
         initial_run_state: ScheduleRunState,
+        preview_config_path: PathBuf,
     ) -> Self {
         let (commands_tx, commands_rx) = mpsc::channel(16);
         let (status_tx, status_rx) = watch::channel(SchedulerStatus {
@@ -1126,6 +1127,7 @@ impl SchedulerHandle {
         let ramp = RampStore::default();
         tokio::spawn(observe_preview_frames(
             camera.clone(),
+            preview_config_path,
             config_cache_path.clone(),
             ramp.clone(),
         ));
@@ -1326,6 +1328,18 @@ fn publish_status(
     let _ = tx.send(status);
 }
 
+/// The staged (uncommitted) config when one exists, else the committed one —
+/// mirrors `web.rs::current_app_config`, for the preview-metering task.
+async fn read_staged_app_config(
+    preview_config_path: &std::path::Path,
+    config_cache_path: &std::path::Path,
+) -> AppConfig {
+    if let Ok(content) = tokio::fs::read_to_string(preview_config_path).await {
+        return serde_json::from_str(&content).unwrap_or_default();
+    }
+    read_app_config(config_cache_path).await
+}
+
 async fn read_app_config(config_cache_path: &std::path::Path) -> AppConfig {
     match durable_state::read_cached(config_cache_path).await {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
@@ -1354,7 +1368,12 @@ const PREVIEW_CONFIG_REFRESH: std::time::Duration = std::time::Duration::from_se
 /// unsaved exposure settings show in the preview even with the scheduler
 /// paused and no capture yet. Runs for the daemon's lifetime; when no
 /// preview is streaming there are simply no frames.
-async fn observe_preview_frames(camera: OpticCamera, config_cache_path: PathBuf, ramp: RampStore) {
+async fn observe_preview_frames(
+    camera: OpticCamera,
+    preview_config_path: PathBuf,
+    config_cache_path: PathBuf,
+    ramp: RampStore,
+) {
     let mut settings: Option<exposure_ramp::RampSettings> = None;
     let mut refreshed_at = std::time::Instant::now() - PREVIEW_CONFIG_REFRESH;
     loop {
@@ -1371,7 +1390,10 @@ async fn observe_preview_frames(camera: OpticCamera, config_cache_path: PathBuf,
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
             if refreshed_at.elapsed() >= PREVIEW_CONFIG_REFRESH {
-                let config = read_app_config(&config_cache_path).await;
+                // The *staged* config, like `/api/status` uses: unsaved
+                // exposure edits must show in the preview (design doc §11).
+                // Scheduled captures keep reading the committed config.
+                let config = read_staged_app_config(&preview_config_path, &config_cache_path).await;
                 settings = match config.schedule.exposure {
                     ScheduleExposure::AutoRamp(settings) => Some(settings.sanitized()),
                     // Dashboard mode: measure nothing, and drop any state so
@@ -2362,6 +2384,40 @@ mod actor_tests {
         assert_eq!(live.ramp_updated_at, Some(state.updated_at));
     }
 
+    #[tokio::test]
+    async fn the_preview_task_reads_staged_config_before_the_committed_one() {
+        // Regression: the preview-metering task first read only the
+        // committed config, so an unsaved AutoRamp edit measured nothing and
+        // the live preview ignored it (design doc §11).
+        let dir = unique_temp_dir("staged-config");
+        let preview = dir.join("preview_config.json");
+        let committed = dir.join("config.json");
+        let with_mode = |exposure: ScheduleExposure| {
+            serde_json::to_string(&AppConfig {
+                schedule: ScheduleConfig {
+                    exposure,
+                    ..ScheduleConfig::default()
+                },
+                ..AppConfig::default()
+            })
+            .unwrap()
+        };
+        std::fs::write(&committed, with_mode(ScheduleExposure::Dashboard)).unwrap();
+
+        // No staged file: the committed config wins.
+        let config = read_staged_app_config(&preview, &committed).await;
+        assert_eq!(config.schedule.exposure, ScheduleExposure::Dashboard);
+
+        // Staged but uncommitted AutoRamp must be what the preview follows.
+        let staged = ScheduleExposure::AutoRamp(exposure_ramp::RampSettings {
+            day_bias_ev: -2.3,
+            ..exposure_ramp::RampSettings::default()
+        });
+        std::fs::write(&preview, with_mode(staged.clone())).unwrap();
+        let config = read_staged_app_config(&preview, &committed).await;
+        assert_eq!(config.schedule.exposure, staged);
+    }
+
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2388,6 +2444,7 @@ mod actor_tests {
             run_state_path.clone(),
             run_state_cache_path,
             initial,
+            unique_temp_dir("preview-config").join("preview_config.json"),
         );
         (handle, run_state_path)
     }
