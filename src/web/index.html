@@ -7,6 +7,7 @@
   <title>Project Optic</title>
   <link rel="icon" type="image/svg+xml" href="/icon.svg">
   <link rel="stylesheet" href="/styles.css">
+  <script src="/focus-tools.js" defer></script>
   <script src="/app.js" defer></script>
   <script src="/footer.js" defer></script>
 </head>
@@ -43,12 +44,35 @@
       </div>
       <div class="preview-frame">
         <img id="preview" alt="HQ Camera preview">
+        <canvas id="peaking-overlay" class="preview-overlay" aria-hidden="true" hidden></canvas>
+        <div id="histogram-panel" class="histogram-panel" hidden>
+          <canvas id="histogram-canvas" width="256" height="96" role="img" aria-label="Live histogram"></canvas>
+          <p id="histogram-clip" class="histogram-clip" aria-live="off"></p>
+        </div>
         <div id="preview-placeholder" class="preview-placeholder">
           <span>IMX477</span>
           <strong id="preview-placeholder-title">Live preview starts automatically</strong>
           <small>Focus and aperture are adjusted manually on the 6 mm lens.</small>
         </div>
       </div>
+      <fieldset class="focus-tools" aria-label="Focus tools">
+        <button id="focus-histogram-toggle" type="button" aria-pressed="false">Histogram</button>
+        <button id="focus-peaking-toggle" type="button" aria-pressed="false">Peaking</button>
+        <button id="focus-loupe-toggle" type="button" aria-pressed="false">Loupe</button>
+        <label id="peaking-sensitivity-field" class="focus-slider" hidden>
+          <span>Peaking sensitivity</span>
+          <input id="peaking-sensitivity" type="range" min="0" max="100" step="1" value="50">
+        </label>
+      </fieldset>
+      <section id="loupe-panel" class="loupe-panel" aria-label="Loupe" hidden>
+        <canvas id="loupe-canvas" width="320" height="320"></canvas>
+        <div class="loupe-readout">
+          <p><span class="muted">Sharpness</span> <strong id="loupe-score">–</strong></p>
+          <p><span class="muted">Best</span> <strong id="loupe-best">–</strong> <button id="loupe-reset" type="button">Reset best</button></p>
+          <p id="loupe-scale" class="muted"></p>
+          <p class="muted">Click or drag on the preview to move the loupe. Turn the focus ring until sharpness peaks, then lock the ring.</p>
+        </div>
+      </section>
       <label class="check preview-option">
         <input id="downsample-preview" type="checkbox">
         <span>Downsample preview <small>Master Archive previews at 1352 × 1014, 8 fps instead of full 4056 × 3040, 2 fps. Other profiles already preview small. Captures are unaffected.</small></span>
