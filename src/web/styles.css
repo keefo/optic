@@ -235,6 +235,8 @@ button.good:hover:not(:disabled) { border-color: var(--green); }
 .input-with-button { display: flex; gap: 10px; }
 .input-with-button > input { flex: 1; min-width: 0; }
 .input-with-button > button { flex: none; }
+.input-with-button > select { flex: none; width: auto; }
+.toggle-heading { display: flex; align-items: center; gap: 14px; }
 .toggle-switch {
   position: relative; align-self: flex-start; width: 84px; height: 36px; min-height: 36px;
   padding: 0 12px 0 40px; border: 0; border-radius: 999px; background: var(--line); color: var(--muted);
@@ -247,7 +249,7 @@ button.good:hover:not(:disabled) { border-color: var(--green); }
 }
 .toggle-switch[aria-checked="true"] { padding: 0 40px 0 12px; background: var(--green); color: #07130e; }
 .toggle-switch[aria-checked="true"]::after { left: calc(100% - 32px); background: #fff; }
-.notifications-card h3 { margin: 24px 0 10px; }
+.notifications-card > .toggle-heading { margin: 24px 0 10px; }
 .notifications-card .controls-help { margin-top: 10px; }
 .notifications-card .section-heading + .controls-help { margin-top: -4px; }
 .control-grid > label { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 0.82rem; }

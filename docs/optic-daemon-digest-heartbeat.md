@@ -360,11 +360,14 @@ or sequence ID):
 
 - Config page: a **Notifications** card (after Time & NTP) with the fields
   in §2; Notifications, Digest and Heartbeat are sliding On/Off switches
-  (`role="switch"` buttons styled by `.toggle-switch`; the page's CSP
+  on their heading lines, so the text fields line up in two columns
+  (`role="switch"` buttons named by their heading, styled by
+  `.toggle-switch`; the page's CSP
   `style-src 'self'` rules out inline styles, so all styling is in
   `styles.css`). A **Generate topic** button beside the Topic
   field fills a random `optic-` + 24 characters, shown once so it can be
-  entered in the ntfy app. Also **Save notifications**,
+  entered in the ntfy app; a Keep saved / Remove saved selector sits
+  beside the token field the same way. Also **Save notifications**,
   **Send test notification** and **Send digest now**, plus live digest and
   heartbeat status lines. The test buttons use the saved settings and ask
   for a save first when the form has unsaved changes. The card's heading

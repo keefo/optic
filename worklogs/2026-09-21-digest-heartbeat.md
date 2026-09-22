@@ -333,6 +333,18 @@ it and ran the check directly. Logged in `AGENTS.md` per the repo rules.
   --assets` (user-approved): `SUCCESS: static web assets deployed and
   verified`, no daemon restart.
 
+### Revision: switches on heading lines (user request, 2026-09-22)
+
+- Notifications / Daily digest / Heartbeat switches moved onto their
+  heading lines (`.toggle-heading`, `aria-labelledby` = heading); Saved
+  token selector moved beside the token input. Grids now hold only text
+  fields: Server | Station name; Topic + Generate | Token + Keep/Remove;
+  Send at; Check in every | Alert after silence.
+- Verified locally in Chrome: left-column fields all at x=704, right
+  column at x=1280, paired rows share a top; switches centred on headings;
+  a switch click toggles and marks the form unsaved; `biome ci` clean.
+- Committed to PR #15 and deployed to the Pi with `--assets` (user-approved).
+
 ## Incident: my cancel test overwrote the user's own settings
 
 The `--assets` deploy printed the journal, which showed the user had used
