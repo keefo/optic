@@ -10,8 +10,8 @@ done — so it's directly felt by the operator as "the button just hangs."
 
 This document records the measurement methodology, the raw findings, the
 root-cause conclusion, and open directions for actually fixing it. It is a
-reference for future iteration, not a worklog — no fix has been
-implemented yet as of this writing.
+reference for future iteration, not a worklog. A fix (§7) is implemented
+on branch `feat/capture-latency` was measured on hardware and accepted by the user on 2026-09-21.
 
 ## 2. Methodology
 
@@ -340,3 +340,51 @@ All logging described in §2.1 is live in `src/native_camera.rs` and
 `optic.local`. It's left in place (not behind a feature flag) since it's
 cheap (`tracing::info!` calls with primitive fields) and directly useful
 for verifying any future change against this document's baseline numbers.
+
+## 7. Fix (2026-09-20/21; hardware-tested, user-accepted, not yet merged)
+
+Tracked in `worklogs/2026-09-20-capture-latency.md`.
+
+- §4 item 1: still-capture requests now always set `FrameDurationLimits`
+  (`still_frame_duration_limits_us` in `src/camera.rs`): `[33,333 µs,
+  500,000 µs]` for auto shutter, `[33,333 µs, max(33,333 µs, shutter_us)]`
+  for a manual shutter. libcamera raises the floor to the sensor mode's
+  minimum. Preview limits are unchanged.
+- **Correction to §3.3.1:** auto exposure is *not* fully disabled. With
+  `shutter_us: 0` the exposure is still chosen automatically (66.7 ms in the
+  2026-09-20 scenes) and is capped by the maximum frame duration. A first
+  version of this fix used `[33,333, 33,333]` for auto and cut 2K Binning
+  exposure to 33 ms on hardware; the auto maximum must leave that headroom.
+- Measured 2026-09-21 on that first version: 2K Binning 778 ms, Master
+  Archive + DNG ~2.6 s (baseline ~5.4 s). Frames 1–3 still run at the
+  previous preview's limit; the new limit applies from frame 4.
+- Observed on `main` 0.1.29 (2026-09-20, see worklog "H0 Baseline"): the
+  still-capture frame interval equals the previous live preview's frame
+  limit — ~500 ms after the 2 FPS Master Archive preview, ~125 ms after the
+  8 FPS 2K preview — regardless of capture profile. A full-resolution Master
+  Archive capture took 1,630 ms after a 2K preview versus ~5,390 ms after a
+  Master Archive preview. §3.3.2's sensor-mode hypothesis is therefore not
+  the cause; the leftover preview limit is.
+- Possible behaviour change: if a ~500 ms implicit maximum was in effect,
+  manual shutters longer than ~500 ms were previously clamped and will now
+  be honoured. Measured: a 1 s manual shutter is honoured (999,686 µs);
+  5 s not yet tested.
+- §4 item 2: `CAPTURE_WARMUP_FRAMES` remains 8. Each `warmup_frame` line now
+  includes `colour_gains` so AWB convergence can be measured before any
+  reduction.
+- §4 item 3 / instrumentation: `warmup_frame` also logs `frame_duration_us`
+  and `analogue_gain` (from request metadata); `warmup_and_capture` `frames` now reports the real
+  frame count (fixes the §5 note); `native camera pipeline started` logs
+  `frame_duration_range_us`, the configured mode's `FrameDurationLimits`
+  range, for both ViewFinder and StillCapture pipelines.
+- Measured 2026-09-21 on the corrected build (worklog "H1 Attempt 2"),
+  each capture after its own profile's preview: 2K Binning 1,017 ms
+  (baseline ~1,460 ms), 4K DCI ~1,130 ms, Master Archive + DNG ~2,570 ms
+  (baseline ~5,390 ms, JPEG only). Exposure (66.65 ms) and gain (1.0) were
+  identical before and after the new limit took effect. A 1 s manual shutter
+  was honoured. `colour_gains` changed < 0.3% across warmup.
+- Remaining latency: the first 3 frames still use the previous preview's
+  limit (new request controls apply from frame 4), even when the preview was
+  stopped first. Candidate next step: pass the still limits to
+  `camera.start()`. After that, reducing `CAPTURE_WARMUP_FRAMES` (§4 item 2).
+

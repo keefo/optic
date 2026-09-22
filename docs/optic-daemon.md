@@ -132,7 +132,9 @@ The Web Service acts as the interactive portal for operator configuration and op
 * Starts a live low-latency preview stream automatically when the dashboard opens (`POST /api/stream/start`) to align the 6mm CS-mount lens rings.
 * Applies camera-control changes to a running dashboard preview through a debounced `POST /api/stream/reconfigure`; the daemon transparently reconfigures the native camera pipeline and the browser reconnects after a brief frame gap.
 * Reports control-to-painted-frame latency, a rolling ten-sample median, and AE/AWB metadata stability in the live dashboard for before/after responsiveness comparisons.
-* Keeps the preview active while the dashboard is open, restores it after still captures, and sends a best-effort stop request only when the page is left.
+* Keeps the preview active while the dashboard is open, restores it after still captures, and sends a best-effort stop request only when the page is left — unless the operator pressed **Stop preview**, which keeps it off in every tab and across daemon restarts and reboots until **Resume preview**.
+* Offers a **Downsample preview** checkbox (persisted with the stop state): the Master Archive preview then runs at 1352 × 1014, 8 FPS (~255 KB per frame, ~16 Mbit/s) instead of full 4056 × 3040, 2 FPS (~2.5 MB per frame, ~40 Mbit/s). It still reads the full-resolution sensor mode and lets the ISP scale down: the 2×2 binned mode looked visibly softer, and libcamera's default pick (1332 × 990) is a centre crop. Other profiles already preview small; still captures are unaffected.
+* Shows capture latency (click to files queued, median per profile/DNG) and the post-capture button-ready time in the MEASUREMENT panel.
 * Publishes a manual profile-specific capture (`POST /api/capture`) to the RAM transfer stage with hidden temporary files and atomic renames.
 
 ### Web Asset Loading
@@ -280,8 +282,9 @@ The dashboard does not expose a separate JPEG-quality override. Quality is part 
 * `GET /`: Serves the single-page application, loaded from disk on each request (see [Web Asset Loading](#web-asset-loading)).
 * `GET /{*asset}`: Serves any other file under the resolved asset directory by its relative path (e.g. `/app.js`, `/styles.css`, `/icons/favicon.ico`), confined to that directory (see [Web Asset Loading](#web-asset-loading)).
 * `GET /healthz`: Returns `200 OK` while the HTTP service is available.
-* `GET /api/status`: Returns version, uptime, IMX477 detection, camera ownership, stream state, and RAM-stage queue usage.
-* `POST /api/stream/start`: Called automatically when the dashboard opens. Accepts camera `settings` plus `profile` and configures the persistent native camera for that profile's preview dimensions and sensor mode. Returns `409 Conflict` if the camera is in use.
+* `GET /api/status`: Returns version, uptime, IMX477 detection, camera ownership, stream state, RAM-stage queue usage, and `preview: { stopped, downsample }`.
+* `POST /api/preview`: Updates the persisted preview state with a partial body, `{"stopped": bool}` and/or `{"downsample": bool}`, and returns the new state. Setting `stopped: true` also stops a running stream. Stored in `~/.local/state/optic-daemon/preview_state.json` (durable) with a tmpfs mirror, like `schedule_run_state.json`; a missing or corrupt file means defaults (running, full size).
+* `POST /api/stream/start`: Called automatically when the dashboard opens. Accepts camera `settings` plus `profile` and configures the persistent native camera for that profile's preview dimensions and sensor mode; the preview size comes from the persisted `downsample` flag. Returns `409 Conflict` if the camera is in use or the preview is stopped.
 * `POST /api/stream/reconfigure`: Accepts camera `settings` plus `profile` and serializes a native pipeline stop/reconfiguration/start. Returns `409 Conflict` if preview is not running.
 * `POST /api/stream/stop`: Used by dashboard page teardown to stop the native request loop and leave the acquired camera ready for reconfiguration; it is not exposed as a manual UI control.
 * `GET /api/stream/mjpeg`: Multipart MJPEG video feed for direct browser `<img>` rendering during lens tuning.

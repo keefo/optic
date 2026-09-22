@@ -13,6 +13,11 @@ const elements = {
   firstVisibleLatency: document.querySelector("#first-visible-latency"),
   medianVisibleLatency: document.querySelector("#median-visible-latency"),
   medianSampleCount: document.querySelector("#median-sample-count"),
+  downsamplePreview: document.querySelector("#downsample-preview"),
+  previewToggle: document.querySelector("#preview-toggle"),
+  placeholderTitle: document.querySelector("#preview-placeholder-title"),
+  captureLatency: document.querySelector("#capture-latency"),
+  captureLatencyDetail: document.querySelector("#capture-latency-detail"),
   measurementSample: document.querySelector("#measurement-sample"),
   discardConfig: document.querySelector("#discard-config"),
   saveConfig: document.querySelector("#save-config"),
@@ -73,6 +78,9 @@ const profiles = {
 
 let objectUrl = null;
 let livePreview = false;
+// Operator's persisted Stop preview choice (daemon `preview_state.json`);
+// while set, nothing on this page auto-starts the preview.
+let previewStopped = false;
 // Fill in default placeholders if we deleted elements to support pure manual focus
 if (!document.querySelector("#ev")) {
   const hiddenForm = document.createElement("div");
@@ -106,6 +114,9 @@ const controlChanges = new Map();
 let cameraFieldsInitialized = false;
 const activeMeasurements = new Map();
 const firstVisibleSamples = [];
+// Capture latency samples per profile + DNG choice: their costs differ too
+// much (≈0.7 s vs ≈2.5 s) for one shared median to mean anything.
+const captureSamples = new Map();
 const MAX_MEASUREMENT_SAMPLES = 10;
 const SETTLE_TIMEOUT_MS = 15000;
 const POST_CAPTURE_FREEZE_MS = 3000;
@@ -580,8 +591,83 @@ function median(values) {
   return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle];
 }
 
+function recordCaptureLatency(key, label, latency) {
+  const samples = captureSamples.get(key) || [];
+  samples.push(latency);
+  if (samples.length > MAX_MEASUREMENT_SAMPLES) samples.shift();
+  captureSamples.set(key, samples);
+  elements.captureLatency.textContent = formatLatency(latency);
+  elements.captureLatencyDetail.textContent = `${label} · median ${formatLatency(median(samples))} of ${samples.length}`;
+}
+
+// The button stays disabled after the capture itself: the frozen-still hold
+// plus the preview restart. Shown so that wait isn't mistaken for capture time.
+function traceButtonReady(captureDoneAt, holdDoneAt, readyAt) {
+  const hold = holdDoneAt - captureDoneAt;
+  const preview = readyAt - holdDoneAt;
+  const trace = `button ready +${formatLatency(readyAt - captureDoneAt)} (hold ${formatLatency(hold)}, preview ${formatLatency(preview)})`;
+  elements.captureLatencyDetail.textContent += ` · ${trace}`;
+  console.info(`capture perf: ${trace}`);
+}
+
 function formatLatency(milliseconds) {
   return `${Math.round(milliseconds)} ms`;
+}
+
+function applyPreviewState(preview) {
+  previewStopped = preview.stopped;
+  elements.downsamplePreview.checked = preview.downsample;
+  elements.previewToggle.textContent = preview.stopped ? "Resume preview" : "Stop preview";
+  elements.placeholderTitle.textContent = preview.stopped
+    ? "Preview stopped"
+    : "Live preview starts automatically";
+}
+
+function stopLivePreview() {
+  livePreview = false;
+  previewGeneration += 1;
+  cancelPreviewUpdate();
+  hidePreview("Preview stopped");
+}
+
+async function postPreviewState(update) {
+  const response = await api("/api/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(update),
+  });
+  applyPreviewState(await response.json());
+}
+
+async function togglePreview() {
+  const stopping = !previewStopped;
+  elements.previewToggle.disabled = true;
+  try {
+    await postPreviewState({ stopped: stopping });
+    if (stopping) {
+      stopLivePreview();
+      showNotice("Preview stopped. It stays off, even after a reboot, until you resume it.");
+    } else {
+      hidePreview();
+      await ensurePreview();
+    }
+  } catch (error) {
+    showNotice(`Could not ${stopping ? "stop" : "resume"} preview: ${error.message}`, "error");
+  } finally {
+    elements.previewToggle.disabled = false;
+  }
+}
+
+async function setPreviewDownsample() {
+  const downsample = elements.downsamplePreview.checked;
+  try {
+    await postPreviewState({ downsample });
+    // The daemon applies the persisted choice on the next reconfigure.
+    if (livePreview) schedulePreviewUpdate();
+  } catch (error) {
+    elements.downsamplePreview.checked = !downsample;
+    showNotice(`Could not change preview size: ${error.message}`, "error");
+  }
 }
 
 function cancelPreviewUpdate() {
@@ -661,7 +747,7 @@ async function api(path, options = {}) {
 }
 
 async function ensurePreview(streamAlreadyRunning = null, announce = true) {
-  if (!pageActive || livePreview || previewStarting || captureRunning) return;
+  if (!pageActive || livePreview || previewStarting || captureRunning || previewStopped) return;
 
   const generation = previewGeneration;
   const profileName = selectedProfile();
@@ -719,13 +805,20 @@ function prepareForStillCapture() {
   livePreview = false;
   previewGeneration += 1;
   cancelPreviewUpdate();
-  freezePreviewForCapture("Still capture · preview resumes automatically");
+  freezePreviewForCapture(
+    previewStopped ? "Still capture" : "Still capture · preview resumes automatically",
+  );
 }
 
 async function captureAndTransfer() {
   const profileName = selectedProfile();
   const profile = profiles[profileName];
   const saveDng = elements.saveDng.checked;
+  const captureKey = `${profileName}:${saveDng}`;
+  const captureLabel = saveDng ? `${profile.label} + DNG` : profile.label;
+  const captureStartedAt = performance.now();
+  elements.captureLatency.textContent = "Measuring…";
+  elements.captureLatencyDetail.textContent = captureLabel;
   setBusy(true);
   prepareForStillCapture();
   showNotice(`Capturing ${profile.label} to the verified RAM queue…`);
@@ -740,21 +833,34 @@ async function captureAndTransfer() {
       }),
     });
     const result = await response.json();
+    recordCaptureLatency(captureKey, captureLabel, performance.now() - captureStartedAt);
     showNotice(
       `${result.files.length} file${result.files.length === 1 ? "" : "s"} queued for ${profile.label} (${formatBytes(result.bytes)}).`,
       "success",
     );
   } catch (error) {
+    elements.captureLatency.textContent = "Failed";
+    elements.captureLatencyDetail.textContent = `${captureLabel} · not counted`;
     showNotice(error.message, "error");
   } finally {
     // Hold the frozen frame for a moment so the capture reads as a
     // deliberate still, rather than flickering straight back to live the
     // instant the request completes. captureRunning stays true through the
     // wait so refreshStatus()'s own auto-resume logic doesn't race this.
-    await new Promise((resolve) => setTimeout(resolve, POST_CAPTURE_FREEZE_MS));
+    const captureDoneAt = performance.now();
+    // No live view to return to while stopped, so nothing to hold for.
+    if (!previewStopped) {
+      await new Promise((resolve) => setTimeout(resolve, POST_CAPTURE_FREEZE_MS));
+    }
+    const holdDoneAt = performance.now();
     captureRunning = false;
-    await ensurePreview(null, false);
+    if (previewStopped) {
+      elements.streamState.textContent = "Preview stopped";
+    } else {
+      await ensurePreview(null, false);
+    }
     setBusy(false);
+    traceButtonReady(captureDoneAt, holdDoneAt, performance.now());
     refreshStatus();
   }
 }
@@ -790,7 +896,15 @@ async function refreshStatus() {
     }
     elements.saveConfig.disabled = !status.config_staged;
     elements.discardConfig.hidden = !status.config_staged;
+    applyPreviewState(status.preview);
     if (!pageActive || captureRunning || reconfigureRunning) return;
+    if (previewStopped) {
+      // Stopped here or in another tab: drop any local stream, and stop a
+      // server stream that slipped through a start already in flight.
+      if (livePreview) stopLivePreview();
+      if (status.camera.streaming) navigator.sendBeacon("/api/stream/stop");
+      return;
+    }
     if (!status.camera.streaming && livePreview) {
       livePreview = false;
       previewGeneration += 1;
@@ -878,6 +992,8 @@ function formatDuration(seconds) {
 }
 
 elements.capture.addEventListener("click", captureAndTransfer);
+elements.previewToggle.addEventListener("click", togglePreview);
+elements.downsamplePreview.addEventListener("change", setPreviewDownsample);
 elements.reset.addEventListener("click", () => {
   applySettings(defaults);
   controlRevision += 1;
