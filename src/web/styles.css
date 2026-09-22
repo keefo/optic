@@ -535,3 +535,21 @@ footer { padding: 0 0 36px; color: var(--muted); font-size: 0.78rem; text-align:
 fieldset:has(> .transform-rotation) { align-items: center; flex-wrap: wrap; }
 .transform-rotation { display: flex; flex-basis: 100%; align-items: center; gap: 8px; color: var(--muted); font-size: 0.82rem; }
 .transform-rotation select { width: auto; }
+/* Step markers under a stepped range input: one hairline per step, inset by
+   half the thumb width so the first and last align with the track ends. The
+   repeating image draws every step but the last, which the second layer
+   pins to the right edge. */
+.ramp-ticks {
+  display: block;
+  height: 4px;
+  margin: 1px 9px 0;
+  background-repeat: repeat-x, no-repeat;
+  background-position: left top, right top;
+  background-image:
+    linear-gradient(to right, var(--line) 0 1px, transparent 1px),
+    linear-gradient(to right, var(--line) 0 1px, transparent 1px);
+}
+.ramp-ticks[data-steps="8"] { background-size: calc((100% - 1px) / 8) 100%, 1px 100%; }
+.ramp-ticks[data-steps="18"] { background-size: calc((100% - 1px) / 18) 100%, 1px 100%; }
+.ramp-grid > label:has(> .ramp-ticks) { gap: 4px; }
+.ramp-grid > label > .ramp-scale { margin-top: 2px; }
