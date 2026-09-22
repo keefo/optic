@@ -24,9 +24,6 @@
   // ramp's `night_drop_ev` is its mirror image.
   const NIGHT_LOOK_MAX = 4;
   const MAX_PREVIEW_GAIN = 16;
-  // libcamera's ExposureValue range, mirrored from src/camera.rs.
-  const MIN_EV = -4;
-  const MAX_EV = 4;
   // Leave the preview's frame time a little headroom so a clamped shutter
   // never slows the stream down.
   const PREVIEW_FRAME_FRACTION = 0.95;
@@ -47,15 +44,7 @@
   function previewEquivalent(plan, previewFps) {
     if (!plan) return null;
     if (plan.seeding) {
-      // No ramp state yet: auto exposure, biased toward the ramp's target so
-      // an unsaved brightness change still shows in the preview.
-      return {
-        shutter_us: 0,
-        gain: 0,
-        colour_gains: null,
-        ev: Math.min(MAX_EV, Math.max(MIN_EV, plan.target_bias_ev ?? 0)),
-        shortfall_ev: 0,
-      };
+      return { shutter_us: 0, gain: 0, colour_gains: null, shortfall_ev: 0 };
     }
     const frameUs = Math.floor((1e6 / previewFps) * PREVIEW_FRAME_FRACTION);
     const shutter = Math.max(100, Math.min(plan.shutter_us, frameUs));
@@ -65,7 +54,6 @@
       shutter_us: shutter,
       gain,
       colour_gains: plan.colour_gains ?? null,
-      ev: 0,
       // How much darker the preview is than the real frame when even 16×
       // gain can't make up for the shorter shutter.
       shortfall_ev: neededGain > MAX_PREVIEW_GAIN ? Math.log2(neededGain / MAX_PREVIEW_GAIN) : 0,
@@ -267,8 +255,8 @@
     const target = `target ${formatEv(current.target_bias_ev)} (${sun})`;
     if (current.seeding) {
       const live = previewMetadata
-        ? "showing the camera's live auto exposure with your brightness applied"
-        : "start the preview to see it";
+        ? "showing the camera's live auto exposure"
+        : "start the preview to see its auto exposure";
       return `Next scheduled frame is a seed: auto exposure and white balance (${live}), then the ramp takes over · ${target}`;
     }
     const learned = current.ramp_updated_at

@@ -691,17 +691,9 @@ mod imp {
     ) -> Result<(), CameraError> {
         let controls = request.controls_mut();
 
-        // Auto exposure with the ramp's brightness compensation: the only
-        // case that runs libcamera's AGC deliberately (seeding preview and
-        // seed captures, `docs/optic-daemon-exposure-ramping.md` §10). Plain
-        // auto (`ev == 0`) keeps the historical control set below, whose
-        // `ExposureTime(0)`/`AnalogueGain(0)` the Pi pipeline already treats
-        // as "choose for me".
-        let biased_auto = settings.shutter_us == 0 && settings.gain == 0.0 && settings.ev != 0.0;
-
         // Permanent AEC Bypass: Pure Manual open-loop
         controls
-            .set(controls::AeEnable(biased_auto))
+            .set(controls::AeEnable(false))
             .map_err(backend_error)?;
         // Manual colour gains (exposure ramping's eased white balance)
         // replace per-frame AWB; otherwise AWB runs in the chosen mode.
@@ -724,35 +716,23 @@ mod imp {
             .set(noise_reduction_mode(&settings.denoise, fps.is_some()))
             .map_err(backend_error)?;
 
-        if biased_auto {
-            controls
-                .set(controls::ExposureTimeMode::Auto)
-                .map_err(backend_error)?;
-            controls
-                .set(controls::AnalogueGainMode::Auto)
-                .map_err(backend_error)?;
-            controls
-                .set(controls::ExposureValue(settings.ev))
-                .map_err(backend_error)?;
-        } else {
-            // Force Shutter Speed manually
-            let exposure = i32::try_from(settings.shutter_us)
-                .map_err(|_| CameraError::Invalid("shutter exceeds libcamera range"))?;
-            controls
-                .set(controls::ExposureTimeMode::Manual)
-                .map_err(backend_error)?;
-            controls
-                .set(controls::ExposureTime(exposure))
-                .map_err(backend_error)?;
+        // Force Shutter Speed manually
+        let exposure = i32::try_from(settings.shutter_us)
+            .map_err(|_| CameraError::Invalid("shutter exceeds libcamera range"))?;
+        controls
+            .set(controls::ExposureTimeMode::Manual)
+            .map_err(backend_error)?;
+        controls
+            .set(controls::ExposureTime(exposure))
+            .map_err(backend_error)?;
 
-            // Force Analogue Gain manually
-            controls
-                .set(controls::AnalogueGainMode::Manual)
-                .map_err(backend_error)?;
-            controls
-                .set(controls::AnalogueGain(settings.gain))
-                .map_err(backend_error)?;
-        }
+        // Force Analogue Gain manually
+        controls
+            .set(controls::AnalogueGainMode::Manual)
+            .map_err(backend_error)?;
+        controls
+            .set(controls::AnalogueGain(settings.gain))
+            .map_err(backend_error)?;
 
         if let Some(fps) = fps {
             let frame_us = (1_000_000_i64 / i64::from(fps)).max(

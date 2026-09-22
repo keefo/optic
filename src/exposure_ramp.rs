@@ -342,10 +342,8 @@ pub fn max_shutter_for_gap(gap: Option<Duration>, settings: &RampSettings) -> u6
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(tag = "kind")]
 pub enum RampPlan {
-    /// Auto exposure and AWB, with the target's brightness bias applied as
-    /// exposure compensation, so a seed frame already lands near the target
-    /// (design doc §10). Its measurement (re)starts the ramp.
-    Seed { bias_ev: f32 },
+    /// Auto exposure and AWB; its measurement (re)starts the ramp.
+    Seed,
     Manual {
         shutter_us: u64,
         gain: f32,
@@ -384,14 +382,11 @@ pub fn plan(
     settings: &RampSettings,
     max_shutter_us: u64,
 ) -> RampPlan {
-    let bias_ev = target_bias_ev(sun_elevation_deg, settings);
     let Some(state) = state.filter(|state| now - state.updated_at <= RESEED_GAP) else {
-        return RampPlan::Seed {
-            bias_ev: bias_ev as f32,
-        };
+        return RampPlan::Seed;
     };
     let max_shutter_us = max_shutter_us.clamp(settings.min_shutter_us, settings.max_shutter_us);
-    let target = target_luminance(bias_ev).log2();
+    let target = target_luminance(target_bias_ev(sun_elevation_deg, settings)).log2();
     let mut desired = target - state.scene_ev;
     if let Some(previous) = state.planned_log2_exposure {
         desired = desired.clamp(
@@ -764,35 +759,17 @@ mod tests {
         let settings = RampSettings::default();
         assert_eq!(
             plan(None, at(0), None, &settings, 5_000_000),
-            RampPlan::Seed { bias_ev: 0.0 }
+            RampPlan::Seed
         );
         let state = seeded(-12.0, at(0));
         assert_eq!(
             plan(Some(&state), at(31), None, &settings, 5_000_000),
-            RampPlan::Seed { bias_ev: 0.0 }
+            RampPlan::Seed
         );
         assert!(matches!(
             plan(Some(&state), at(30), None, &settings, 5_000_000),
             RampPlan::Manual { .. }
         ));
-    }
-
-    #[test]
-    fn a_seed_carries_the_targets_brightness_bias_for_exposure_compensation() {
-        let settings = RampSettings {
-            day_bias_ev: -0.5,
-            ..RampSettings::default()
-        };
-        // Day: the day bias alone.
-        assert_eq!(
-            plan(None, at(0), Some(30.0), &settings, 5_000_000),
-            RampPlan::Seed { bias_ev: -0.5 }
-        );
-        // Night: day bias minus the full night drop.
-        assert_eq!(
-            plan(None, at(0), Some(-30.0), &settings, 5_000_000),
-            RampPlan::Seed { bias_ev: -2.5 }
-        );
     }
 
     #[test]
@@ -804,14 +781,7 @@ mod tests {
             colour_gains: Some([2.1, 1.7]),
             meter: meter(MID_GREY, None),
         };
-        let state = observe(
-            None,
-            &RampPlan::Seed { bias_ev: 0.0 },
-            &observation,
-            at(0),
-            &settings,
-        )
-        .unwrap();
+        let state = observe(None, &RampPlan::Seed, &observation, at(0), &settings).unwrap();
         assert!((state.scene_ev - (MID_GREY.log2() - 1_000_f64.log2())).abs() < 1e-9);
         assert_eq!(state.colour_gains, [2.1, 1.7]);
         assert_eq!(state.planned_log2_exposure, None);
@@ -820,16 +790,7 @@ mod tests {
             colour_gains: None,
             ..observation
         };
-        assert!(
-            observe(
-                None,
-                &RampPlan::Seed { bias_ev: 0.0 },
-                &no_awb,
-                at(0),
-                &settings
-            )
-            .is_none()
-        );
+        assert!(observe(None, &RampPlan::Seed, &no_awb, at(0), &settings).is_none());
     }
 
     #[test]
@@ -888,7 +849,7 @@ mod tests {
         let seed_exposure = (MID_GREY.log2() - scene).min(500_000_f64.log2());
         let mut state = observe(
             None,
-            &RampPlan::Seed { bias_ev: 0.0 },
+            &RampPlan::Seed,
             &FrameObservation {
                 exposure_us: seed_exposure.exp2(),
                 analogue_gain: 1.0,

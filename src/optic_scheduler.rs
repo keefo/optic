@@ -1024,7 +1024,7 @@ pub fn live_exposure_plan(
         &settings,
         max_shutter_us,
     ) {
-        RampPlan::Seed { .. } => Some(base),
+        RampPlan::Seed => Some(base),
         RampPlan::Manual {
             shutter_us,
             gain,
@@ -1356,14 +1356,11 @@ fn build_capture_request(
     let mut settings = config.settings.clone();
     match plan {
         None => {}
-        Some(RampPlan::Seed { bias_ev }) => {
+        Some(RampPlan::Seed) => {
             settings.shutter_us = 0;
             settings.gain = 0.0;
             settings.awb = "auto".to_owned();
             settings.colour_gains = None;
-            // Auto exposure, but biased toward the ramp's target so the
-            // first frame doesn't start from the camera's own default.
-            settings.ev = bias_ev.clamp(crate::camera::MIN_EV, crate::camera::MAX_EV);
         }
         Some(RampPlan::Manual {
             shutter_us,
@@ -1492,7 +1489,7 @@ async fn fire_capture(
         }
         RampSnapshot {
             at: Utc::now(),
-            seed: matches!(ramp_shot.plan, RampPlan::Seed { .. }),
+            seed: ramp_shot.plan == RampPlan::Seed,
             exposure_us: exposure.exposure_us,
             analogue_gain: exposure.analogue_gain,
             colour_gains: exposure.colour_gains,
@@ -2154,17 +2151,10 @@ mod actor_tests {
     #[test]
     fn ramp_plans_override_only_exposure_and_white_balance() {
         let config = committed_config();
-        let seed = build_capture_request(&config, &[], Some(&RampPlan::Seed { bias_ev: -2.5 }));
+        let seed = build_capture_request(&config, &[], Some(&RampPlan::Seed));
         assert_eq!((seed.settings.shutter_us, seed.settings.gain), (0, 0.0));
         assert_eq!(seed.settings.awb, "auto");
         assert_eq!(seed.settings.colour_gains, None);
-        // Auto exposure, biased toward the ramp's target.
-        assert_eq!(seed.settings.ev, -2.5);
-        seed.validate().unwrap();
-        // Beyond libcamera's compensation range it clamps and stays valid.
-        let deep = build_capture_request(&config, &[], Some(&RampPlan::Seed { bias_ev: -9.0 }));
-        assert_eq!(deep.settings.ev, crate::camera::MIN_EV);
-        deep.validate().unwrap();
 
         let manual = build_capture_request(
             &config,
@@ -2205,7 +2195,7 @@ mod actor_tests {
         auto.schedule.exposure = ScheduleExposure::AutoRamp(exposure_ramp::RampSettings::default());
         let ramp_shot =
             plan_ramp_shot(&auto, &shot, Some(Duration::seconds(30)), &mut ramp, now).unwrap();
-        assert!(matches!(ramp_shot.plan, RampPlan::Seed { .. }));
+        assert_eq!(ramp_shot.plan, RampPlan::Seed);
         assert_eq!(ramp_shot.max_shutter_us, 2_045_454);
         // No station: the target stays at the day level.
         assert_eq!(ramp_shot.sun_elevation_deg, None);
