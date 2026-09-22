@@ -1554,6 +1554,7 @@ mod tests {
     const FOOTER_JS: &str = include_str!("web/footer.js");
     const CAPTURE_HISTORY_HTML: &str = include_str!("web/capture-history.html");
     const CAPTURE_HISTORY_JS: &str = include_str!("web/capture-history.js");
+    const FOCUS_TOOLS_JS: &str = include_str!("web/focus-tools.js");
     const FOOTER_PAGES: [(&str, &str); 4] = [
         ("index.html", INDEX_HTML),
         ("scheduler.html", include_str!("web/scheduler.html")),
@@ -1628,6 +1629,34 @@ mod tests {
             .await
             .expect("read response body");
         String::from_utf8(bytes.to_vec()).expect("utf8 response body")
+    }
+
+    #[test]
+    fn focus_tools_are_wired_into_the_dashboard() {
+        // Loaded before app.js (defer preserves order) and hooked per frame.
+        let focus = INDEX_HTML
+            .find("<script src=\"/focus-tools.js\" defer></script>")
+            .expect("index.html loads focus-tools.js");
+        let app = INDEX_HTML
+            .find("<script src=\"/app.js\" defer></script>")
+            .expect("index.html loads app.js");
+        assert!(focus < app);
+        assert!(APP_JS.contains("window.OpticFocus?.onFrame(elements.preview)"));
+        assert!(APP_JS.contains("window.OpticFocus?.clear()"));
+        // Every element focus-tools.js looks up must exist in index.html.
+        let mut checked = 0;
+        for chunk in FOCUS_TOOLS_JS.split("$(\"#").skip(1) {
+            let id = chunk.split('"').next().expect("selector id");
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "index.html is missing #{id} used by focus-tools.js"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 15,
+            "expected the focus-tools element lookups, found {checked}"
+        );
     }
 
     #[test]

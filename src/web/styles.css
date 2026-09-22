@@ -416,3 +416,65 @@ footer { padding: 0 0 36px; color: var(--muted); font-size: 0.78rem; text-align:
   .control-grid > label, .control-grid > label:nth-last-child(-n+3), fieldset { grid-column: 1; }
   fieldset { flex-direction: column; gap: 10px; }
 }
+
+/* Focus tools (focus-tools.js): peaking overlay, histogram, loupe. */
+.preview-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+.preview-frame img.loupe-target { cursor: crosshair; touch-action: none; user-select: none; }
+.histogram-panel {
+  position: absolute;
+  left: 10px;
+  bottom: 10px;
+  width: min(45%, 272px);
+  padding: 8px;
+  border: 1px solid rgba(237, 247, 244, 0.18);
+  border-radius: 8px;
+  background: rgba(3, 5, 5, 0.72);
+  pointer-events: none;
+}
+.histogram-panel canvas { display: block; width: 100%; height: auto; }
+.histogram-clip { margin: 6px 0 0; color: var(--muted); font: 0.68rem ui-monospace, monospace; }
+/* A <fieldset>: override the global fieldset rules (incl. the narrow-screen
+   column layout) so the toggles stay one wrapping row. */
+.focus-tools {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 0 0 10px;
+}
+.focus-tools button { min-height: 34px; padding: 6px 12px; }
+.focus-tools button[aria-pressed="true"] { border-color: var(--green); color: var(--green); background: var(--green-dark); }
+.focus-slider { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 0.8rem; }
+.loupe-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(3, 5, 5, 0.45);
+}
+.loupe-panel canvas {
+  width: min(100%, 320px);
+  height: auto;
+  aspect-ratio: 1;
+  border: 1px solid #243033;
+  border-radius: 8px;
+  background: #030505;
+  image-rendering: pixelated;
+}
+.loupe-readout { flex: 1 1 180px; font-size: 0.85rem; }
+.loupe-readout p { margin: 0 0 8px; }
+.loupe-readout strong { color: var(--green); font: 700 1.05rem ui-monospace, monospace; }
+.loupe-readout button { min-height: 28px; margin-left: 6px; padding: 3px 10px; font-size: 0.75rem; }
+

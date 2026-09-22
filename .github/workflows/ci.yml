@@ -88,6 +88,9 @@ jobs:
           version: 2.5.14
       # The checked file list lives in biome.json `files.includes`.
       - run: biome ci
+      # Pure-function unit tests for the dashboard JS (focus tools), on the
+      # runner's preinstalled Node; node:test only, no npm dependencies.
+      - run: node --version && node --test tests/web
 
   rust-arm64:
     name: Rust (Debian 13 arm64)
