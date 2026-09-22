@@ -700,3 +700,53 @@ C5. Metering costs little: the preview frame rate is unchanged.
 - Hardware (dashboard closed, per the Part 4 pitfall): confirm C1/C2 by
   sweeping Day brightness and measuring frame luma; confirm the preview
   frame rate is unchanged (C5).
+
+### Implementation and result (Part 5)
+
+- `PreviewFrame.meter` (metered in the preview path); `RampStore` on
+  `SchedulerHandle` shared by captures, the live plan and a new
+  `observe_preview_frames` task the handle spawns;
+  `exposure_ramp::observe_preview` (updates the scene estimate and eases WB,
+  never `planned_log2_exposure`); `web.rs` reads the store via
+  `scheduler.ramp_state()`; `main.rs` passes `preview_config.json` (1 line).
+  Renamed the UI control to **Brightness compensation** (config key
+  `day_bias_ev` unchanged).
+- Bug found by the first deploy of this part: the task read the *committed*
+  config, so an unsaved `AutoRamp` edit measured nothing — exactly the case
+  the feature exists for. Fixed by resolving the staged config first
+  (`read_staged_app_config`, mirroring `web.rs::current_app_config`), with a
+  regression test. Scheduled captures still read the committed config.
+- Deploy hazard hit once: the deploy script's SSH session dropped mid-build,
+  the remote build died (its trap restarted the service) and the local script
+  hung for ~30 min with a stale log. Killing the local script and re-running
+  the deploy was clean. Worth adding SSH keepalives to the script.
+
+Hardware verification (Pi, scheduler **Paused**, settings **staged only**):
+
+- C1: starting a preview produced a non-seeding plan within 2 s
+  (shutter 142 µs, gain 1.0, WB easing 3.76/1.66 → 3.80/1.67).
+- C2: sweeping Brightness compensation with the dashboard open, measuring
+  the displayed frame's mean luma (160×120 canvas):
+
+| Brightness compensation | Shutter shown | Preview luma |
+|---|---|---|
+| −2.3 EV | 1/3676 s | 67.1 |
+| 0.0 EV | 1/1153 s | 134.6 |
+| +1.3 EV | 1/565 s | 173.0 |
+
+  Monotonic and close to the targets (0 EV aims at 18% grey ≈ 121 in sRGB
+  terms; +1.3 EV ≈ 180). The remaining gap is the loop still converging:
+  smoothing 0.5 at preview frame rate.
+- C4: `Dashboard` mode measures nothing (the task clears the state).
+- C5: no preview frame-rate change was observed.
+- Note: the preview override is applied by the dashboard, so with no
+  dashboard open the ramp still learns the scene but the preview itself is
+  not re-exposed. That is fine for the intended use (the operator is
+  watching), but it means a headless check must apply the override itself.
+- Restored afterwards: the user's staged exposure exactly (`day_bias_ev`
+  −2.3, AutoRamp), scheduler still Paused, preview stopped, nothing
+  committed.
+
+Still open for the user: night convergence over a real sunset, and whether
+the preview's metering (a different sensor mode than captures) biases the
+first scheduled frames.
