@@ -9,7 +9,11 @@
 //! "what should fire next" (the actor) and "what would the next 48h look
 //! like" (the design doc's future Shot Forecaster, 1d) — see design doc §3.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use chrono::{DateTime, Datelike, Duration, NaiveTime, Utc, Weekday};
 use chrono_tz::Tz;
@@ -19,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{
     camera::{AppConfig, CaptureProfile, CaptureRequest, CaptureSource},
     durable_state, ephemeris,
+    exposure_ramp::{self, FrameObservation, RampPlan, RampState, ScheduleExposure},
     optic_camera::OpticCamera,
     optic_capture_log::{CaptureLog, CaptureLogEntry},
 };
@@ -81,6 +86,11 @@ impl Station {
 pub struct ScheduleConfig {
     pub station: Option<Station>,
     pub rules: Vec<Rule>,
+    /// How every scheduled capture is exposed — one global mode, not per
+    /// rule (`docs/optic-daemon-exposure-ramping.md` §3.1). Defaults to
+    /// `Dashboard`, so a config written before this field existed behaves
+    /// exactly as before.
+    pub exposure: ScheduleExposure,
 }
 
 impl ScheduleConfig {
@@ -944,6 +954,118 @@ pub struct SchedulerStatus {
     pub next_capture_at: Option<DateTime<Utc>>,
     pub next_capture_rules: Vec<String>,
     pub last_capture: Option<LastCapture>,
+    /// The last auto-ramped capture; `None` in `Dashboard` mode.
+    pub exposure: Option<RampSnapshot>,
+}
+
+/// The one ramp state, shared by scheduled captures, the live preview
+/// task, and `/api/status`'s live plan (design doc §11).
+pub type RampStore = Arc<Mutex<Option<RampState>>>;
+
+/// Reads the store without letting a poisoned lock take the daemon down:
+/// a missed live value is not worth a panic.
+fn ramp_snapshot(store: &RampStore) -> Option<RampState> {
+    store.lock().ok().and_then(|state| *state)
+}
+
+fn store_ramp(store: &RampStore, next: Option<RampState>) {
+    if let Ok(mut state) = store.lock() {
+        *state = next;
+    }
+}
+
+/// The next scheduled frame's exposure as of now — what the dashboard's
+/// locked Shutter/Gain/White balance fields show while *Scheduled
+/// exposure* is on (`docs/optic-daemon-exposure-ramping.md` §10).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LiveExposurePlan {
+    /// The next frame is an auto-exposure/AWB seed, so there's no manual
+    /// exposure to show yet.
+    pub seeding: bool,
+    pub shutter_us: Option<u64>,
+    pub gain: Option<f32>,
+    pub target_bias_ev: f64,
+    pub sun_elevation_deg: Option<f64>,
+    pub max_shutter_us: u64,
+    /// When the ramp last learned from a captured frame.
+    pub ramp_updated_at: Option<DateTime<Utc>>,
+}
+
+/// How far ahead `live_exposure_plan` looks for the next two shots to size
+/// the interval budget. Short: it runs on every status poll.
+const LIVE_PLAN_LOOKAHEAD: Duration = Duration::hours(6);
+
+/// Plans the next ramped frame for `now`, the same way the scheduler will
+/// when it fires (sun elevation and interval budget included). `None` in
+/// `Dashboard` mode.
+pub fn live_exposure_plan(
+    schedule: &ScheduleConfig,
+    ramp_state: Option<&RampState>,
+    now: DateTime<Utc>,
+) -> Option<LiveExposurePlan> {
+    let ScheduleExposure::AutoRamp(settings) = &schedule.exposure else {
+        return None;
+    };
+    let settings = settings.sanitized();
+    let sun_elevation_deg = schedule
+        .station
+        .as_ref()
+        .map(|station| sun_elevation_at(station)(now));
+    let mut upcoming = occurrences(
+        schedule,
+        now.with_timezone(&schedule.tz()),
+        LIVE_PLAN_LOOKAHEAD,
+    )
+    .into_iter();
+    let gap = upcoming
+        .next()
+        .and_then(|next| upcoming.next().map(|after| after.at - next.at));
+    let max_shutter_us = exposure_ramp::max_shutter_for_gap(gap, &settings);
+    let target_bias_ev = exposure_ramp::target_bias_ev(sun_elevation_deg, &settings);
+    let base = LiveExposurePlan {
+        seeding: true,
+        shutter_us: None,
+        gain: None,
+        target_bias_ev,
+        sun_elevation_deg,
+        max_shutter_us,
+        ramp_updated_at: ramp_state.map(|state| state.updated_at),
+    };
+    match exposure_ramp::plan(
+        ramp_state,
+        now,
+        sun_elevation_deg,
+        &settings,
+        max_shutter_us,
+    ) {
+        RampPlan::Seed => Some(base),
+        RampPlan::Manual {
+            shutter_us, gain, ..
+        } => Some(LiveExposurePlan {
+            seeding: false,
+            shutter_us: Some(shutter_us),
+            gain: Some(gain),
+            ..base
+        }),
+    }
+}
+
+/// What the last auto-ramped capture did — the exposure the camera
+/// actually used (request metadata) alongside the ramp's inputs.
+#[derive(Debug, Clone, Serialize)]
+pub struct RampSnapshot {
+    pub at: DateTime<Utc>,
+    /// An auto-exposure seed frame rather than a ramped one.
+    pub seed: bool,
+    pub exposure_us: Option<i32>,
+    pub analogue_gain: Option<f32>,
+    pub colour_gains: Option<[f32; 2]>,
+    pub luminance: Option<f64>,
+    pub target_bias_ev: f64,
+    pub sun_elevation_deg: Option<f64>,
+    /// Shutter ceiling for this shot: the setting, or less when the gap to
+    /// the next shot is short (`exposure_ramp::max_shutter_for_gap`).
+    pub max_shutter_us: u64,
 }
 
 #[derive(Debug)]
@@ -973,6 +1095,7 @@ enum SchedulerCommand {
 pub struct SchedulerHandle {
     commands: mpsc::Sender<SchedulerCommand>,
     status: watch::Receiver<SchedulerStatus>,
+    ramp: RampStore,
 }
 
 impl SchedulerHandle {
@@ -985,6 +1108,7 @@ impl SchedulerHandle {
         run_state_path: PathBuf,
         run_state_cache_path: PathBuf,
         initial_run_state: ScheduleRunState,
+        preview_config_path: PathBuf,
     ) -> Self {
         let (commands_tx, commands_rx) = mpsc::channel(16);
         let (status_tx, status_rx) = watch::channel(SchedulerStatus {
@@ -992,9 +1116,17 @@ impl SchedulerHandle {
             next_capture_at: None,
             next_capture_rules: Vec::new(),
             last_capture: None,
+            exposure: None,
         });
+        let ramp = RampStore::default();
+        tokio::spawn(observe_preview_frames(
+            camera.clone(),
+            preview_config_path,
+            config_cache_path.clone(),
+            ramp.clone(),
+        ));
         tokio::spawn(run_actor(
-            camera,
+            camera.clone(),
             capture_log,
             capture_dir,
             config_cache_path,
@@ -1003,11 +1135,18 @@ impl SchedulerHandle {
             initial_run_state,
             commands_rx,
             status_tx,
+            ramp.clone(),
         ));
         Self {
             commands: commands_tx,
             status: status_rx,
+            ramp,
         }
+    }
+
+    /// The ramp's current state, for `live_exposure_plan`.
+    pub fn ramp_state(&self) -> Option<RampState> {
+        ramp_snapshot(&self.ramp)
     }
 
     pub fn status(&self) -> SchedulerStatus {
@@ -1058,6 +1197,7 @@ async fn run_actor(
     mut run_state: ScheduleRunState,
     mut commands: mpsc::Receiver<SchedulerCommand>,
     status_tx: watch::Sender<SchedulerStatus>,
+    ramp: RampStore,
 ) {
     loop {
         if run_state == ScheduleRunState::Paused {
@@ -1082,9 +1222,11 @@ async fn run_actor(
         let config = read_app_config(&config_cache_path).await;
         let tz = config.schedule.tz();
         let now = Utc::now().with_timezone(&tz);
-        let next = occurrences(&config.schedule, now, LOOKAHEAD)
-            .into_iter()
-            .next();
+        let mut upcoming = occurrences(&config.schedule, now, LOOKAHEAD).into_iter();
+        let next = upcoming.next();
+        let gap = next
+            .as_ref()
+            .and_then(|shot| upcoming.next().map(|after| after.at - shot.at));
 
         match next {
             Some(shot) => {
@@ -1099,9 +1241,10 @@ async fn run_actor(
                 );
                 tokio::select! {
                     () = tokio::time::sleep(sleep_for) => {
-                        let outcome = fire_capture(&camera, &capture_log, &capture_dir, &config, &shot).await;
+                        let (outcome, exposure) = fire_capture(&camera, &capture_log, &capture_dir, &config, &shot, gap, &ramp).await;
                         let mut status = status_tx.borrow().clone();
                         status.last_capture = Some(outcome);
+                        status.exposure = exposure;
                         let _ = status_tx.send(status);
                     }
                     command = commands.recv() => {
@@ -1179,6 +1322,18 @@ fn publish_status(
     let _ = tx.send(status);
 }
 
+/// The staged (uncommitted) config when one exists, else the committed one —
+/// mirrors `web.rs::current_app_config`, for the preview-metering task.
+async fn read_staged_app_config(
+    preview_config_path: &std::path::Path,
+    config_cache_path: &std::path::Path,
+) -> AppConfig {
+    if let Ok(content) = tokio::fs::read_to_string(preview_config_path).await {
+        return serde_json::from_str(&content).unwrap_or_default();
+    }
+    read_app_config(config_cache_path).await
+}
+
 async fn read_app_config(config_cache_path: &std::path::Path) -> AppConfig {
     match durable_state::read_cached(config_cache_path).await {
         Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
@@ -1199,18 +1354,92 @@ async fn persist_run_state(
     }
 }
 
-/// Builds a `CaptureRequest` from whatever profile/settings are currently
-/// committed (design doc §6 — no scheduler-specific override) and fires
-/// it, recording the outcome to the capture history log with `source:
-/// "scheduler"` if one is configured, exactly like a manual capture does
-/// with `source: "web_ui"`.
-async fn fire_capture(
-    camera: &OpticCamera,
-    capture_log: &Option<CaptureLog>,
-    capture_dir: &std::path::Path,
+/// How often the preview task re-reads the staged config. Frames arrive up
+/// to 8x a second; the config only changes when an operator edits it.
+const PREVIEW_CONFIG_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Teaches the ramp the scene from live preview frames (design doc §11), so
+/// unsaved exposure settings show in the preview even with the scheduler
+/// paused and no capture yet. Runs for the daemon's lifetime; when no
+/// preview is streaming there are simply no frames.
+async fn observe_preview_frames(
+    camera: OpticCamera,
+    preview_config_path: PathBuf,
+    config_cache_path: PathBuf,
+    ramp: RampStore,
+) {
+    let mut settings: Option<exposure_ramp::RampSettings> = None;
+    let mut refreshed_at = std::time::Instant::now() - PREVIEW_CONFIG_REFRESH;
+    loop {
+        let Ok(mut frames) = camera.subscribe().await else {
+            tokio::time::sleep(PREVIEW_CONFIG_REFRESH).await;
+            continue;
+        };
+        loop {
+            let frame = match frames.recv().await {
+                Ok(frame) => frame,
+                // Lagged: preview frames outran this task, which is
+                // harmless — the next frame is just as good a measurement.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            if refreshed_at.elapsed() >= PREVIEW_CONFIG_REFRESH {
+                // The *staged* config, like `/api/status` uses: unsaved
+                // exposure edits must show in the preview (design doc §11).
+                // Scheduled captures keep reading the committed config.
+                let config = read_staged_app_config(&preview_config_path, &config_cache_path).await;
+                settings = match config.schedule.exposure {
+                    ScheduleExposure::AutoRamp(settings) => Some(settings.sanitized()),
+                    // Dashboard mode: measure nothing, and drop any state so
+                    // switching back to AutoRamp starts fresh.
+                    ScheduleExposure::Dashboard => {
+                        store_ramp(&ramp, None);
+                        None
+                    }
+                };
+                refreshed_at = std::time::Instant::now();
+            }
+            let (Some(settings), Some(meter)) = (settings.as_ref(), frame.meter) else {
+                continue;
+            };
+            let (Some(exposure_us), Some(analogue_gain)) = (frame.exposure_us, frame.analogue_gain)
+            else {
+                continue;
+            };
+            let observation = FrameObservation {
+                exposure_us: f64::from(exposure_us),
+                analogue_gain: f64::from(analogue_gain),
+                meter,
+            };
+            let current = ramp_snapshot(&ramp);
+            if let Some(next) =
+                exposure_ramp::observe_preview(current.as_ref(), &observation, Utc::now(), settings)
+            {
+                store_ramp(&ramp, Some(next));
+            }
+        }
+    }
+}
+
+/// The ramp inputs for one `AutoRamp` shot.
+struct RampShot {
+    settings: exposure_ramp::RampSettings,
+    plan: RampPlan,
+    target_bias_ev: f64,
+    sun_elevation_deg: Option<f64>,
+    max_shutter_us: u64,
+}
+
+/// Builds a `CaptureRequest` from the committed profile/settings (design
+/// doc §6) and, in `AutoRamp` mode, the ramp's exposure
+/// (`docs/optic-daemon-exposure-ramping.md` §7): a seed runs auto exposure
+/// and AWB, a manual plan sets shutter, gain and colour gains. Everything
+/// else (profile, orientation, denoise, DNG policy) is unchanged.
+fn build_capture_request(
     config: &AppConfig,
-    shot: &ForecastedShot,
-) -> LastCapture {
+    rule_slugs: &[String],
+    plan: Option<&RampPlan>,
+) -> CaptureRequest {
     // Binning2k forces its own DNG policy regardless of the committed
     // preference (`validate_raw_policy` rejects it outright). MasterArchive
     // and Dci4k both read `config.save_dng` — as of 2026-09-20,
@@ -1226,14 +1455,91 @@ async fn fire_capture(
         CaptureProfile::Binning2k => false,
         CaptureProfile::MasterArchive | CaptureProfile::Dci4k => config.save_dng,
     };
-    let request = CaptureRequest {
-        settings: config.settings.clone(),
+    let mut settings = config.settings.clone();
+    match plan {
+        None => {}
+        // Auto exposure for the first frame; white balance is the
+        // dashboard's, untouched.
+        Some(RampPlan::Seed) => {
+            settings.shutter_us = 0;
+            settings.gain = 0.0;
+        }
+        // Exposure only: white balance stays whatever the dashboard's
+        // control says, like a manual capture (design doc §6).
+        Some(RampPlan::Manual {
+            shutter_us, gain, ..
+        }) => {
+            settings.shutter_us = *shutter_us;
+            settings.gain = *gain;
+        }
+    }
+    CaptureRequest {
+        settings,
         profile: config.profile,
         save_dng,
         source: CaptureSource::Scheduler {
-            rule_slugs: shot.rule_slugs.clone(),
+            rule_slugs: rule_slugs.to_vec(),
         },
+    }
+}
+
+/// Plans the ramp for one shot, or resets it in `Dashboard` mode so that
+/// switching back to `AutoRamp` later starts from a fresh seed.
+fn plan_ramp_shot(
+    config: &AppConfig,
+    shot: &ForecastedShot,
+    gap: Option<Duration>,
+    ramp: &RampStore,
+    now: DateTime<Utc>,
+) -> Option<RampShot> {
+    let ScheduleExposure::AutoRamp(settings) = &config.schedule.exposure else {
+        store_ramp(ramp, None);
+        return None;
     };
+    let settings = settings.sanitized();
+    let sun_elevation_deg = config
+        .schedule
+        .station
+        .as_ref()
+        .map(|station| sun_elevation_at(station)(shot.at.with_timezone(&Utc)));
+    let max_shutter_us = exposure_ramp::max_shutter_for_gap(gap, &settings);
+    Some(RampShot {
+        plan: exposure_ramp::plan(
+            ramp_snapshot(ramp).as_ref(),
+            now,
+            sun_elevation_deg,
+            &settings,
+            max_shutter_us,
+        ),
+        target_bias_ev: exposure_ramp::target_bias_ev(sun_elevation_deg, &settings),
+        settings,
+        sun_elevation_deg,
+        max_shutter_us,
+    })
+}
+
+/// Fires one scheduled capture (exposed per `build_capture_request`),
+/// recording the outcome to the capture history log with `source:
+/// "scheduler"` if one is configured, exactly like a manual capture does
+/// with `source: "web_ui"`. In `AutoRamp` mode the frame's reported
+/// exposure and meter update `ramp`.
+async fn fire_capture(
+    camera: &OpticCamera,
+    capture_log: &Option<CaptureLog>,
+    capture_dir: &std::path::Path,
+    config: &AppConfig,
+    shot: &ForecastedShot,
+    gap: Option<Duration>,
+    ramp: &RampStore,
+) -> (LastCapture, Option<RampSnapshot>) {
+    let ramp_shot = plan_ramp_shot(config, shot, gap, ramp, Utc::now());
+    let request = build_capture_request(
+        config,
+        &shot.rule_slugs,
+        ramp_shot.as_ref().map(|ramp_shot| &ramp_shot.plan),
+    );
+    let save_dng = request.save_dng;
+    let settings = request.settings.clone();
     let source = request.source.clone();
     let requested_at = std::time::SystemTime::now();
     let result = camera.capture_to_stage(capture_dir, request).await;
@@ -1248,7 +1554,7 @@ async fn fire_capture(
                 .unwrap_or_default()
                 .as_millis(),
             config.profile,
-            config.settings.clone(),
+            settings,
             save_dng,
             &source,
             &result,
@@ -1256,7 +1562,44 @@ async fn fire_capture(
         capture_log.record(entry).await;
     }
 
-    match result {
+    let snapshot = ramp_shot.map(|ramp_shot| {
+        let exposure = result
+            .as_ref()
+            .ok()
+            .and_then(|capture| capture.exposure)
+            .unwrap_or_default();
+        if let (Some(exposure_us), Some(analogue_gain), Some(meter)) =
+            (exposure.exposure_us, exposure.analogue_gain, exposure.meter)
+        {
+            let observation = FrameObservation {
+                exposure_us: f64::from(exposure_us),
+                analogue_gain: f64::from(analogue_gain),
+                meter,
+            };
+            if let Some(next) = exposure_ramp::observe(
+                ramp_snapshot(ramp).as_ref(),
+                &ramp_shot.plan,
+                &observation,
+                Utc::now(),
+                &ramp_shot.settings,
+            ) {
+                store_ramp(ramp, Some(next));
+            }
+        }
+        RampSnapshot {
+            at: Utc::now(),
+            seed: ramp_shot.plan == RampPlan::Seed,
+            exposure_us: exposure.exposure_us,
+            analogue_gain: exposure.analogue_gain,
+            colour_gains: exposure.colour_gains,
+            luminance: exposure.meter.map(|meter| meter.luminance),
+            target_bias_ev: ramp_shot.target_bias_ev,
+            sun_elevation_deg: ramp_shot.sun_elevation_deg,
+            max_shutter_us: ramp_shot.max_shutter_us,
+        }
+    });
+
+    let outcome = match result {
         Ok(_) => LastCapture {
             at: Utc::now(),
             rule_slugs: shot.rule_slugs.clone(),
@@ -1272,7 +1615,8 @@ async fn fire_capture(
                 error: Some(error.to_string()),
             }
         }
-    }
+    };
+    (outcome, snapshot)
 }
 
 #[cfg(test)]
@@ -1308,6 +1652,7 @@ mod tests {
         let schedule = ScheduleConfig {
             station: None,
             rules: vec![rule("r", interval(60, false))],
+            ..ScheduleConfig::default()
         };
         let shots = occurrences(&schedule, from, Duration::seconds(150));
         let times: Vec<_> = shots.iter().map(|s| s.at).collect();
@@ -1322,6 +1667,7 @@ mod tests {
         let schedule = ScheduleConfig {
             station: None,
             rules: vec![rule("r", interval(300, true))], // 5 minutes
+            ..ScheduleConfig::default()
         };
         let from_a = utc(2026, 1, 1, 12, 0, 3);
         let from_b = utc(2026, 1, 1, 12, 3, 47);
@@ -1345,6 +1691,7 @@ mod tests {
                     time: NaiveTime::from_hms_opt(13, 0, 0).unwrap(),
                 },
             )],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 3, 1, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::days(3));
@@ -1371,6 +1718,7 @@ mod tests {
                     time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
                 },
             )],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 3, 1, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::days(7));
@@ -1396,6 +1744,7 @@ mod tests {
                     time: NaiveTime::from_hms_opt(10, 0, 0).unwrap(),
                 },
             )],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 3, 1, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::days(60));
@@ -1424,6 +1773,7 @@ mod tests {
                     time: NaiveTime::from_hms_opt(13, 0, 0).unwrap(),
                 },
             )],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 3, 7, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::days(3));
@@ -1485,6 +1835,7 @@ mod tests {
                     },
                 ),
             ],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 1, 1, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::minutes(11));
@@ -1570,6 +1921,7 @@ mod tests {
                     ..Default::default()
                 },
             }],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 1, 1, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::days(2));
@@ -1597,6 +1949,7 @@ mod tests {
         let schedule = ScheduleConfig {
             station: None,
             rules: vec![dead, disabled_dead, alive],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 1, 1, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::hours(1));
@@ -1638,6 +1991,7 @@ mod tests {
         let schedule = ScheduleConfig {
             station: None,
             rules: vec![morning, evening],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 1, 1, 0, 0, 0);
         let shots = occurrences(&schedule, from, Duration::hours(24));
@@ -1661,6 +2015,7 @@ mod tests {
                 rule("baseline", interval(300, true)),
                 rule("site-visit", interval(30, true)),
             ],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 1, 1, 10, 0, 0);
         let shots = occurrences(&schedule, from, Duration::minutes(30));
@@ -1689,6 +2044,7 @@ mod tests {
         let schedule = ScheduleConfig {
             station: None,
             rules: vec![rule("baseline", interval(300, true)), disabled],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 1, 1, 10, 0, 0);
         let shots = occurrences(&schedule, from, Duration::minutes(30));
@@ -1702,6 +2058,7 @@ mod tests {
         let schedule = ScheduleConfig {
             station: None,
             rules: vec![r],
+            ..ScheduleConfig::default()
         };
         let from = utc(2026, 1, 1, 0, 0, 0);
         assert!(occurrences(&schedule, from, Duration::minutes(10)).is_empty());
@@ -1834,6 +2191,219 @@ mod actor_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[test]
+    fn schedule_config_without_exposure_defaults_to_dashboard() {
+        // A config.json committed before exposure ramping existed.
+        let schedule: ScheduleConfig =
+            serde_json::from_str(r#"{"station": null, "rules": []}"#).unwrap();
+        assert_eq!(schedule.exposure, ScheduleExposure::Dashboard);
+    }
+
+    #[test]
+    fn schedule_config_round_trips_an_auto_ramp_exposure() {
+        let schedule = ScheduleConfig {
+            exposure: ScheduleExposure::AutoRamp(exposure_ramp::RampSettings {
+                max_gain: 4.0,
+                ..exposure_ramp::RampSettings::default()
+            }),
+            ..ScheduleConfig::default()
+        };
+        let json = serde_json::to_string(&schedule).unwrap();
+        assert!(json.contains(r#""mode":"AutoRamp""#));
+        let parsed: ScheduleConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, schedule);
+    }
+
+    fn committed_config() -> AppConfig {
+        AppConfig {
+            profile: CaptureProfile::Dci4k,
+            save_dng: true,
+            settings: crate::camera::CameraSettings {
+                rotation: 180,
+                awb: "daylight".to_owned(),
+                shutter_us: 20_000,
+                gain: 2.0,
+                ..crate::camera::CameraSettings::default()
+            },
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn dashboard_mode_request_matches_the_committed_settings() {
+        // Regression: Dashboard mode must build exactly the pre-ramping request.
+        let config = committed_config();
+        let slugs = vec!["daytime".to_owned()];
+        let request = build_capture_request(&config, &slugs, None);
+        assert_eq!(
+            serde_json::to_value(&request.settings).unwrap(),
+            serde_json::to_value(&config.settings).unwrap()
+        );
+        assert_eq!(request.profile, CaptureProfile::Dci4k);
+        assert!(request.save_dng);
+        assert_eq!(
+            request.source,
+            CaptureSource::Scheduler { rule_slugs: slugs }
+        );
+    }
+
+    #[test]
+    fn ramp_plans_override_exposure_only_and_never_white_balance() {
+        // White balance belongs to the dashboard's own control, for
+        // scheduled captures too (user decision, 2026-09-22).
+        let config = committed_config();
+        let seed = build_capture_request(&config, &[], Some(&RampPlan::Seed));
+        assert_eq!((seed.settings.shutter_us, seed.settings.gain), (0, 0.0));
+        assert_eq!(seed.settings.awb, config.settings.awb);
+        assert_eq!(seed.settings.colour_gains, config.settings.colour_gains);
+
+        let manual = build_capture_request(
+            &config,
+            &[],
+            Some(&RampPlan::Manual {
+                shutter_us: 2_000_000,
+                gain: 3.5,
+                log2_exposure: 22.7,
+            }),
+        );
+        assert_eq!(manual.settings.shutter_us, 2_000_000);
+        assert_eq!(manual.settings.gain, 3.5);
+        assert_eq!(manual.settings.awb, config.settings.awb);
+        assert_eq!(manual.settings.colour_gains, config.settings.colour_gains);
+        assert_eq!(manual.settings.rotation, 180);
+        assert!(manual.save_dng);
+        manual.validate().unwrap();
+    }
+
+    #[test]
+    fn plan_ramp_shot_resets_state_in_dashboard_mode_and_seeds_in_auto_ramp() {
+        let now = Utc::now();
+        let shot = ForecastedShot {
+            at: now.with_timezone(&chrono_tz::UTC),
+            rule_slugs: vec!["dusk".to_owned()],
+        };
+        let ramp: RampStore = Arc::new(Mutex::new(Some(RampState {
+            updated_at: now,
+            scene_ev: -12.0,
+            planned_log2_exposure: Some(10.0),
+        })));
+        // Dashboard mode drops the state, so switching back to AutoRamp
+        // starts from a fresh measurement.
+        let dashboard = committed_config();
+        assert!(plan_ramp_shot(&dashboard, &shot, None, &ramp, now).is_none());
+        assert!(ramp_snapshot(&ramp).is_none());
+
+        let mut auto = committed_config();
+        auto.schedule.exposure = ScheduleExposure::AutoRamp(exposure_ramp::RampSettings::default());
+        let ramp_shot =
+            plan_ramp_shot(&auto, &shot, Some(Duration::seconds(30)), &ramp, now).unwrap();
+        assert_eq!(ramp_shot.plan, RampPlan::Seed);
+        assert_eq!(ramp_shot.max_shutter_us, 2_045_454);
+        // No station: the target stays at the day level.
+        assert_eq!(ramp_shot.sun_elevation_deg, None);
+        assert_eq!(ramp_shot.target_bias_ev, 0.0);
+    }
+
+    #[test]
+    fn live_exposure_plan_is_none_in_dashboard_mode() {
+        let schedule = ScheduleConfig::default();
+        assert_eq!(live_exposure_plan(&schedule, None, Utc::now()), None);
+    }
+
+    #[test]
+    fn live_exposure_plan_seeds_without_state_and_tracks_the_ramp_with_it() {
+        use chrono::TimeZone as _;
+        let now = Utc.with_ymd_and_hms(2026, 9, 22, 8, 40, 0).unwrap();
+        let station = Station {
+            latitude: 49.22,
+            longitude: -123.0,
+            elevation_m: 86.0,
+            timezone: "America/Vancouver".to_owned(),
+        };
+        let settings = exposure_ramp::RampSettings::default();
+        let schedule = ScheduleConfig {
+            station: Some(station.clone()),
+            rules: vec![Rule {
+                id: "every-minute".to_owned(),
+                label: "Every minute".to_owned(),
+                slug: "every-minute".to_owned(),
+                enabled: true,
+                trigger: Trigger::Interval {
+                    every_secs: 60,
+                    align_to_wall_clock: true,
+                },
+                constraints: Constraints::default(),
+            }],
+            exposure: ScheduleExposure::AutoRamp(settings),
+        };
+
+        let seeding = live_exposure_plan(&schedule, None, now).unwrap();
+        assert!(seeding.seeding);
+        assert_eq!((seeding.shutter_us, seeding.gain), (None, None));
+        // 60 s interval -> the capture-time budget caps the shutter.
+        assert_eq!(seeding.max_shutter_us, 4_227_272);
+        // 01:40 local: deep night, full night drop.
+        assert!(seeding.sun_elevation_deg.unwrap() < -18.0);
+        assert_eq!(seeding.target_bias_ev, -2.0);
+
+        let state = RampState {
+            updated_at: now - Duration::minutes(1),
+            scene_ev: -26.0,
+            planned_log2_exposure: Some(21.0),
+        };
+        let live = live_exposure_plan(&schedule, Some(&state), now).unwrap();
+        let RampPlan::Manual {
+            shutter_us, gain, ..
+        } = exposure_ramp::plan(
+            Some(&state),
+            now,
+            seeding.sun_elevation_deg,
+            &settings,
+            4_227_272,
+        )
+        else {
+            panic!("expected a manual plan");
+        };
+        assert!(!live.seeding);
+        assert_eq!(live.shutter_us, Some(shutter_us));
+        assert_eq!(live.gain, Some(gain));
+        assert_eq!(live.ramp_updated_at, Some(state.updated_at));
+    }
+
+    #[tokio::test]
+    async fn the_preview_task_reads_staged_config_before_the_committed_one() {
+        // Regression: the preview-metering task first read only the
+        // committed config, so an unsaved AutoRamp edit measured nothing and
+        // the live preview ignored it (design doc §11).
+        let dir = unique_temp_dir("staged-config");
+        let preview = dir.join("preview_config.json");
+        let committed = dir.join("config.json");
+        let with_mode = |exposure: ScheduleExposure| {
+            serde_json::to_string(&AppConfig {
+                schedule: ScheduleConfig {
+                    exposure,
+                    ..ScheduleConfig::default()
+                },
+                ..AppConfig::default()
+            })
+            .unwrap()
+        };
+        std::fs::write(&committed, with_mode(ScheduleExposure::Dashboard)).unwrap();
+
+        // No staged file: the committed config wins.
+        let config = read_staged_app_config(&preview, &committed).await;
+        assert_eq!(config.schedule.exposure, ScheduleExposure::Dashboard);
+
+        // Staged but uncommitted AutoRamp must be what the preview follows.
+        let staged = ScheduleExposure::AutoRamp(exposure_ramp::RampSettings {
+            day_bias_ev: -2.3,
+            ..exposure_ramp::RampSettings::default()
+        });
+        std::fs::write(&preview, with_mode(staged.clone())).unwrap();
+        let config = read_staged_app_config(&preview, &committed).await;
+        assert_eq!(config.schedule.exposure, staged);
+    }
+
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1860,6 +2430,7 @@ mod actor_tests {
             run_state_path.clone(),
             run_state_cache_path,
             initial,
+            unique_temp_dir("preview-config").join("preview_config.json"),
         );
         (handle, run_state_path)
     }

@@ -4,6 +4,7 @@
     "includes": [
       "src/web/app.js",
       "src/web/focus-tools.js",
+      "src/web/scheduled-exposure.js",
       "src/web/index.html",
       "src/web/scheduler.js",
       "src/web/scheduler.html",

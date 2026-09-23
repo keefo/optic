@@ -18,7 +18,22 @@ pub struct CameraSettings {
     pub gain: f32,
     pub shutter_us: u64,
     pub denoise: String,
+    /// Manual white balance as `[red, blue]` colour gains. `Some` disables
+    /// AWB for the request (`AwbEnable(false)` + `ColourGains`); `None`
+    /// keeps per-frame AWB with `awb`'s mode. Set by exposure ramping
+    /// (`docs/optic-daemon-exposure-ramping.md` §6), never by the dashboard.
+    pub colour_gains: Option<[f32; 2]>,
 }
+
+/// Manual shutter range accepted by `CameraSettings::validate` (0 = auto).
+pub(crate) const MIN_SHUTTER_US: u64 = 100;
+pub(crate) const MAX_SHUTTER_US: u64 = 5_000_000;
+/// Manual analogue gain range (0 = auto).
+pub(crate) const MIN_GAIN: f32 = 1.0;
+pub(crate) const MAX_GAIN: f32 = 16.0;
+/// Manual colour-gain range for `CameraSettings::colour_gains`.
+pub(crate) const COLOUR_GAIN_MIN: f32 = 0.5;
+pub(crate) const COLOUR_GAIN_MAX: f32 = 8.0;
 
 impl Default for CameraSettings {
     fn default() -> Self {
@@ -26,13 +41,17 @@ impl Default for CameraSettings {
             rotation: 0,
             horizontal_flip: false,
             vertical_flip: false,
-            awb: "auto".to_owned(),
+            // Daylight, not Auto: per-frame AWB makes consecutive timelapse
+            // frames jump in colour, and a RAW/DNG keeps white balance
+            // adjustable in post anyway (docs §6).
+            awb: "daylight".to_owned(),
             metering: "centre".to_owned(),
             exposure: "normal".to_owned(),
             ev: 0.0,
             gain: 0.0,
             shutter_us: 0,
             denoise: "auto".to_owned(),
+            colour_gains: None,
         }
     }
 }
@@ -63,14 +82,25 @@ impl CameraSettings {
         if !(-4.0..=4.0).contains(&self.ev) || !self.ev.is_finite() {
             return Err(CameraError::Invalid("EV must be between -4 and 4"));
         }
-        if !(self.gain == 0.0 || (1.0..=16.0).contains(&self.gain)) || !self.gain.is_finite() {
+        if !(self.gain == 0.0 || (MIN_GAIN..=MAX_GAIN).contains(&self.gain))
+            || !self.gain.is_finite()
+        {
             return Err(CameraError::Invalid(
                 "gain must be 0 (auto) or between 1 and 16",
             ));
         }
-        if !(self.shutter_us == 0 || (100..=5_000_000).contains(&self.shutter_us)) {
+        if !(self.shutter_us == 0 || (MIN_SHUTTER_US..=MAX_SHUTTER_US).contains(&self.shutter_us)) {
             return Err(CameraError::Invalid(
                 "shutter must be 0 (auto) or between 100 and 5000000 microseconds",
+            ));
+        }
+        if let Some(gains) = self.colour_gains
+            && !gains
+                .iter()
+                .all(|gain| (COLOUR_GAIN_MIN..=COLOUR_GAIN_MAX).contains(gain))
+        {
+            return Err(CameraError::Invalid(
+                "colour gains must be between 0.5 and 8",
             ));
         }
         Ok(())
@@ -226,6 +256,12 @@ pub(crate) const STILL_MIN_FRAME_DURATION_US: i64 = 33_333;
 /// preview limit that still captures used to inherit.
 pub(crate) const STILL_AUTO_MAX_FRAME_DURATION_US: i64 = 500_000;
 
+/// Frames a still capture waits for before its output frame: the 3 queued
+/// requests plus `native_camera.rs`'s 8 warmup frames. Each lasts at least
+/// one shutter, which bounds how long a ramped shutter can be for a given
+/// interval (`exposure_ramp::max_shutter_for_gap`).
+pub(crate) const STILL_CAPTURE_FRAMES: u32 = 11;
+
 /// `FrameDurationLimits` for still-capture requests: as fast as the sensor
 /// mode and the exposure allow. Auto shutter leaves auto exposure its old
 /// headroom; a manual shutter is never truncated by the limit.
@@ -322,11 +358,41 @@ pub struct StreamRequest {
     /// don't need to send it.
     #[serde(default)]
     pub downsample: bool,
+    /// Preview-only exposure from the dashboard's *Scheduled exposure*
+    /// toggle (`docs/optic-daemon-exposure-ramping.md` §10). It changes what
+    /// the live preview shows, never `settings`, which is what
+    /// `reconfigure_stream` stages, so it's never saved.
+    #[serde(default)]
+    pub exposure_override: Option<ExposureOverride>,
+}
+
+/// A brightness-equivalent stand-in for the next scheduled frame's
+/// exposure. `shutter_us`/`gain` `0` means auto exposure, which is what a
+/// ramp seed frame uses. White balance is never part of this: it stays the
+/// operator's (`docs/optic-daemon-exposure-ramping.md` §6).
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExposureOverride {
+    pub shutter_us: u64,
+    pub gain: f32,
 }
 
 impl StreamRequest {
     pub(crate) fn validate(&self) -> Result<(), CameraError> {
-        self.settings.validate()
+        self.effective_settings().validate()
+    }
+
+    /// The settings the camera actually runs the preview with: `settings`,
+    /// with `exposure_override` applied when present. Exposure only — white
+    /// balance stays the operator's (`docs/optic-daemon-exposure-ramping.md`
+    /// §6).
+    pub(crate) fn effective_settings(&self) -> CameraSettings {
+        let mut settings = self.settings.clone();
+        if let Some(exposure) = self.exposure_override {
+            settings.shutter_us = exposure.shutter_us;
+            settings.gain = exposure.gain;
+        }
+        settings
     }
 }
 
@@ -340,6 +406,10 @@ pub struct PreviewFrame {
     pub exposure_us: Option<i32>,
     pub analogue_gain: Option<f32>,
     pub colour_gains: Option<[f32; 2]>,
+    /// Brightness/colour of this preview frame. The ramp learns the scene
+    /// from it, so unsaved exposure settings show in the live preview even
+    /// before any capture (`docs/optic-daemon-exposure-ramping.md` §11).
+    pub meter: Option<crate::exposure_ramp::FrameMeter>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -355,6 +425,20 @@ pub struct CaptureResult {
     pub bytes: u64,
     pub width: u32,
     pub height: u32,
+    /// What the output frame was actually exposed with, and its meter —
+    /// feeds exposure ramping. `None` when the backend can't report it.
+    pub exposure: Option<CaptureExposure>,
+}
+
+/// Request metadata of the output frame (the values libcamera used, not
+/// the ones requested) plus its brightness/colour meter.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct CaptureExposure {
+    pub exposure_us: Option<i32>,
+    pub analogue_gain: Option<f32>,
+    pub colour_gains: Option<[f32; 2]>,
+    pub meter: Option<crate::exposure_ramp::FrameMeter>,
 }
 
 #[derive(Debug)]
@@ -501,6 +585,70 @@ mod tests {
             ..CameraSettings::default()
         };
         assert!(invalid_awb.validate().is_err());
+    }
+
+    #[test]
+    fn stream_request_exposure_override_is_optional_and_preview_only() {
+        let plain: StreamRequest =
+            serde_json::from_str(r#"{"settings": {"gain": 2.0}, "profile": "dci_4k"}"#).unwrap();
+        assert_eq!(plain.exposure_override, None);
+        assert_eq!(plain.effective_settings().gain, 2.0);
+
+        let ramped: StreamRequest = serde_json::from_str(
+            r#"{"settings": {"gain": 2.0, "shutter_us": 1000, "awb": "cloudy"},
+                "profile": "dci_4k",
+                "exposure_override": {"shutter_us": 110000, "gain": 12.5}}"#,
+        )
+        .unwrap();
+        let effective = ramped.effective_settings();
+        assert_eq!((effective.shutter_us, effective.gain), (110_000, 12.5));
+        // Exposure only: the operator's white balance survives the override.
+        assert_eq!(effective.awb, "cloudy");
+        assert_eq!(effective.colour_gains, None);
+        // The staged settings keep the manual values.
+        assert_eq!(
+            (ramped.settings.shutter_us, ramped.settings.gain),
+            (1000, 2.0)
+        );
+        ramped.validate().unwrap();
+
+        // Seeding: auto exposure, white balance still the operator's.
+        let seed: StreamRequest = serde_json::from_str(
+            r#"{"settings": {"awb": "daylight"}, "profile": "dci_4k",
+                "exposure_override": {"shutter_us": 0, "gain": 0.0}}"#,
+        )
+        .unwrap();
+        let effective = seed.effective_settings();
+        assert_eq!((effective.shutter_us, effective.gain), (0, 0.0));
+        assert_eq!(effective.awb, "daylight");
+        assert_eq!(effective.colour_gains, None);
+
+        let invalid: StreamRequest = serde_json::from_str(
+            r#"{"settings": {}, "profile": "dci_4k",
+                "exposure_override": {"shutter_us": 1000, "gain": 40.0}}"#,
+        )
+        .unwrap();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn colour_gains_default_to_awb_and_are_range_checked() {
+        let settings: CameraSettings = serde_json::from_str(r#"{"shutter_us": 1000}"#).unwrap();
+        assert_eq!(settings.colour_gains, None);
+        settings.validate().unwrap();
+
+        let manual = CameraSettings {
+            colour_gains: Some([2.0, 1.6]),
+            ..CameraSettings::default()
+        };
+        manual.validate().unwrap();
+        for gains in [[0.4, 1.6], [2.0, 8.5], [f32::NAN, 1.0]] {
+            let invalid = CameraSettings {
+                colour_gains: Some(gains),
+                ..CameraSettings::default()
+            };
+            assert!(invalid.validate().is_err(), "{gains:?}");
+        }
     }
 
     #[test]

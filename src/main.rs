@@ -1,6 +1,8 @@
 mod camera;
 mod durable_state;
 mod ephemeris;
+mod exif;
+mod exposure_ramp;
 mod native_camera;
 #[cfg(target_os = "linux")]
 mod native_codec;
@@ -170,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         run_state_path,
         run_state_cache_path,
         initial_run_state,
+        capture_dir.join("preview_config.json"),
     );
 
     // Passive health monitor, daily digest and heartbeat

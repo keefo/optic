@@ -497,3 +497,59 @@ footer { padding: 0 0 36px; color: var(--muted); font-size: 0.78rem; text-align:
 .loupe-readout strong { color: var(--green); font: 700 1.05rem ui-monospace, monospace; }
 .loupe-readout button { min-height: 28px; margin-left: 6px; padding: 3px 10px; font-size: 0.75rem; }
 
+/* Scheduler page: Scheduled exposure card (docs/optic-daemon-exposure-ramping.md). */
+.exposure-card { grid-column: 2; grid-row: 2 / span 2; align-self: start; }
+@media (max-width: 820px) { .exposure-card { grid-column: auto; grid-row: auto; } }
+
+/* Dashboard: Scheduled exposure toggle (scheduled-exposure.js,
+   docs/optic-daemon-exposure-ramping.md §10). The block sits inside
+   .control-grid, which shifts the nth-last-child span rule above, so Gain
+   keeps its full-width row explicitly. */
+#camera-control-grid > label:has(> #gain), .scheduled-exposure { grid-column: 1 / -1; }
+.scheduled-exposure { display: grid; gap: 10px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; }
+.scheduled-exposure .check small { display: block; color: var(--muted); font-size: 0.78rem; }
+#scheduled-exposure-panel { display: grid; gap: 12px; }
+#scheduled-exposure-panel[hidden] { display: none; }
+.ramp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 15px; }
+.ramp-grid > label { display: flex; flex-direction: column; gap: 7px; color: var(--muted); font-size: 0.82rem; }
+.ramp-grid > label:first-child { grid-column: 1 / -1; }
+.ramp-scale { display: flex; justify-content: space-between; font-size: 0.72rem; }
+.ramp-advanced summary { cursor: pointer; color: var(--muted); font-size: 0.82rem; }
+.ramp-advanced[open] summary { margin-bottom: 10px; }
+.ramp-caption, .ramp-note { margin: 0; color: var(--muted); font-size: 0.8rem; }
+.ramp-caption { color: var(--orange); }
+.ramp-caption[data-kind="error"] { color: var(--red); }
+/* Ramp-driven values replace the locked inputs: amber, dashed, and a short
+   glow whenever the value changes. */
+.ramp-value { padding: 8px 10px; border: 1px dashed rgba(255, 174, 87, 0.55); border-radius: 9px; color: var(--orange); background: rgba(255, 174, 87, 0.07); font-variant-numeric: tabular-nums; }
+.ramp-value[hidden] { display: none; }
+.control-grid.ramp-on #shutter-value, .control-grid.ramp-on #gain-value { display: none; }
+.ramp-pulse { animation: ramp-pulse 1.4s ease-out; }
+@keyframes ramp-pulse {
+  from { background: rgba(255, 174, 87, 0.32); box-shadow: 0 0 0 3px rgba(255, 174, 87, 0.25); }
+  to { background: rgba(255, 174, 87, 0.07); box-shadow: 0 0 0 0 rgba(255, 174, 87, 0); }
+}
+@media (prefers-reduced-motion: reduce) { .ramp-pulse { animation: none; } }
+@media (max-width: 520px) { .ramp-grid { grid-template-columns: 1fr; } }
+/* Rotation lives in the Transform group, inline with the flips. */
+fieldset:has(> .transform-rotation) { align-items: center; flex-wrap: wrap; }
+.transform-rotation { display: flex; flex-basis: 100%; align-items: center; gap: 8px; color: var(--muted); font-size: 0.82rem; }
+.transform-rotation select { width: auto; }
+/* Step markers under a stepped range input: one hairline per step, inset by
+   half the thumb width so the first and last align with the track ends. The
+   repeating image draws every step but the last, which the second layer
+   pins to the right edge. */
+.ramp-ticks {
+  display: block;
+  height: 4px;
+  margin: 1px 9px 0;
+  background-repeat: repeat-x, no-repeat;
+  background-position: left top, right top;
+  background-image:
+    linear-gradient(to right, var(--line) 0 1px, transparent 1px),
+    linear-gradient(to right, var(--line) 0 1px, transparent 1px);
+}
+.ramp-ticks[data-steps="8"] { background-size: calc((100% - 1px) / 8) 100%, 1px 100%; }
+.ramp-ticks[data-steps="18"] { background-size: calc((100% - 1px) / 18) 100%, 1px 100%; }
+.ramp-grid > label:has(> .ramp-ticks) { gap: 4px; }
+.ramp-grid > label > .ramp-scale { margin-top: 2px; }

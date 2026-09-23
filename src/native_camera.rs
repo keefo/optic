@@ -37,10 +37,12 @@ mod imp {
 
     use crate::{
         camera::{
-            CameraError, CameraSettings, CaptureFile, CaptureProfile, CaptureRequest,
-            CaptureResult, CaptureSource, PreviewFrame, StreamRequest, format_rule_tags,
-            still_frame_duration_limits_us,
+            CameraError, CameraSettings, CaptureExposure, CaptureFile, CaptureProfile,
+            CaptureRequest, CaptureResult, CaptureSource, PreviewFrame, StreamRequest,
+            format_rule_tags, still_frame_duration_limits_us,
         },
+        exif::{ExifMetadata, exif_app1, insert_exif},
+        exposure_ramp::meter_yuv420,
         native_codec::{DngMetadata, decode_pisp_comp1, encode_bayer16_dng, encode_yuv420_jpeg},
     };
 
@@ -100,6 +102,7 @@ mod imp {
         yuv: Vec<u8>,
         raw: Option<Vec<u8>>,
         metadata: DngMetadata,
+        exposure: CaptureExposure,
         still: StreamInfo,
         raw_info: Option<StreamInfo>,
     }
@@ -310,7 +313,7 @@ mod imp {
                     start_pipeline(
                         camera,
                         request.profile,
-                        request.settings,
+                        request.effective_settings(),
                         request.control_revision,
                         true,
                         false,
@@ -331,12 +334,12 @@ mod imp {
                             active.profile,
                             &active.settings,
                             request.profile,
-                            &request.settings,
+                            &request.effective_settings(),
                         )
                 });
                 let result = if is_streaming && controls_only {
                     let active = pipeline.as_mut().expect("streaming pipeline disappeared");
-                    active.settings = request.settings;
+                    active.settings = request.effective_settings();
                     active.control_revision = request.control_revision;
                     Ok(())
                 } else if is_streaming {
@@ -344,7 +347,7 @@ mod imp {
                         start_pipeline(
                             camera,
                             request.profile,
-                            request.settings,
+                            request.effective_settings(),
                             request.control_revision,
                             true,
                             false,
@@ -389,7 +392,20 @@ mod imp {
                         elapsed_ms = frame_started.elapsed().as_millis(),
                         "capture perf"
                     );
-                    frame_result.and_then(|frame| {
+                    frame_result.and_then(|mut frame| {
+                        let meter_started = Instant::now();
+                        frame.exposure.meter = meter_yuv420(
+                            &frame.yuv,
+                            frame.still.width,
+                            frame.still.height,
+                            frame.still.stride,
+                        );
+                        info!(
+                            stage = "meter",
+                            luminance = frame.exposure.meter.map(|meter| meter.luminance),
+                            elapsed_ms = meter_started.elapsed().as_millis(),
+                            "capture perf"
+                        );
                         let publish_started = Instant::now();
                         let publish_result = publish_capture(&capture_dir, request, frame);
                         info!(
@@ -680,12 +696,23 @@ mod imp {
         controls
             .set(controls::AeEnable(false))
             .map_err(backend_error)?;
-        controls
-            .set(controls::AwbEnable(true))
-            .map_err(backend_error)?;
-        controls
-            .set(controls::AwbMode::from_setting(&settings.awb))
-            .map_err(backend_error)?;
+        // Manual colour gains (exposure ramping's eased white balance)
+        // replace per-frame AWB; otherwise AWB runs in the chosen mode.
+        if let Some(gains) = settings.colour_gains {
+            controls
+                .set(controls::AwbEnable(false))
+                .map_err(backend_error)?;
+            controls
+                .set(controls::ColourGains(gains))
+                .map_err(backend_error)?;
+        } else {
+            controls
+                .set(controls::AwbEnable(true))
+                .map_err(backend_error)?;
+            controls
+                .set(controls::AwbMode::from_setting(&settings.awb))
+                .map_err(backend_error)?;
+        }
         controls
             .set(noise_reduction_mode(&settings.denoise, fps.is_some()))
             .map_err(backend_error)?;
@@ -854,6 +881,12 @@ mod imp {
                         yuv,
                         raw,
                         metadata: dng_metadata(request.metadata(), &pipeline.raw_info, model),
+                        exposure: CaptureExposure {
+                            exposure_us,
+                            analogue_gain,
+                            colour_gains,
+                            meter: None,
+                        },
                         still: pipeline.still_info.clone(),
                         raw_info: pipeline.raw_info.clone(),
                     });
@@ -917,6 +950,7 @@ mod imp {
                     .ok_or_else(|| backend_error("preview request lost its buffer"))?,
             )?;
             let jpeg = encode_yuv420_jpeg(&yuv, info.width, info.height, info.stride, 95)?;
+            let meter = meter_yuv420(&yuv, info.width, info.height, info.stride);
             let _ = frames.send(PreviewFrame {
                 jpeg: Bytes::from(jpeg),
                 sequence: request.sequence(),
@@ -938,6 +972,7 @@ mod imp {
                     .get::<controls::ColourGains>()
                     .ok()
                     .map(|value| value.0),
+                meter,
             });
         }
         request.reuse(ReuseFlag::REUSE_BUFFERS);
@@ -1089,16 +1124,51 @@ mod imp {
         Ok(output)
     }
 
-    fn encode_jpeg(frame: &CapturedFrame, quality: u8) -> Result<Bytes, CameraError> {
-        encode_yuv420_jpeg(
+    /// Encodes the frame and gives it EXIF metadata describing what the
+    /// sensor actually did (`docs/optic-daemon-capture-log.md` §3.2). A
+    /// failure to build the block is logged and skipped rather than failing
+    /// the capture: a JPEG without metadata still beats a lost frame.
+    fn encode_jpeg(
+        frame: &CapturedFrame,
+        quality: u8,
+        model: &str,
+        manual_white_balance: bool,
+    ) -> Result<Bytes, CameraError> {
+        let jpeg = encode_yuv420_jpeg(
             &frame.yuv,
             frame.still.width,
             frame.still.height,
             frame.still.stride,
             quality,
-        )
-        .map(Bytes::from)
-        .map_err(Into::into)
+        )?;
+        let metadata = ExifMetadata {
+            model: model.to_owned(),
+            width: frame.still.width,
+            height: frame.still.height,
+            date_time: exif_date_time(SystemTime::now()),
+            exposure_us: frame.exposure.exposure_us,
+            analogue_gain: frame.exposure.analogue_gain,
+            colour_gains: frame.exposure.colour_gains,
+            manual_white_balance,
+        };
+        match exif_app1(&metadata) {
+            Ok(segment) => Ok(Bytes::from(insert_exif(jpeg, &segment))),
+            Err(error) => {
+                warn!(%error, "failed to build EXIF metadata; writing JPEG without it");
+                Ok(Bytes::from(jpeg))
+            }
+        }
+    }
+
+    /// EXIF wants local civil time as `YYYY:MM:DD HH:MM:SS`. The daemon has
+    /// no timezone database dependency here, so this formats UTC, which is
+    /// unambiguous and matches the sidecar's unix milliseconds.
+    fn exif_date_time(at: SystemTime) -> String {
+        let seconds = i64::try_from(at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+            .unwrap_or_default();
+        chrono::DateTime::from_timestamp(seconds, 0)
+            .map(|stamp| stamp.format("%Y:%m:%d %H:%M:%S").to_string())
+            .unwrap_or_default()
     }
 
     fn publish_capture(
@@ -1109,7 +1179,14 @@ mod imp {
         let spec = request.profile.spec();
 
         let jpeg_started = Instant::now();
-        let jpeg = encode_jpeg(&frame, spec.jpeg_quality)?;
+        // `colour_gains` set means the operator fixed white balance for this
+        // capture; otherwise AWB chose it.
+        let jpeg = encode_jpeg(
+            &frame,
+            spec.jpeg_quality,
+            &frame.metadata.model,
+            request.settings.colour_gains.is_some() || request.settings.awb != "auto",
+        )?;
         info!(
             stage = "jpeg_encode",
             bytes = jpeg.len(),
@@ -1204,6 +1281,7 @@ mod imp {
             bytes,
             width: spec.width,
             height: spec.height,
+            exposure: Some(frame.exposure),
         })
     }
 

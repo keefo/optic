@@ -64,6 +64,14 @@ pub struct CaptureLogEntry {
     pub bytes: u64,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// What the camera *actually* did: the output frame's own metadata
+    /// (shutter, analogue gain, colour gains) and its brightness meter, as
+    /// opposed to `settings`, which is what was **requested**. `None` for a
+    /// failed capture or a backend that reports no metadata.
+    /// `#[serde(default)]` so sidecars and rows written before this field
+    /// existed still parse (`worklogs/2026-09-22-capture-exposure-metadata.md`).
+    #[serde(default)]
+    pub exposure: Option<crate::camera::CaptureExposure>,
 }
 
 impl CaptureLogEntry {
@@ -121,6 +129,7 @@ impl CaptureLogEntry {
             bytes,
             width,
             height,
+            exposure: outcome.as_ref().ok().and_then(|result| result.exposure),
         }
     }
 }
@@ -605,6 +614,71 @@ mod tests {
         dir
     }
 
+    fn exposure_sample() -> crate::camera::CaptureExposure {
+        crate::camera::CaptureExposure {
+            exposure_us: Some(626),
+            analogue_gain: Some(1.0),
+            colour_gains: Some([2.6337, 1.8228]),
+            meter: Some(crate::exposure_ramp::FrameMeter {
+                luminance: 0.071,
+                clipped_fraction: 0.004,
+                samples: 192_888,
+                grey_world: Some([0.08, 0.07, 0.06]),
+            }),
+        }
+    }
+
+    #[test]
+    fn an_entry_records_the_frames_actual_exposure_and_round_trips() {
+        let mut outcome = success_outcome("testshot-master-archive-7.jpg");
+        if let Ok(result) = outcome.as_mut() {
+            result.exposure = Some(exposure_sample());
+        }
+        let entry = CaptureLogEntry::new(
+            SystemTime::now(),
+            SystemTime::now(),
+            250,
+            CaptureProfile::MasterArchive,
+            CameraSettings::default(),
+            false,
+            &CaptureSource::WebUi,
+            &outcome,
+        );
+        let exposure = entry.exposure.expect("actual exposure recorded");
+        assert_eq!(exposure.exposure_us, Some(626));
+        assert_eq!(exposure.analogue_gain, Some(1.0));
+        assert_eq!(exposure.colour_gains, Some([2.6337, 1.8228]));
+        assert_eq!(exposure.meter.map(|meter| meter.samples), Some(192_888));
+
+        let json = serde_json::to_string(&entry).unwrap();
+        let parsed: CaptureLogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.exposure.unwrap().exposure_us, Some(626));
+
+        // A failed capture has no frame, so nothing to report.
+        let failed: Result<CaptureResult, CameraError> = Err(CameraError::Timeout);
+        let entry = CaptureLogEntry::new(
+            SystemTime::now(),
+            SystemTime::now(),
+            250,
+            CaptureProfile::MasterArchive,
+            CameraSettings::default(),
+            false,
+            &CaptureSource::WebUi,
+            &failed,
+        );
+        assert!(entry.exposure.is_none());
+    }
+
+    #[test]
+    fn a_sidecar_written_before_this_field_existed_still_parses() {
+        let legacy = r#"{"capture_id":"testshot-master-archive-1","source":"web_ui",
+            "requested_at_unix_ms":1,"completed_at_unix_ms":2,"duration_ms":1,
+            "profile":"master_archive","settings":{},"save_dng":false,"success":true,
+            "error":null,"files":[],"bytes":0,"width":4056,"height":3040}"#;
+        let parsed: CaptureLogEntry = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.exposure.is_none());
+    }
+
     fn success_outcome(filename: &str) -> Result<CaptureResult, CameraError> {
         Ok(CaptureResult {
             profile: CaptureProfile::MasterArchive,
@@ -615,6 +689,7 @@ mod tests {
             bytes: 1234,
             width: 4056,
             height: 3040,
+            exposure: None,
         })
     }
 

@@ -280,7 +280,7 @@ The dashboard does not expose a separate JPEG-quality override. Quality is part 
 * `GET /`: Serves the single-page application, loaded from disk on each request (see [Web Asset Loading](#web-asset-loading)).
 * `GET /{*asset}`: Serves any other file under the resolved asset directory by its relative path (e.g. `/app.js`, `/styles.css`, `/icons/favicon.ico`), confined to that directory (see [Web Asset Loading](#web-asset-loading)).
 * `GET /healthz`: Returns `200 OK` while the HTTP service is available.
-* `GET /api/status`: Returns version, uptime, IMX477 detection, camera ownership, stream state, RAM-stage queue usage, and `preview: { stopped, downsample }`.
+* `GET /api/status`: Returns version, uptime, IMX477 detection, camera ownership, stream state, RAM-stage queue usage, `preview: { stopped, downsample }`, and `exposure_plan` (the next scheduled frame's ramped exposure; `null` unless Scheduled exposure is on — `docs/optic-daemon-exposure-ramping.md` §10).
 * `POST /api/preview`: Updates the persisted preview state with a partial body, `{"stopped": bool}` and/or `{"downsample": bool}`, and returns the new state. Setting `stopped: true` also stops a running stream. Stored in `~/.local/state/optic-daemon/preview_state.json` (durable) with a tmpfs mirror, like `schedule_run_state.json`; a missing or corrupt file means defaults (running, full size).
 * `POST /api/stream/start`: Called automatically when the dashboard opens. Accepts camera `settings` plus `profile` and configures the persistent native camera for that profile's preview dimensions and sensor mode; the preview size comes from the persisted `downsample` flag. Returns `409 Conflict` if the camera is in use or the preview is stopped.
 * `POST /api/stream/reconfigure`: Accepts camera `settings` plus `profile` and serializes a native pipeline stop/reconfiguration/start. Returns `409 Conflict` if preview is not running.
@@ -292,6 +292,7 @@ The dashboard does not expose a separate JPEG-quality override. Quality is part 
 * `POST /api/sync/retry-now`: Clears any active backoff so the next scan attempts a transfer immediately, and returns the fresh sync status.
 * `POST /api/config/commit`, `POST /api/config/discard`: Commit or discard the staged `preview_config.json` (camera settings and scheduler rules) against the durable committed config.
 * `POST /api/config/save-dng`: Stages the companion-DNG preference for committed-config captures.
+* `POST /api/schedule/exposure`: Stages the dashboard's Scheduled exposure toggle and settings (`{"mode":"Dashboard"}` or `{"mode":"AutoRamp", …}`); out-of-range settings return 422. The stream start/reconfigure requests also accept an optional, never-staged `exposure_override` for the live preview (`docs/optic-daemon-exposure-ramping.md` §10).
 * `POST /api/schedule/pause`, `POST /api/schedule/resume`: Pause or resume `optic_scheduler`; the run state is durable across reboots.
 * `POST /api/schedule/preview`: Stages rule edits and returns upcoming occurrences plus advisories; invalid or duplicate slugs are rejected immediately (`docs/optic-daemon-scheduler.md`).
 * `GET /api/schedule/forecast`: Shot and storage/bandwidth forecast for the staged (or committed) rules, capped at one week.

@@ -142,6 +142,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/schedule/resume", post(schedule_resume))
         .route("/api/schedule/preview", post(schedule_preview))
         .route("/api/config/save-dng", post(stage_save_dng))
+        .route("/api/schedule/exposure", post(stage_schedule_exposure))
         .route("/api/schedule/forecast", get(schedule_forecast))
         .route("/api/captures", get(capture_history))
         .route("/api/system/status", get(system_status_handler))
@@ -402,6 +403,10 @@ struct StatusResponse {
     /// changes" indicator (Save/Discard button state) accordingly, instead
     /// of always assuming a clean load.
     config_staged: bool,
+    /// The next scheduled frame's exposure as of now, from the staged-or-
+    /// committed schedule; `null` in `Dashboard` mode
+    /// (`docs/optic-daemon-exposure-ramping.md` §10).
+    exposure_plan: Option<optic_scheduler::LiveExposurePlan>,
 }
 
 #[derive(Serialize)]
@@ -481,6 +486,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
     let camera = state.camera.status();
     let config_staged =
         config_is_staged(&state.preview_config_path, &state.config_cache_path).await;
+    let schedule = state.scheduler.status();
     let mut config = current_app_config(&state).await;
     // Every page polls this; the ntfy topic and token must never reach a
     // browser (docs/optic-daemon-digest-heartbeat.md §6.1).
@@ -504,7 +510,12 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusResponse>, A
             queued_bytes,
         },
         sync: state.sync.status(),
-        schedule: state.scheduler.status(),
+        exposure_plan: optic_scheduler::live_exposure_plan(
+            &config.schedule,
+            state.scheduler.ramp_state().as_ref(),
+            chrono::Utc::now(),
+        ),
+        schedule,
         config,
         preview: read_preview_state(&state.preview_state_cache_path).await,
         config_staged,
@@ -599,6 +610,10 @@ struct SchedulePreviewRequest {
     station: Option<optic_scheduler::Station>,
     #[serde(default)]
     rules: Vec<optic_scheduler::Rule>,
+    /// Omitted by clients that predate exposure ramping; the staged value
+    /// is then left as it was (`docs/optic-daemon-exposure-ramping.md` §4).
+    #[serde(default)]
+    exposure: Option<crate::exposure_ramp::ScheduleExposure>,
 }
 
 /// Stages rule edits into `preview_config.json`, the same file
@@ -617,9 +632,20 @@ async fn schedule_preview(
             message: format!("invalid schedule rule slugs: {error:?}"),
         });
     }
+    if let Some(crate::exposure_ramp::ScheduleExposure::AutoRamp(settings)) = &request.exposure
+        && let Err(message) = settings.validate()
+    {
+        return Err(AppError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("invalid scheduled exposure: {message}"),
+        });
+    }
     let mut config = current_app_config(&state).await;
     config.schedule.station = request.station;
     config.schedule.rules = request.rules;
+    if let Some(exposure) = request.exposure {
+        config.schedule.exposure = exposure;
+    }
     let serialized = serde_json::to_string_pretty(&config).map_err(|error| AppError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         message: error.to_string(),
@@ -660,6 +686,36 @@ async fn stage_save_dng(
     tokio::fs::write(&temp_path, serialized).await?;
     tokio::fs::rename(temp_path, &*state.preview_config_path).await?;
     Ok((StatusCode::OK, Json(Message::new("DNG preference staged"))))
+}
+
+/// Stages the dashboard's *Scheduled exposure* toggle and its settings
+/// (`docs/optic-daemon-exposure-ramping.md` §10), same staging pattern as
+/// `stage_save_dng`; the dashboard's Save Settings commits it.
+async fn stage_schedule_exposure(
+    State(state): State<AppState>,
+    Json(exposure): Json<crate::exposure_ramp::ScheduleExposure>,
+) -> Result<impl IntoResponse, AppError> {
+    if let crate::exposure_ramp::ScheduleExposure::AutoRamp(settings) = &exposure
+        && let Err(message) = settings.validate()
+    {
+        return Err(AppError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: format!("invalid scheduled exposure: {message}"),
+        });
+    }
+    let mut config = current_app_config(&state).await;
+    config.schedule.exposure = exposure;
+    let serialized = serde_json::to_string_pretty(&config).map_err(|error| AppError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: error.to_string(),
+    })?;
+    let temp_path = state.preview_config_path.with_extension("json.tmp");
+    tokio::fs::write(&temp_path, serialized).await?;
+    tokio::fs::rename(temp_path, &*state.preview_config_path).await?;
+    Ok((
+        StatusCode::OK,
+        Json(Message::new("scheduled exposure staged")),
+    ))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1626,6 +1682,7 @@ mod tests {
     const CAPTURE_HISTORY_HTML: &str = include_str!("web/capture-history.html");
     const CAPTURE_HISTORY_JS: &str = include_str!("web/capture-history.js");
     const FOCUS_TOOLS_JS: &str = include_str!("web/focus-tools.js");
+    const SCHEDULED_EXPOSURE_JS: &str = include_str!("web/scheduled-exposure.js");
     const FOOTER_PAGES: [(&str, &str); 4] = [
         ("index.html", INDEX_HTML),
         ("scheduler.html", include_str!("web/scheduler.html")),
@@ -1731,6 +1788,40 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_exposure_is_wired_into_the_dashboard() {
+        // Loaded before app.js, which calls its hooks.
+        let ramp = INDEX_HTML
+            .find("<script src=\"/scheduled-exposure.js\" defer></script>")
+            .expect("index.html loads scheduled-exposure.js");
+        let app = INDEX_HTML
+            .find("<script src=\"/app.js\" defer></script>")
+            .expect("index.html loads app.js");
+        assert!(ramp < app);
+        assert!(APP_JS.contains("window.OpticScheduledExposure?.previewOverride("));
+        assert!(APP_JS.contains("window.OpticScheduledExposure?.applyConfig(status.config)"));
+        assert!(APP_JS.contains("window.OpticScheduledExposure?.onStatus(status)"));
+        assert!(
+            APP_JS
+                .contains("window.OpticScheduledExposure?.onPreviewFrame(frameMetadata(headers))")
+        );
+        assert!(APP_JS.contains("window.OpticScheduledExposure?.clearPreview()"));
+        assert!(APP_JS.contains("\"scheduled-exposure-change\""));
+        let mut checked = 0;
+        for chunk in SCHEDULED_EXPOSURE_JS.split("$(\"#").skip(1) {
+            let id = chunk.split('"').next().expect("selector id");
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "index.html is missing #{id} used by scheduled-exposure.js"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 18,
+            "expected the scheduled-exposure element lookups, found {checked}"
+        );
+    }
+
+    #[test]
     fn embedded_assets_are_present() {
         assert!(INDEX_HTML.contains("Project Optic"));
         assert!(APP_JS.contains("/api/stream/start"));
@@ -1742,7 +1833,7 @@ mod tests {
         assert!(INDEX_HTML.contains("Capture profile"));
         assert!(APP_JS.contains("master_archive"));
         assert!(APP_JS.contains("${profile.previewFps} FPS"));
-        assert!(APP_JS.contains("White balance ${optionLabel(\"awb\", values.awb)}"));
+        assert!(APP_JS.contains("White balance ${awb}"));
         assert!(APP_JS.contains("Denoise ${optionLabel(\"denoise\", values.denoise)}"));
         assert!(APP_JS.contains("Analogue gain ${gain}"));
         assert!(INDEX_HTML.contains("Live preview starts automatically"));
@@ -2148,6 +2239,7 @@ mod tests {
             exposure_us: Some(12_500),
             analogue_gain: Some(2.5),
             colour_gains: Some([1.25, 1.5]),
+            meter: None,
         });
         let text = String::from_utf8(part.to_vec()).unwrap();
 

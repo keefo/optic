@@ -770,6 +770,7 @@ mod tests {
                 },
                 constraints: Constraints::default(),
             }],
+            ..ScheduleConfig::default()
         }
     }
 

@@ -27,6 +27,10 @@
 //   representation (`SolarEvent`/`LunarEvent`/`MilkyWayEvent` have no
 //   `#[serde(tag=...)]`, unlike `CelestialTarget`/`Trigger` which do).
 //   `direction` is one of "Rising"|"Setting"|"Both".
+// - `exposure` (ScheduleConfig.exposure) is edited on the Dashboard (the
+//   Scheduled exposure toggle, scheduled-exposure.js); this page only shows
+//   it and never sends it, so staging rules can't overwrite it —
+//   docs/optic-daemon-exposure-ramping.md §10.
 
 // One entry per named event per body: [wire value, label]. `degrees` marks
 // events needing the elevation/azimuth-degrees input; `direction` marks
@@ -142,6 +146,8 @@ const elements = {
   forecastStorageWarning: document.querySelector("#forecast-storage-warning"),
   forecastAdvisories: document.querySelector("#forecast-advisories"),
   forecastBody: document.querySelector("#forecast-body"),
+  exposureMode: document.querySelector("#exposure-mode"),
+  rampStatus: document.querySelector("#ramp-status"),
 };
 
 let rules = [];
@@ -208,6 +214,7 @@ async function loadInitial() {
     const status = await response.json();
     rules = status.config.schedule.rules || [];
     station = status.config.schedule.station || null;
+    renderExposureMode(status.config.schedule.exposure);
     // `config` reflects a staged-but-uncommitted preview when one exists
     // (see current_app_config on the backend), so a reload mid-edit must
     // not assume "clean" just because it succeeded — otherwise Save rules
@@ -242,6 +249,7 @@ function renderRunState(schedule) {
   } else {
     elements.lastCapture.textContent = "—";
   }
+  renderRampStatus(schedule.exposure);
   // One button, not two — its own label and target action flip with the
   // current state, rather than showing a disabled "Pause" next to an
   // enabled "Resume" (or vice versa) as two separate always-visible
@@ -803,6 +811,47 @@ elements.runToggleBtn.addEventListener("click", async () => {
     showNotice(`Failed to ${action}: ${error.message}`, "error");
   }
 });
+
+// --- Scheduled exposure (read-only here; edited on the Dashboard) ---
+
+function renderExposureMode(exposure) {
+  const autoRamp = exposure?.mode === "AutoRamp";
+  elements.exposureMode.textContent = autoRamp ? "Auto-ramp" : "Dashboard settings";
+  elements.exposureMode.className = `pill ${autoRamp ? "good" : "neutral"}`;
+}
+
+function formatShutter(us) {
+  if (us >= 1e6) {
+    return `${(us / 1e6).toFixed(1)} s`;
+  }
+  return `1/${Math.round(1e6 / us)} s`;
+}
+
+function renderRampStatus(snapshot) {
+  if (!snapshot) {
+    elements.rampStatus.textContent = "—";
+    return;
+  }
+  const parts = [new Date(snapshot.at).toLocaleTimeString()];
+  if (snapshot.seed) {
+    parts.push("seed (auto exposure/AWB)");
+  }
+  if (snapshot.exposure_us) {
+    parts.push(formatShutter(snapshot.exposure_us));
+  }
+  if (snapshot.analogue_gain) {
+    parts.push(`gain ${snapshot.analogue_gain.toFixed(2)}`);
+  }
+  if (snapshot.colour_gains) {
+    parts.push(`WB ${snapshot.colour_gains.map((gain) => gain.toFixed(2)).join("/")}`);
+  }
+  parts.push(`target ${snapshot.target_bias_ev.toFixed(1)} EV`);
+  if (snapshot.sun_elevation_deg !== null && snapshot.sun_elevation_deg !== undefined) {
+    parts.push(`sun ${snapshot.sun_elevation_deg.toFixed(1)}°`);
+  }
+  parts.push(`max ${formatShutter(snapshot.max_shutter_us)}`);
+  elements.rampStatus.textContent = parts.join(" · ");
+}
 
 updateTriggerFieldVisibility();
 void loadInitial();
