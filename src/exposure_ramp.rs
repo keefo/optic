@@ -164,7 +164,7 @@ impl RampSettings {
 }
 
 /// Brightness and colour of one captured frame (design doc §5.1).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub struct FrameMeter {
     /// Trimmed log-mean linear luminance, 0..1 (0.18 = mid-grey).
     pub luminance: f64,

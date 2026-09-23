@@ -41,6 +41,7 @@ mod imp {
             CaptureRequest, CaptureResult, CaptureSource, PreviewFrame, StreamRequest,
             format_rule_tags, still_frame_duration_limits_us,
         },
+        exif::{ExifMetadata, exif_app1, insert_exif},
         exposure_ramp::meter_yuv420,
         native_codec::{DngMetadata, decode_pisp_comp1, encode_bayer16_dng, encode_yuv420_jpeg},
     };
@@ -1123,16 +1124,51 @@ mod imp {
         Ok(output)
     }
 
-    fn encode_jpeg(frame: &CapturedFrame, quality: u8) -> Result<Bytes, CameraError> {
-        encode_yuv420_jpeg(
+    /// Encodes the frame and gives it EXIF metadata describing what the
+    /// sensor actually did (`docs/optic-daemon-capture-log.md` §3.2). A
+    /// failure to build the block is logged and skipped rather than failing
+    /// the capture: a JPEG without metadata still beats a lost frame.
+    fn encode_jpeg(
+        frame: &CapturedFrame,
+        quality: u8,
+        model: &str,
+        manual_white_balance: bool,
+    ) -> Result<Bytes, CameraError> {
+        let jpeg = encode_yuv420_jpeg(
             &frame.yuv,
             frame.still.width,
             frame.still.height,
             frame.still.stride,
             quality,
-        )
-        .map(Bytes::from)
-        .map_err(Into::into)
+        )?;
+        let metadata = ExifMetadata {
+            model: model.to_owned(),
+            width: frame.still.width,
+            height: frame.still.height,
+            date_time: exif_date_time(SystemTime::now()),
+            exposure_us: frame.exposure.exposure_us,
+            analogue_gain: frame.exposure.analogue_gain,
+            colour_gains: frame.exposure.colour_gains,
+            manual_white_balance,
+        };
+        match exif_app1(&metadata) {
+            Ok(segment) => Ok(Bytes::from(insert_exif(jpeg, &segment))),
+            Err(error) => {
+                warn!(%error, "failed to build EXIF metadata; writing JPEG without it");
+                Ok(Bytes::from(jpeg))
+            }
+        }
+    }
+
+    /// EXIF wants local civil time as `YYYY:MM:DD HH:MM:SS`. The daemon has
+    /// no timezone database dependency here, so this formats UTC, which is
+    /// unambiguous and matches the sidecar's unix milliseconds.
+    fn exif_date_time(at: SystemTime) -> String {
+        let seconds = i64::try_from(at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+            .unwrap_or_default();
+        chrono::DateTime::from_timestamp(seconds, 0)
+            .map(|stamp| stamp.format("%Y:%m:%d %H:%M:%S").to_string())
+            .unwrap_or_default()
     }
 
     fn publish_capture(
@@ -1143,7 +1179,14 @@ mod imp {
         let spec = request.profile.spec();
 
         let jpeg_started = Instant::now();
-        let jpeg = encode_jpeg(&frame, spec.jpeg_quality)?;
+        // `colour_gains` set means the operator fixed white balance for this
+        // capture; otherwise AWB chose it.
+        let jpeg = encode_jpeg(
+            &frame,
+            spec.jpeg_quality,
+            &frame.metadata.model,
+            request.settings.colour_gains.is_some() || request.settings.awb != "auto",
+        )?;
         info!(
             stage = "jpeg_encode",
             bytes = jpeg.len(),

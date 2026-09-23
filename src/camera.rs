@@ -432,7 +432,8 @@ pub struct CaptureResult {
 
 /// Request metadata of the output frame (the values libcamera used, not
 /// the ones requested) plus its brightness/colour meter.
-#[derive(Debug, Clone, Copy, Default, Serialize)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
+#[serde(default)]
 pub struct CaptureExposure {
     pub exposure_us: Option<i32>,
     pub analogue_gain: Option<f32>,

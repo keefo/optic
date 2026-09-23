@@ -223,6 +223,53 @@ its own backup/merge tooling — `VACUUM INTO`, or `ATTACH` + `INSERT
 SELECT`) but isn't required for the Pi-side query use case and isn't
 planned for the initial implementation.
 
+### 3.3 What the camera actually did (added 2026-09-22)
+
+`settings` records what was **requested**. Since 2026-09-22 each entry also
+carries `exposure`, read from the output frame's own libcamera metadata:
+
+```json
+"exposure": {
+  "exposure_us": 626,
+  "analogue_gain": 1.0,
+  "colour_gains": [2.6337, 1.8228],
+  "meter": { "luminance": 0.071, "clipped_fraction": 0.004,
+             "samples": 192888, "grey_world": [0.08, 0.07, 0.06] }
+}
+```
+
+`meter` is the same brightness measurement exposure ramping uses
+(`docs/optic-daemon-exposure-ramping.md` §5.1). The field is `null` for a
+failed capture, and `#[serde(default)]` keeps older sidecars and database
+rows parseable.
+
+**Why:** a frame in the 2026-09-22 run came out ~0.8 EV darker than its
+neighbours, and answering "did the camera use the exposure it was asked
+for?" required inspecting pixels, because the requested value was all that
+was recorded. The same values now also go into the JPEG's EXIF (below), so
+the question is answerable from the file itself.
+
+### 3.4 JPEG EXIF (added 2026-09-22)
+
+Captured JPEGs carry an `APP1`/EXIF block (`src/exif.rs`, spliced in after
+`SOI` by `native_camera::encode_jpeg`), so Finder, Preview, Lightroom,
+LRTimelapse and exiftool can read each frame:
+
+| Tag | Source |
+|---|---|
+| `ExposureTime` | the frame's metadata, in microseconds as a rational |
+| `ISOSpeedRatings` | analogue gain × 100, the same convention the DNG uses |
+| `DateTime`, `DateTimeOriginal`, `DateTimeDigitized` | capture time, UTC |
+| `Make`, `Model`, `Software`, `Orientation`, `ImageDescription` | fixed/sensor |
+| `ColorSpace`, `PixelXDimension`, `PixelYDimension` | sRGB and output size |
+| `WhiteBalance` | manual when the operator fixed it, auto otherwise |
+| `UserComment` | the colour gains actually applied |
+
+Unknown values are omitted rather than guessed: a frame whose metadata is
+missing simply has no `ExposureTime`/`ISOSpeedRatings`. If the block can't be
+built the capture still succeeds and the JPEG is written without it — a frame
+without metadata beats a lost frame. DNGs already carried the equivalent tags.
+
 ## 4. Decision: OverlayFS Phase 9 Compatibility
 
 This project's stated long-term design (`README.md`, `verify.sh` Phase 9)

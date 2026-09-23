@@ -1,6 +1,7 @@
 mod camera;
 mod durable_state;
 mod ephemeris;
+mod exif;
 mod exposure_ramp;
 mod native_camera;
 #[cfg(target_os = "linux")]
