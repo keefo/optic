@@ -20,6 +20,11 @@ Optic is an ultra-reliable, long-term timelapse system engineered around the Ras
 * **Focal Length & Aperture:** 6.0 mm, adjustable f/1.2 – f/16
 * **Field of View (FoV):** ~63° (horizontal)
 
+### Enclosure
+* **Design:** 3D-printable four-part outdoor box (base, lid, lens back, lens cover) — CAD source and print notes in [`case/`](case/README.md)
+* **Format:** STEP AP214 assembly (`case/pi5/step/pi-cam-case-assembly.step`), editable in Fusion, FreeCAD, Onshape and other CAD tools
+* **Licence:** CERN-OHL-S v2 (hardware design only; see `case/LICENSE-hardware.txt`)
+
 ### Networking & Access
 * **Hostname:** `optic.local`
 * **Remote Access:** OpenSSH (key-based authentication recommended)
