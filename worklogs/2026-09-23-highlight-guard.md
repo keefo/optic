@@ -3,7 +3,9 @@
 Status: **implemented and host-tested (Mac); not deployed, not
 hardware-validated, not user-accepted.** The test plan was written before any
 `src/` edit. On-Pi validation needs the user's approval and a deploy of `main`
-plus this branch (see "Proposed overnight comparison").
+plus this branch (see "Proposed overnight comparison"). Committed and opened
+as PR #18 (https://github.com/keefo/optic/pull/18) with the user's approval on
+2026-09-23; not merged.
 
 ## Objective
 
