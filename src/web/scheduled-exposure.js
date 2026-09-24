@@ -6,7 +6,9 @@
 // The pure functions at the top are exported for Node tests
 // (tests/web/scheduled-exposure.test.js). app.js calls the hooks on
 // window.OpticScheduledExposure and listens for the
-// "scheduled-exposure-change" event to refresh the live preview.
+// "scheduled-exposure-change" event (a user edit: re-request the preview and
+// refresh status) and "scheduled-exposure-preview-change" (plan- or
+// compare-driven: re-request the preview only).
 
 (() => {
   // Mirrors `RampSettings::default()` in src/exposure_ramp.rs.
@@ -96,11 +98,55 @@
     };
   }
 
-  // Caption fragment for the highlight guard (design doc §5.6): how much it
-  // is darkening the plan, or "" when it isn't.
-  function describeHighlightGuard(plan) {
-    const ev = plan?.highlight_ev ?? 0;
-    return ev <= -0.05 ? `highlight guard ${formatEv(ev)}` : "";
+  // What the preview runs for a ramped plan (design doc §5.7): the next frame
+  // with the highlight guard at its target, or without the guard while
+  // *hold to compare* is pressed. A daemon without these fields gets the
+  // plan itself, as before.
+  function previewSource(plan, compare = false) {
+    if (!plan || plan.seeding) return plan ?? null;
+    const setting = compare ? plan.preview_unguarded : plan.preview;
+    return setting ? { seeding: false, shutter_us: setting.shutter_us, gain: setting.gain } : plan;
+  }
+
+  // Smallest preview exposure change worth re-requesting the stream for.
+  // Each re-request moves the analogue gain, and at night the shadows'
+  // colour with it (worklog 2026-09-23, Part 3).
+  const PREVIEW_HYSTERESIS_EV = 1 / 6;
+
+  // Whether the preview must be re-requested to show `next` (a
+  // previewSource() result or null) when it last ran `lastSent`.
+  function previewNeedsUpdate(lastSent, next, thresholdEv = PREVIEW_HYSTERESIS_EV) {
+    if (!lastSent || !next) return lastSent !== next;
+    if (Boolean(lastSent.seeding) !== Boolean(next.seeding)) return true;
+    if (next.seeding) return false;
+    const log2 = (source) => Math.log2(source.shutter_us * source.gain);
+    return Math.abs(log2(next) - log2(lastSent)) > thresholdEv;
+  }
+
+  function formatPercent(fraction) {
+    const percent = fraction * 100;
+    return `${percent.toFixed(percent < 10 ? 2 : 1)}%`;
+  }
+
+  // The highlight guard line under the caption (design doc §5.7).
+  // `clippedFraction` is the latest preview frame's X-Optic-Clipped, or null.
+  function describeGuardLine(plan, budgetPercent, clippedFraction = null) {
+    if (!plan || plan.highlight_active === undefined) return "";
+    const clipped =
+      clippedFraction == null ? "" : ` · clipped now ${formatPercent(clippedFraction)}`;
+    if (!(budgetPercent > 0)) return `Highlight guard off (budget 0%)${clipped}`;
+    if (!plan.highlight_active) {
+      const sun =
+        plan.sun_elevation_deg == null
+          ? "no station set"
+          : `sun ${plan.sun_elevation_deg.toFixed(1).replace("-", "−")}°`;
+      return `Highlight guard inactive (${sun}); it acts only with the sun below the horizon${clipped}`;
+    }
+    return (
+      `Highlight guard · budget ${formatPercent(budgetPercent / 100)}${clipped}` +
+      ` · preview ${formatEv(plan.highlight_target_ev ?? 0)}` +
+      ` · timelapse ${formatEv(plan.highlight_ev ?? 0)}`
+    );
   }
 
   const pure = {
@@ -111,7 +157,9 @@
     formatShutter,
     formatEv,
     describePlan,
-    describeHighlightGuard,
+    previewSource,
+    previewNeedsUpdate,
+    describeGuardLine,
   };
 
   if (typeof module !== "undefined" && module.exports) {
@@ -138,6 +186,8 @@
     smoothing: $("#ramp-smoothing"),
     minShutter: $("#ramp-min-shutter"),
     clipBudget: $("#ramp-clip-budget"),
+    guardLine: $("#ramp-guard-line"),
+    compare: $("#ramp-compare"),
     shutterLive: $("#shutter-ramp-value"),
     gainLive: $("#gain-ramp-value"),
     shutter: $("#shutter"),
@@ -159,10 +209,16 @@
 
   let exposure = { mode: "Dashboard" };
   let plan = null;
-  let lastPlanKey = "null";
   let lastShown = null;
   let previewShortfallEv = 0;
   let previewMetadata = null;
+  let clippedFraction = null;
+  let comparing = false;
+  // The preview source the running stream was last requested with.
+  let lastSentSource = null;
+  let guardLineAt = 0;
+  // The guard line follows every preview frame; refresh it at most this often.
+  const GUARD_LINE_MIN_INTERVAL_MS = 500;
   // Live preview values can change several times a second; pulse at most
   // this often per field.
   const PULSE_MIN_INTERVAL_MS = 2000;
@@ -238,6 +294,7 @@
     }
     lastShown = shown;
     ui.caption.textContent = captionFor(plan);
+    renderGuardLine();
   }
 
   function captionFor(current) {
@@ -260,12 +317,38 @@
       previewShortfallEv >= 0.1
         ? ` · preview ≈ ${previewShortfallEv.toFixed(1)} EV darker than the frame (preview frames are shorter)`
         : "";
-    const guard = describeHighlightGuard(current);
-    return `Next scheduled frame · ${target}${guard ? ` · ${guard}` : ""} · shutter cap ${formatShutter(current.max_shutter_us)}${learned}${darker}`;
+    return `Next scheduled frame · ${target} · shutter cap ${formatShutter(current.max_shutter_us)}${learned}${darker}`;
   }
 
+  function renderGuardLine() {
+    guardLineAt = Date.now();
+    if (!ui.guardLine) return;
+    const text = autoRamp()
+      ? describeGuardLine(plan, rampSettings().clip_budget_percent, clippedFraction)
+      : "";
+    ui.guardLine.textContent = comparing && text ? `Comparing without the guard · ${text}` : text;
+    ui.guardLine.hidden = !text;
+    if (ui.compare) ui.compare.hidden = !text || !plan || plan.seeding;
+  }
+
+  function setComparing(next) {
+    if (comparing === next) return;
+    comparing = next;
+    ui.compare?.setAttribute("aria-pressed", String(comparing));
+    renderGuardLine();
+    notifyPreviewChange();
+  }
+
+  // A user edit: re-request the preview and refresh status straight away.
   function notifyChange() {
     document.dispatchEvent(new CustomEvent("scheduled-exposure-change"));
+  }
+
+  // A plan- or compare-driven change: re-request the preview only. Refreshing
+  // status here fed back into onStatus and re-requested the stream at
+  // network speed (worklog 2026-09-23, Part 3).
+  function notifyPreviewChange() {
+    document.dispatchEvent(new CustomEvent("scheduled-exposure-preview-change"));
   }
 
   async function stage(next) {
@@ -308,6 +391,33 @@
       ui.toggle.checked ? { mode: "AutoRamp", ...rampSettings() } : { mode: "Dashboard" },
     );
   });
+  // Hold to compare: the preview drops the highlight guard while pressed.
+  if (ui.compare) {
+    ui.compare.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      setComparing(true);
+      // Keeps the release on this button even if the pointer slides off.
+      // Best effort: compare must work even where capture is refused.
+      try {
+        ui.compare.setPointerCapture(event.pointerId);
+      } catch (_) {
+        // Released by pointerup/pointercancel/blur instead.
+      }
+    });
+    for (const type of ["pointerup", "pointercancel", "lostpointercapture", "blur"]) {
+      ui.compare.addEventListener(type, () => setComparing(false));
+    }
+    ui.compare.addEventListener("keydown", (event) => {
+      if ((event.key === " " || event.key === "Enter") && !event.repeat) {
+        event.preventDefault();
+        setComparing(true);
+      }
+    });
+    ui.compare.addEventListener("keyup", (event) => {
+      if (event.key === " " || event.key === "Enter") setComparing(false);
+    });
+  }
+
   for (const [input, field, , toWire] of fields) {
     input.addEventListener("input", updateSliderLabels);
     input.addEventListener("change", () => {
@@ -330,10 +440,8 @@
   function onStatus(status) {
     plan = autoRamp() ? (status.exposure_plan ?? null) : null;
     renderPlan();
-    const key = plan ? JSON.stringify([plan.seeding, plan.shutter_us, plan.gain]) : "null";
-    if (key !== lastPlanKey) {
-      lastPlanKey = key;
-      notifyChange();
+    if (previewNeedsUpdate(lastSentSource, previewSource(plan, comparing))) {
+      notifyPreviewChange();
     }
   }
 
@@ -342,18 +450,24 @@
   // override, whose values aren't the ones the scheduled frame will use.
   function onPreviewFrame(metadata) {
     previewMetadata = metadata?.exposureUs > 0 ? metadata : null;
+    clippedFraction = Number.isFinite(metadata?.clippedFraction) ? metadata.clippedFraction : null;
     if (autoRamp() && plan?.seeding) renderPlan();
+    else if (Date.now() - guardLineAt >= GUARD_LINE_MIN_INTERVAL_MS) renderGuardLine();
   }
 
   // Called when the preview stops, so stale values aren't shown.
   function clearPreview() {
     previewMetadata = null;
+    clippedFraction = null;
     if (autoRamp() && plan?.seeding) renderPlan();
+    else renderGuardLine();
   }
 
   // The preview-only override for the next stream request (or null).
   function previewOverride(previewFps) {
-    const equivalent = previewEquivalent(autoRamp() ? plan : null, previewFps);
+    const source = autoRamp() ? previewSource(plan, comparing) : null;
+    lastSentSource = source;
+    const equivalent = previewEquivalent(source, previewFps);
     previewShortfallEv = equivalent?.shortfall_ev ?? 0;
     if (!equivalent) return null;
     const { shortfall_ev: _shortfall, ...override } = equivalent;

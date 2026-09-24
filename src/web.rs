@@ -1392,7 +1392,7 @@ fn mjpeg_part(frame: PreviewFrame) -> Bytes {
     let mut part = BytesMut::with_capacity(frame.jpeg.len() + 256);
     part.extend_from_slice(
         format!(
-            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Optic-Sequence: {}\r\nX-Optic-Control-Revision: {}\r\nX-Optic-AE-State: {}\r\nX-Optic-AWB-State: {}\r\nX-Optic-Exposure-Us: {}\r\nX-Optic-Analogue-Gain: {}\r\nX-Optic-Colour-Gains: {}\r\n\r\n",
+            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Optic-Sequence: {}\r\nX-Optic-Control-Revision: {}\r\nX-Optic-AE-State: {}\r\nX-Optic-AWB-State: {}\r\nX-Optic-Exposure-Us: {}\r\nX-Optic-Analogue-Gain: {}\r\nX-Optic-Colour-Gains: {}\r\nX-Optic-Clipped: {}\r\n\r\n",
             frame.jpeg.len(),
             frame.sequence,
             frame.control_revision,
@@ -1404,6 +1404,9 @@ fn mjpeg_part(frame: PreviewFrame) -> Bytes {
                 .colour_gains
                 .map(|gains| format!("{},{}", gains[0], gains[1]))
                 .unwrap_or_else(|| "unavailable".to_owned()),
+            // The daemon meter's clipped fraction: what the highlight guard
+            // sees (docs/optic-daemon-exposure-ramping.md §5.7).
+            optional_header(frame.meter.map(|meter| meter.clipped_fraction)),
         )
         .as_bytes(),
     );
@@ -2247,6 +2250,29 @@ mod tests {
         assert!(text.contains("X-Optic-Sequence: 42\r\n"));
         assert!(text.contains("X-Optic-Control-Revision: 7\r\n"));
         assert!(text.contains("X-Optic-Exposure-Us: 12500\r\n"));
+        assert!(text.contains("X-Optic-Clipped: unavailable\r\n"));
         assert!(text.ends_with("\r\n\r\njpeg\r\n"));
+    }
+
+    #[test]
+    fn mjpeg_part_carries_the_clipped_fraction() {
+        let part = mjpeg_part(PreviewFrame {
+            jpeg: Bytes::from_static(b"jpeg"),
+            sequence: 1,
+            control_revision: 1,
+            ae_state: None,
+            awb_state: None,
+            exposure_us: None,
+            analogue_gain: None,
+            colour_gains: None,
+            meter: Some(crate::exposure_ramp::FrameMeter {
+                luminance: 0.04,
+                clipped_fraction: 0.0265,
+                samples: 1000,
+                grey_world: None,
+            }),
+        });
+        let text = String::from_utf8(part.to_vec()).unwrap();
+        assert!(text.contains("X-Optic-Clipped: 0.0265\r\n"));
     }
 }

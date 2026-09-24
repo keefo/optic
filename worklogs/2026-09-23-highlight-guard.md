@@ -1,7 +1,8 @@
 # Dated Worklog: 2026-09-23 - Highlight Guard (Clipping Budget) for the Exposure Ramp
 
-Status: **implemented and host-tested (Mac); not deployed, not
-hardware-validated, not user-accepted.** The test plan was written before any
+Status: **implemented, host-tested (Mac), and deployed to the Pi on
+2026-09-23 20:27 PDT (branch build, still 0.1.31); overnight validation
+pending; not user-accepted.** The test plan was written before any
 `src/` edit. On-Pi validation needs the user's approval and a deploy of `main`
 plus this branch (see "Proposed overnight comparison"). Committed and opened
 as PR #18 (https://github.com/keefo/optic/pull/18) with the user's approval on
@@ -320,4 +321,438 @@ brighter than the unguarded run at any frame.
 2. After an approved deploy, while the guard is active, the caption shows
    "highlight guard −x EV" at night.
 3. Review the overnight footage for lamp bloom.
+
+## Deploy (2026-09-23, user-requested: "now please build and deploy")
+
+- What was deployed: branch `highlight-guard` at `9e81009` (= `main` 3b8cd1a +
+  the guard). PR #18 is **not merged**, and the version is **not bumped**, so
+  the Pi still reports `0.1.31`. The guard build is identified by the
+  `exposure_plan.highlight_ev` field in `/api/status`.
+- Command: `scripts/build-deploy-optic-daemon.sh` (full path) from the Mac
+  worktree. Exit 0. The script's on-Pi gates all passed: Biome, `cargo fmt
+  --check`, `cargo test --locked --all-targets` (4 + 251 passed),
+  strict Clippy, and the release build (1 m 34 s). It installed with rollback
+  protection and printed `SUCCESS: optic-daemon 0.1.31 is active`.
+- The service was stopped for the build from about 20:24 to 20:27:42 PDT, so
+  the every-minute timelapse has a gap of about 3–4 frames there. `NRestarts=0`.
+- Observed after the restart, read-only:
+  - `/api/status`: `exposure_plan.highlight_ev: 0.0` and
+    `config.schedule.exposure.clip_budget_percent: 1.0`. The ramp is not
+    seeding; it was already seeded by preview frames.
+  - Scheduled captures at 20:28:07 and 20:29:06 succeeded and were ramped
+    (0.88 s and 0.79 s, gain 1.0, sun −13.9°).
+  - The synced sidecar `…1790220546688.log.json` records the actual exposure
+    (786,285 µs against 786,907 µs requested) and the daemon's own meter:
+    `clipped_fraction` 0.645%. That is inside the hold band (0.5–1%), so
+    `H = 0` is the expected state; last night at this hour it was 0.4–0.7%.
+- Still to do: the overnight comparison (see above). Pulls, if any, appear in
+  `journalctl -u optic-daemon | grep "highlight guard"`.
+
+
+## Part 2: making the budget visible in the live preview (2026-09-23)
+
+Status: **implemented, host-tested (Mac), deployed to the Pi on
+2026-09-23 20:46 PDT (uncommitted working tree, still 0.1.31), and verified
+live at night in a browser tab (see "Part 2 on the Pi"); not user-accepted.** The
+test plan was written before any `src/` edit for Part 2.
+
+**Why.** After the deploy, the user asked whether the Highlight clip budget
+shows in the preview. It did not, or not usefully: the guard moved only on
+scheduled captures, once a minute, and never while the scheduler was paused. User: "if a feature can not
+preview the see the impact, it is useless." Of the ideas brainstormed, the user chose all four
+(question tool): (1) the preview uses the guard's target, (2) a clipping
+overlay, (3) a live readout, (4) hold-to-compare. Design:
+`docs/optic-daemon-exposure-ramping.md` §5.7.
+
+**Facts checked before designing.** The preview is MJPEG decoded into an `<img>`.
+Focus tools already paint an overlay canvas from each decoded frame
+(`focus-tools.js`). Every preview frame is already metered on the Pi
+(`PreviewFrame.meter`), but only exposure, gain and colour gains reach the
+browser (`X-Optic-*` headers, `web.rs::mjpeg_part`). The dashboard polls
+`/api/status` every 3 s, and staging an exposure change triggers an immediate
+refresh (`app.js` `scheduled-exposure-change`). The preview override is
+recomputed when the plan key changes.
+
+**Scope note.** Beyond the files listed for this track, Part 2 also touches
+`src/web.rs` (one header), `src/web/app.js` (reading it, plus the compare
+button wiring), `src/web/focus-tools.js` (the Clipping tool), and
+`src/web/index.html` (buttons and the guard line). Capture behaviour (§5.6
+`H`) is unchanged.
+
+### Acceptance criteria
+
+P1. **The budget moves the preview without a capture.** With a fixed ramp
+    state (no new frames), changing `clip_budget_percent` changes
+    `highlight_target_ev` and `LiveExposurePlan.preview` on the next status
+    call.
+P2. **Target formula and gates.** `H* = clamp(log2(budget) − ĉ − min(u, E_max),
+    −3, 0)`. It is 0 with the sun ≥ 0°, without a station, with budget 0, or
+    without a clip estimate. It is never above 0, and `preview` is never brighter than
+    `preview_unguarded`.
+P3. **What learns.** `ĉ` learns from captures and preview frames, normalised
+    by the actual exposure (a frame exposed 1 EV differently with the
+    correspondingly scaled clipping gives the same `ĉ`). Preview frames
+    still leave `H`, `last_pull_ev`, `previous_excess_ev` and
+    `planned_log2_exposure` alone.
+P4. **Preview closed loop converges.** With a simulated preview loop, where each
+    iteration measures clipping at the preview exposure with a true slope of
+    0.8, 1.0 or 1.2 doublings per EV, clipping converges to within ±20% of the budget
+    within 8 iterations and stays there. With lamp cores that always clip
+    (a floor above the budget), it stops at −3 EV and never goes below it.
+P5. **Captures unchanged.** All Part 1 guard tests and the 2026-09-22 replay
+    pass unchanged.
+P6. **API.** `LiveExposurePlan` gains `preview`, `preview_unguarded`,
+    `highlight_target_ev` and `highlight_active`. The JS override uses
+    `preview`, falls back to the plan for an older daemon, and uses
+    `preview_unguarded` while compare is held. A change of either value or of the
+    compare state re-requests the stream.
+P7. **Readout.** `X-Optic-Clipped` is on every MJPEG part. The guard line
+    formats active, inactive (sun) and off states, and the live clipped
+    percentage.
+P8. **Overlay.** The *Clipping* tool marks exactly the pixels whose BT.601
+    luma ≥ 250 (pure function, tested), and toggles like the other tools.
+P9. `cargo fmt --check`, `cargo test --locked`, `cargo clippy --locked
+    --all-targets -- -D warnings`, `node --test tests/web/*.test.js`, and
+    Biome 2.5.14 `ci` pass.
+P10. **On the Pi** (after an approved deploy): changing the budget visibly changes
+    the preview brightness at night within a few seconds; hold-to-compare
+    shows the bloom; the overlay and readout agree with the frame.
+
+### Test plan (written before implementation)
+
+Rust (`src/exposure_ramp.rs`):
+
+1. `clip_estimate_is_normalised_by_actual_exposure` (P3).
+2. `preview_frames_learn_the_clip_estimate_but_not_the_capture_guard` (P3;
+   extends the Part 1 preview test).
+3. `highlight_target_follows_the_budget_without_new_frames` (P1, P2).
+4. `highlight_target_is_zero_when_the_guard_cannot_act` (P2): sun ≥ 0,
+   no station, budget 0, no estimate.
+5. `preview_plans_bracket_the_capture_plan` (P2, P6): `preview` ≤
+   `preview_unguarded`; equal to the plan when `H* = H = 0`.
+6. `simulated_preview_loop_converges_to_the_budget` (P4): slopes 0.8, 1.0 and 1.2,
+   plus a clipping floor case.
+7. The existing Part 1 tests and the replay, unchanged (P5).
+
+Rust (`src/optic_scheduler.rs`): extend the `live_exposure_plan` test for
+the new fields (P6). `src/web.rs`: extend the MJPEG part test for
+`X-Optic-Clipped` (P7).
+
+Node (`tests/web/`): `describeGuardLine` states (P7); preview override
+source selection including compare and fallback (P6); `clippedMask` on
+synthetic RGBA with BT.601 threshold edges (P8).
+
+Target environment: the Mac for all of the above, then the Pi at night for P10
+(deploy needs user approval).
+
+### Part 2 implementation
+
+- `src/exposure_ramp.rs`: `HighlightGuard.clip_scene_ev` (the smoothed,
+  budget-independent clip estimate), learned from every frame by `observe`
+  and `observe_preview`. It survives a budget-0 guard reset and is floored at
+  1e-4. `highlight_target_ev` (`H*`). `ExposureSetting`, `PreviewPlans`,
+  `preview_plans` (`preview = clamp(E_plan − H + H*)`, `unguarded =
+  clamp(E_plan − H)`). `plan` is refactored onto `ExposureLimits` and
+  `unguarded_log2_exposure` with the same arithmetic; all Part 1 tests and
+  the replay pass unchanged. The capture guard's `H` logic is untouched.
+- `src/optic_scheduler.rs`: `LiveExposurePlan.highlight_target_ev`,
+  `highlight_active`, `preview` and `preview_unguarded`.
+- `src/web.rs`: the `X-Optic-Clipped` MJPEG part header.
+- `src/web/app.js`: `frameMetadata().clippedFraction`.
+- `src/web/scheduled-exposure.js`: `previewSource` (target, compare, or a
+  fallback for an older daemon) feeds the preview override. The plan key also
+  covers the preview plans. `describeGuardLine` renders the guard line,
+  refreshed at most every 500 ms from preview frames. Hold-to-compare works
+  with the pointer (captured) and with Space/Enter. The Part 1
+  `describeHighlightGuard` caption fragment is replaced by the guard line.
+- `src/web/focus-tools.js`: the `clippedMask` pure function and the
+  *Clipping* toggle, drawing zebra stripes on the shared overlay canvas.
+- `src/web/index.html` and `styles.css`: the Clipping button, the guard
+  line and the compare button.
+- Docs: `docs/optic-daemon-exposure-ramping.md` §5.6 (a pointer to the new
+  section), the new §5.7, and a §10 bullet. `docs/optic-daemon-focus-tools.md`
+  gets the controls list, the function table and a new §3.3.1.
+
+A mistake caught in review, before any run: the first draft of the
+`live_exposure_plan` test extension had a tautological assertion. It was
+replaced with the real property (no clip estimate → `preview ==
+preview_unguarded`).
+
+### Part 2 validation (Mac)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo test --locked` | pass: 262 (Part 1 had 256; `exposure_ramp` 36, all Part 1 tests unchanged, replay included) |
+| `cargo clippy --locked --all-targets -- -D warnings` | pass |
+| `node --test tests/web/*.test.js` | pass: 29 |
+| `npx @biomejs/biome@2.5.14 ci` | pass: 13 files, no fixes |
+| Browser check of the new controls | **not run**: there is no local camera, so it needs the Pi |
+| P10 on the Pi at night | **not run**: needs deploy approval |
+
+New or changed tests: `clip_estimate_is_normalised_by_actual_exposure`
+(P3), `highlight_target_follows_the_budget_without_new_frames` (P1/P2: 1% →
+−1.406 EV and 0.5% → −2.406 EV at 2.65%; 0.1% hits the floor; the preview moves
+1.406 EV between budgets with no new frame),
+`highlight_target_is_zero_when_the_guard_cannot_act` (P2),
+`preview_plans_bracket_the_capture_plan` (P2/P6),
+`simulated_preview_loop_converges_to_the_budget` (P4: slopes 0.8/1.0/1.2 ×
+shortfall 0/0.8 EV all within ±20% of the budget from iteration 8 to 20;
+2% lamp-core floor → stops at −3 EV), `preview_frames_leave_the_guard_alone`
+(now also checks that the estimate learns), `live_exposure_plan` (P6),
+`mjpeg_part_carries_the_clipped_fraction` and the header in the existing
+part test (P7). Node: `previewSource`, `describeGuardLine` (P6/P7), and
+`clippedMask` threshold edges at Y = 248.7 and 250.4 (P8).
+
+### Part 2 limitations
+
+- The preview target and the timelapse `H` converge to the same goal by
+  different routes (a solver versus rate-limited steps with a hold band), so they can differ by
+  up to about the hold band (≈ 1 EV) until clipping settles. The guard line shows both.
+- The preview meters at lower resolution than a still, which is not yet
+  measured on the Pi (P10). If the preview reads systematically lower, the
+  target will be too bright relative to the timelapse.
+- The overlay runs on the ≤ 960 px working copy. The daemon's number is
+  authoritative.
+- As before, every status poll that changes the preview plan re-requests
+  the stream, and the target adds one more source of such changes.
+
+### Part 2 on the Pi (2026-09-23, user-approved "deploy now + verify live")
+
+**Deploy.** Ran `scripts/build-deploy-optic-daemon.sh` from the worktree
+(uncommitted Part 2 changes). Exit 0. On-Pi gates: Biome, fmt, `cargo test`
+(257 passed in the main binary), strict Clippy, release build. It printed
+`SUCCESS`. The daemon was down from 20:43:46 to 20:46:40 PDT, so the
+timelapse lost about 3 frames. Afterwards `/api/status` exposed `highlight_active`,
+`highlight_target_ev`, `preview` and `preview_unguarded`. Scheduled captures
+continued (for example 20:51:07, success).
+
+**Live check** (Chrome automation tab on `http://optic.local:8000/`, sun
+about −17°, Master Archive preview downsampled to 8 fps):
+
+| P | Observed |
+|---|---|
+| P7 header | A raw MJPEG part carried `X-Optic-Clipped: 0.004496…` (0.45%) |
+| P7 readout | Guard line: "Highlight guard · budget 1.00% · clipped now 0.53% · preview 0.0 EV · timelapse 0.0 EV". A target of 0 is correct: tonight is under the 1% budget |
+| P1 budget → preview | Setting 0.25% in the Advanced field moved `highlight_target_ev` to −0.96 EV and `preview` to 0.356 s (against 0.692 s unguarded) within 1.5 s, with no captured frame in between |
+| P10 convergence | The live readout then showed clipped 0.23–0.30% at a 0.25% budget, and the target settled at −0.69 to −0.81 EV as the scene changed. The room-light reflections visible in the window went on and off during the test, and the unguarded exposure moved from 0.69 s to 1.07 s |
+| P6/P10 compare | Space held on *Hold to compare*: `aria-pressed=true`; the camera's frames went to 1.58× the exposure (+0.66 EV), clipped 0.27% → 0.61%. After release: `aria-pressed=false`, and the frames returned to the guarded side (0.40 s, 0.16%) |
+| P8/P10 overlay | *Clipping* on: red zebra marks on the store entrance, the parking-lot floodlights and the lamp posts, the areas that bloomed on 2026-09-22 |
+
+**Findings and caveats from the live check:**
+
+- **The automation tab was hidden** (`visibilityState: hidden`, 0 rAF
+  callbacks/s). `renderMjpegFrame` awaits two animation frames before calling
+  the frame hooks, so in a hidden tab the guard line, the overlay and the
+  clipped readout only updated while a screenshot was being taken. The hidden tab's timer
+  throttling also delayed the 3 s status poll. That explains an observed gap
+  of 0.8× between the planned preview and the frames' actual exposure: the UI's
+  override (535k µs) was about 0.96× the latest plan (559k µs), and the rest
+  was stream lag. This is existing dashboard behaviour, not caused by this change. It is
+  **not verified that a visible dashboard tracks the plan within one poll**;
+  that is left to the user.
+- **The pointer path of hold-to-compare was not exercised** (only the keyboard
+  path). A review of it found that `setPointerCapture` ran *before*
+  `setComparing(true)`, so a refused capture would have stopped compare
+  from engaging. **Fixed after the deploy** (compare first, capture as best effort).
+  Node 29/29 and Biome pass. **This fix is not deployed.**
+- The budget was restored to exactly 1% afterwards. The staged exposure settings are
+  identical to before (`config_staged` was already true from edits that
+  aren't ours). Closing the automation tab stopped the camera preview through
+  `pagehide` → `/api/stream/stop`. Scheduled captures are unaffected.
+- A probe of a nonexistent `/api/config` route logged one harmless `ERROR
+  failed to load web asset … api/config` at 20:51:15.
+- The preview-to-still clipped-fraction ratio (a Part 2 limitation) is still
+  unmeasured.
+
+
+## Part 3: Scheduled exposure preview hunts, and its colour shifts (2026-09-23)
+
+Status: **implemented, host-tested (Mac), deployed to the Pi on 2026-09-23
+23:52 PDT (uncommitted working tree, still 0.1.31), and verified on the camera
+for Q7 (see below); not user-accepted.** The test plan was written before any
+`src/` edit for Part 3.
+
+**Report (user, about 21:55).** With *Scheduled exposure* on, the live preview's
+colour keeps shifting "like WB is changing": warmer when the Shutter field
+drops to about 600 ms, cooler at 700–800 ms. Unchecking Scheduled exposure
+stops it. The user identified it as a Scheduled exposure bug, not a
+clip-budget one, and chose to fix it on this branch.
+
+**Evidence** (a 40 s recording of the live MJPEG stream as a second
+read-only viewer; 319 frames; Master Archive preview downsampled to 8 fps,
+AWB preset Daylight, Denoise Auto, sun −27°):
+
+- **Not white balance.** `X-Optic-Colour-Gains` was identical in all 319
+  frames (3.2061546, 1.4414065).
+- **The exposure never settles.** Shutter was fixed at 118,745 µs (frame-time
+  limited), and analogue gain took **40 distinct values between 5.22 and
+  6.87** (0.40 EV peak to peak, sd 0.12 EV). **86 control revisions in 40 s**:
+  the dashboard re-requested the stream about every 0.47 s.
+- **Colour follows gain.** Frame R/G ranged 1.08–1.41 and B/G 0.40–0.49,
+  with corr(gain, B/G) = 0.81 and corr(gain, R/G) = 0.67. Higher gain looked
+  cooler, which matches the report. The shift is in the shadows: R/G of the
+  darker half ranged 0.98–1.76 (sd 0.18), while the brightest 5% held at
+  1.04–1.14 (sd 0.02).
+- **Root cause of the hunting.** The per-frame scene estimate `log2 L − log2(e·g)`
+  was not exposure-invariant at these gains: corr(scene_ev, log2 e·g) =
+  **0.93**, with a range of 0.48 EV over 0.40 EV of exposure (≈ 1.2 EV of
+  apparent scene change per EV of gain). A higher preview gain makes the scene
+  read brighter, so the plan asks for less, and the reverse. Preview frames update
+  the estimate at frame rate with weight 1 − smoothing = 0.5, so the loop
+  gain is above 1 and it oscillates.
+- **An amplifier.** `onStatus` calls `notifyChange` whenever the plan's
+  shutter/gain (Part 2: also the preview plans) changes, and `app.js`'s
+  `scheduled-exposure-change` handler calls `refreshStatus()` straight away.
+  The new plan differs again, so the dashboard re-requests at network round-trip rate
+  instead of once per 3 s poll. This loop is in the PR #16 code (the key
+  was `[seeding, shutter_us, gain]`); Part 2 only added fields to the key.
+- Why the colour moves with gain: most likely the sensor/ISP rendering of
+  near-black at different analogue gains (noise floor, black level, gain-
+  dependent colour denoise). This has not been isolated. With a stable exposure it no
+  longer flickers; it only changes when the exposure really changes.
+- Stills are not affected in the same way: on 2026-09-22 the captured scene estimate
+  held at about −26.2 across 3.1–4.2 s at gain 1.
+
+### Acceptance criteria
+
+Q1. **Time-based preview learning.** `observe_preview` blends the scene and
+    clip estimates by `1 − exp(−Δt / 5 s)`, where Δt is the time since the state
+    was last updated (clamped to 0 or more). A burst of frames at 8 fps moves the
+    estimate by the same amount as one frame after the same total time, within 1%.
+    Captures (`observe`) keep per-frame `smoothing` and are unchanged.
+Q2. **The loop converges.** A simulation with the measured bias (the scene
+    reads 1.2 EV brighter per EV of preview exposure), a 3 s poll and
+    8 fps frames settles: after 60 s the planned preview exposure moves less than 1/6 EV
+    between polls, and the peak-to-peak swing over the last 30 s is below 1/6 EV. The
+    same simulation with the old per-frame learning keeps a swing of ≥ 1/3 EV
+    (a regression guard that shows the test detects the bug).
+Q3. **No re-request storm.** A plan-driven change re-requests the stream
+    without an immediate extra status fetch. User edits (the toggle,
+    settings) still refresh status immediately, so a budget change still shows
+    within about 1 s.
+Q4. **Hysteresis.** A new preview exposure is sent (a controls-only
+    `/api/stream/reconfigure`, with no pipeline restart) only when the preview source
+    changes seeding state, or its exposure differs from the last one sent by more
+    than 1/6 EV. Compare press and release always send.
+Q5. All Part 1 and Part 2 tests pass; some Part 2 tests only need their frame
+    timestamps advanced, and no assertion is weakened.
+Q6. fmt, test, clippy, Node and Biome pass.
+Q7. **On the Pi, at night** (needs a deploy): over 40 s of recorded preview,
+    control revisions ≪ 86 and the gain spread ≪ 0.40 EV, with no visible colour
+    pumping.
+
+### Test plan (written before implementation)
+
+- Rust: `preview_learning_is_time_based` (Q1),
+  `preview_loop_with_gain_dependent_metering_settles` (Q2, including the
+  old-behaviour guard), and updated Part 1/2 preview tests (Q5).
+- Node: `previewNeedsUpdate` (Q4). The event split (Q3) is covered by code
+  review and the on-Pi recording (Q7): it is browser wiring without a pure seam.
+- Pi: repeat the 40 s MJPEG recording and analysis after an approved deploy
+  (Q7).
+
+### Part 3 implementation
+
+- `src/exposure_ramp.rs`: `PREVIEW_LEARNING_TIME_CONSTANT_S = 5.0`.
+  `observe_preview` blends the scene and clip estimates by `1 − e^(−Δt/τ)`, with Δt
+  measured from `state.updated_at` and clamped to 0 or more. `observe`
+  (captures) is unchanged.
+- `src/web/scheduled-exposure.js`: `previewNeedsUpdate` with
+  `PREVIEW_HYSTERESIS_EV = 1/6`. `previewOverride` records the source it
+  sends (`lastSentSource`). `onStatus` re-requests the stream only when
+  `previewNeedsUpdate` says so, through the new preview-only event.
+  `setComparing` uses the same event. The unused `lastPlanKey` is removed.
+- `src/web/app.js`: a `scheduled-exposure-preview-change` listener
+  (`controlRevision += 1; schedulePreviewUpdate()`, with no `refreshStatus`).
+- Tests: `preview_learning_is_time_based`,
+  `preview_loop_with_gain_dependent_metering_settles` (new).
+  `preview_frames_seed_the_ramp_and_keep_the_capture_step_anchor`,
+  `preview_frames_leave_the_guard_alone` and the Part 2 `preview_loop` helper
+  now advance time explicitly (1 s, 2 s, and one iteration per 3 s poll).
+  Their assertions use the time-based blend; none were loosened. Node:
+  `previewNeedsUpdate`.
+- Docs: `docs/optic-daemon-exposure-ramping.md` gets the §5.7 learning formula,
+  a §11 bullet (which also drops a stale "eases white balance"), and a new §11.1.
+
+Test mistake found on the first run: an assertion claimed that 700 → 600 ms (0.22 EV) is
+below the 1/6 EV hysteresis. The test was wrong, so it now checks 650 → 600 ms
+(0.12 EV, no update) and 700 → 600 ms (update).
+
+### Part 3 validation (Mac)
+
+| Check | Result |
+|---|---|
+| `cargo fmt --check` | pass |
+| `cargo test --locked` | pass: 264 (`exposure_ramp` 38) |
+| `cargo clippy --locked --all-targets -- -D warnings` | pass |
+| `node --test tests/web/*.test.js` | pass: 30 |
+| Biome 2.5.14 `ci` | pass: 13 files |
+| Q7 on the Pi | **not run**: needs a deploy |
+
+Simulated loop (the measured bias of 1.2 EV per EV, 8 fps, 3 s poll, 40 polls;
+numbers from a temporary `eprintln!`, removed afterwards):
+
+| Learning | Peak-to-peak swing, last 10 polls |
+|---|---|
+| Old: per frame, weight 0.5 | **0.667 EV**, a sustained limit cycle alternating 21.19 ↔ 21.86 |
+| New: time-based, τ = 5 s | **0.000 EV**, settled at the correct exposure |
+
+### Part 3 limitations
+
+- The per-gain shadow colour itself is not fixed. It is sensor and ISP rendering at
+  high analogue gain, not isolated (a fixed-gain test at 5× and 7× would
+  isolate it). It now changes only when the exposure really changes.
+- While a preview runs, its frames still teach the scene estimate that the next
+  scheduled capture plans from, and the high-gain preview metering is biased
+  relative to stills at gain 1. The size of that bias on the timelapse is not
+  measured. It predates this work (§11), but Part 3 makes it visible.
+- The event split (Q3) has no unit test. It is verified by review and needs
+  the Q7 recording.
+
+### Part 3 on the Pi (2026-09-23, user-approved "deploy now + re-record")
+
+**Deploy.** `scripts/build-deploy-optic-daemon.sh`, exit 0. On-Pi: 259 tests
+in the main binary, clippy, release build, `SUCCESS`. The daemon was down from 23:49:53 to
+23:52:45. The served `scheduled-exposure.js` contains `previewNeedsUpdate`.
+
+**Q7 recording.** The user reloaded a visible dashboard, with Scheduled exposure on and
+the preview started. 60 s of MJPEG was recorded as a read-only viewer and analysed
+with the same script as the baseline (scratchpad `stream_stats.py`):
+
+| | Before (21:56, 40 s) | After (23:53, 60 s) |
+|---|---|---|
+| Control revisions | 86 | 2 (one of them the stream restart after a capture) |
+| Distinct exposures while live | 40 (gain 5.22–6.87, 0.40 EV) | **1** (119 ms × 12.19 for all 196 live frames) |
+| Frame R/G | 1.08–1.41, sd 0.092 | 1.18–1.22, **sd 0.010** |
+| Frame B/G | sd 0.025 | sd 0.005 |
+
+The colour pumping is gone while the preview is live. The preview ran 119 ms × 12.19 ≈ 1.45 s,
+which matches the plan (3.44 s) at the guard's target (−1.29 EV).
+
+**New finding: preview frame rate (user: "preview frame rate should be
+consistent").** The recording's second segment was two frames at 3,474,267 µs
+× 1.0 (sequence reset to 0). The journal (23:53–23:56) shows why:
+
+- Every scheduled capture runs `stop_existing_preview`, then a still pipeline
+  of 11 warm-up frames at the capture's exposure: `warmup_and_capture` took
+  25,072 ms and 22,758 ms at about 3.5 s night frames. The preview gets **no frames for about
+  23–25 s every minute**.
+- The preview pipeline then restarts, and its first frames still carry the
+  still's exposure (3.47 s): libcamera applies new controls a few frames late, so there are
+  about 7 more seconds at about 0.3 fps.
+- At a 1-minute interval with a night frame of about 3.5 s, the preview is live for only about half of
+  each minute. This predates Parts 1–3 (captures always stopped the preview).
+  It is more visible tonight because the night exposure is long (at 20:51, 0.84 s:
+  6.6 s per capture).
+- The user also questioned "re-request the stream". An exposure-only change takes
+  `ReconfigureStream`'s controls-only path (`native_camera.rs`: settings and
+  revision updated, no pipeline restart), so it costs no frames. The worklog
+  and design text are corrected to say "exposure update".
+
+Candidate fixes (not implemented; design doc §9 already lists the first two
+as follow-ups): pass the preview controls to `camera.start()` so the first
+frames after a capture use the preview exposure; shorten the 11-frame warm-up
+for fully manual stills (needs an on-Pi test); longer term, a combined preview and still
+configuration that never stops the preview.
 

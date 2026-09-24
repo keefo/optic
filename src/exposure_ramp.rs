@@ -62,6 +62,15 @@ const GUARD_FLOOR_EV: f64 = -3.0;
 const GUARD_RELEASE_FRACTION: f64 = 0.5;
 /// Largest `clip_budget_percent`.
 const MAX_CLIP_BUDGET_PERCENT: f64 = 10.0;
+/// Time constant for what live preview frames teach the ramp (design doc
+/// §11). Per-frame learning at preview frame rate made a feedback loop: at
+/// night the preview runs high analogue gain, the scene then meters about
+/// 1.2 EV brighter per EV of gain, and the preview exposure hunted ±0.2 EV
+/// (worklogs/2026-09-23-highlight-guard.md, Part 3).
+const PREVIEW_LEARNING_TIME_CONSTANT_S: f64 = 5.0;
+/// Floor for the clipped fraction in the clip estimate (design doc §5.7), so
+/// a clip-free frame can't drag its log average towards −∞.
+const CLIP_ESTIMATE_FLOOR: f64 = 1e-4;
 
 /// How scheduled captures are exposed — `ScheduleConfig.exposure`. One
 /// global mode, deliberately not per rule: merged rules share one physical
@@ -403,6 +412,10 @@ pub struct HighlightGuard {
     /// The last captured frame's clipping excess, `log2(clipped / budget)`
     /// at its planned exposure. A pull needs two frames over budget in a row.
     pub previous_excess_ev: Option<f64>,
+    /// Smoothed `log2(clipped fraction) − log2(actual exposure)` from every
+    /// frame, captured or preview (design doc §5.7). Budget-independent, so
+    /// the preview target follows a new budget without waiting for a frame.
+    pub clip_scene_ev: Option<f64>,
 }
 
 impl HighlightGuard {
@@ -418,6 +431,7 @@ impl HighlightGuard {
                 offset_ev: recovered,
                 last_pull_ev: 0.0,
                 previous_excess_ev: None,
+                clip_scene_ev: self.clip_scene_ev,
             };
         };
         let confirmed = self
@@ -438,8 +452,32 @@ impl HighlightGuard {
             offset_ev,
             last_pull_ev,
             previous_excess_ev: Some(excess),
+            clip_scene_ev: self.clip_scene_ev,
         }
     }
+
+    /// Folds one frame's clipping into the clip estimate.
+    fn with_clip_sample(self, sample: f64, smoothing: f64) -> Self {
+        let clip_scene_ev = match self.clip_scene_ev {
+            Some(previous) => previous + (1.0 - smoothing) * (sample - previous),
+            None => sample,
+        };
+        Self {
+            clip_scene_ev: Some(clip_scene_ev),
+            ..self
+        }
+    }
+}
+
+/// One frame's clip estimate sample (design doc §5.7).
+fn clip_sample(observation: &FrameObservation) -> f64 {
+    let exposure = (observation.exposure_us.max(1.0) * observation.analogue_gain.max(1.0)).log2();
+    observation
+        .meter
+        .clipped_fraction
+        .max(CLIP_ESTIMATE_FLOOR)
+        .log2()
+        - exposure
 }
 
 /// Whether the highlight guard runs at this sun elevation: only below the
@@ -459,14 +497,12 @@ pub fn plan(
     let Some(state) = state.filter(|state| now - state.updated_at <= RESEED_GAP) else {
         return RampPlan::Seed;
     };
-    let max_shutter_us = max_shutter_us.clamp(settings.min_shutter_us, settings.max_shutter_us);
-    let target = target_luminance(target_bias_ev(sun_elevation_deg, settings)).log2();
-    let lowest = (settings.min_shutter_us as f64).log2();
-    let highest = (max_shutter_us as f64 * f64::from(settings.max_gain)).log2();
+    let limits = ExposureLimits::new(settings, max_shutter_us);
     // The guard darkens what the ramp would actually shoot, so a scene too
     // dark for max shutter × max gain can't hide the offset above the
     // ceiling (design doc §5.6). With no offset this is the plain ramp.
-    let mut desired = (target - state.scene_ev).min(highest) + state.highlight.offset_ev;
+    let mut desired = unguarded_log2_exposure(state, sun_elevation_deg, settings, &limits)
+        + state.highlight.offset_ev;
     if let Some(previous) = state.planned_log2_exposure {
         // A guard pull may step down further than `max_step_ev` (design
         // doc §5.6); upward the step limit is unchanged.
@@ -475,17 +511,121 @@ pub fn plan(
             previous + settings.max_step_ev,
         );
     }
-    let (shutter_us, gain) = split_exposure(
-        desired.clamp(lowest, highest),
-        settings.min_shutter_us,
-        max_shutter_us,
-        settings.max_gain,
-    );
+    let (shutter_us, gain) = limits.split(desired, settings);
     RampPlan::Manual {
         shutter_us,
         gain,
         log2_exposure: (shutter_us as f64 * f64::from(gain)).log2(),
     }
+}
+
+/// The exposure range one shot may use.
+struct ExposureLimits {
+    max_shutter_us: u64,
+    lowest: f64,
+    highest: f64,
+}
+
+impl ExposureLimits {
+    fn new(settings: &RampSettings, max_shutter_us: u64) -> Self {
+        let max_shutter_us = max_shutter_us.clamp(settings.min_shutter_us, settings.max_shutter_us);
+        Self {
+            max_shutter_us,
+            lowest: (settings.min_shutter_us as f64).log2(),
+            highest: (max_shutter_us as f64 * f64::from(settings.max_gain)).log2(),
+        }
+    }
+
+    /// Clamps into range, then splits shutter first, gain last.
+    fn split(&self, log2_exposure: f64, settings: &RampSettings) -> (u64, f32) {
+        split_exposure(
+            log2_exposure.clamp(self.lowest, self.highest),
+            settings.min_shutter_us,
+            self.max_shutter_us,
+            settings.max_gain,
+        )
+    }
+}
+
+/// The ramp's exposure without the highlight guard or the step limit,
+/// capped at the shutter × gain ceiling.
+fn unguarded_log2_exposure(
+    state: &RampState,
+    sun_elevation_deg: Option<f64>,
+    settings: &RampSettings,
+    limits: &ExposureLimits,
+) -> f64 {
+    let target = target_luminance(target_bias_ev(sun_elevation_deg, settings)).log2();
+    (target - state.scene_ev).min(limits.highest)
+}
+
+/// Where the highlight guard is heading (`H*`, design doc §5.7): the offset
+/// at which the clip estimate predicts exactly the budget, in
+/// `GUARD_FLOOR_EV..=0`. 0 whenever the guard can't act.
+pub fn highlight_target_ev(
+    state: &RampState,
+    sun_elevation_deg: Option<f64>,
+    settings: &RampSettings,
+    max_shutter_us: u64,
+) -> f64 {
+    let Some(clip_scene_ev) = state.highlight.clip_scene_ev else {
+        return 0.0;
+    };
+    if settings.clip_budget_percent <= 0.0 || !guard_active(sun_elevation_deg) {
+        return 0.0;
+    }
+    let limits = ExposureLimits::new(settings, max_shutter_us);
+    let at_budget = (settings.clip_budget_percent / 100.0).log2() - clip_scene_ev;
+    let unguarded = unguarded_log2_exposure(state, sun_elevation_deg, settings, &limits);
+    let target = (at_budget - unguarded).clamp(GUARD_FLOOR_EV, 0.0);
+    if target.is_finite() { target } else { 0.0 }
+}
+
+/// A shutter and gain pair.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct ExposureSetting {
+    pub shutter_us: u64,
+    pub gain: f32,
+}
+
+/// What the live preview shows for the next ramped frame (design doc §5.7).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreviewPlans {
+    /// `H*`, the guard's target offset.
+    pub target_ev: f64,
+    /// The next frame with the guard at its target.
+    pub preview: ExposureSetting,
+    /// The next frame without the guard, for *hold to compare*.
+    pub unguarded: ExposureSetting,
+}
+
+/// The preview's exposures around the next planned frame. `None` while the
+/// next frame is a seed.
+pub fn preview_plans(
+    state: Option<&RampState>,
+    now: DateTime<Utc>,
+    sun_elevation_deg: Option<f64>,
+    settings: &RampSettings,
+    max_shutter_us: u64,
+) -> Option<PreviewPlans> {
+    let RampPlan::Manual { log2_exposure, .. } =
+        plan(state, now, sun_elevation_deg, settings, max_shutter_us)
+    else {
+        return None;
+    };
+    let state = state?;
+    let limits = ExposureLimits::new(settings, max_shutter_us);
+    let target_ev = highlight_target_ev(state, sun_elevation_deg, settings, max_shutter_us);
+    let unguarded = log2_exposure - state.highlight.offset_ev;
+    let setting = |log2: f64| {
+        let (shutter_us, gain) = limits.split(log2, settings);
+        ExposureSetting { shutter_us, gain }
+    };
+    Some(PreviewPlans {
+        target_ev,
+        preview: setting(unguarded + target_ev),
+        unguarded: setting(unguarded),
+    })
 }
 
 /// Folds a completed capture into the ramp state. `sun_elevation_deg` is
@@ -517,18 +657,25 @@ pub fn observe(
                 updated_at: now,
                 scene_ev: state.scene_ev + blend * (scene_ev - state.scene_ev),
                 planned_log2_exposure: Some(*log2_exposure),
-                highlight: state.highlight.next(
-                    excess_ev.is_finite().then_some(excess_ev),
-                    guard_active(sun_elevation_deg),
-                    settings.clip_budget_percent,
-                ),
+                highlight: HighlightGuard {
+                    // The budget-independent clip estimate survives a guard
+                    // reset (budget 0), so the preview target stays live.
+                    clip_scene_ev: state.highlight.clip_scene_ev,
+                    ..state.highlight.next(
+                        excess_ev.is_finite().then_some(excess_ev),
+                        guard_active(sun_elevation_deg),
+                        settings.clip_budget_percent,
+                    )
+                }
+                .with_clip_sample(clip_sample(observation), settings.smoothing),
             })
         }
         _ => Some(RampState {
             updated_at: now,
             scene_ev,
             planned_log2_exposure: None,
-            highlight: HighlightGuard::default(),
+            highlight: HighlightGuard::default()
+                .with_clip_sample(clip_sample(observation), settings.smoothing),
         }),
     }
 }
@@ -538,7 +685,8 @@ pub fn observe(
 /// Brightness only. `planned_log2_exposure` is deliberately left alone: it
 /// anchors the capture sequence's per-frame step limit, so a preview restart
 /// or a passing cloud can't jump a running timelapse. So is the highlight
-/// guard, whose rates are per captured frame (design doc §5.6).
+/// guard's timelapse offset, whose rates are per captured frame (design doc
+/// §5.6); only its clip estimate learns from the preview (§5.7).
 pub fn observe_preview(
     state: Option<&RampState>,
     observation: &FrameObservation,
@@ -552,15 +700,25 @@ pub fn observe_preview(
             updated_at: now,
             scene_ev,
             planned_log2_exposure: None,
-            highlight: HighlightGuard::default(),
+            highlight: HighlightGuard::default()
+                .with_clip_sample(clip_sample(observation), settings.smoothing),
         });
     };
-    let blend = 1.0 - settings.smoothing;
+    // By elapsed time, not per frame, so frame rate doesn't set how hard the
+    // preview pulls on the estimate.
+    let elapsed_s = (now - state.updated_at)
+        .num_microseconds()
+        .map_or(f64::MAX, |us| us as f64 / 1e6)
+        .max(0.0);
+    let blend = 1.0 - (-elapsed_s / PREVIEW_LEARNING_TIME_CONSTANT_S).exp();
     Some(RampState {
         updated_at: now,
         scene_ev: state.scene_ev + blend * (scene_ev - state.scene_ev),
         planned_log2_exposure: state.planned_log2_exposure,
-        highlight: state.highlight,
+        // Only the clip estimate learns here (design doc §5.7).
+        highlight: state
+            .highlight
+            .with_clip_sample(clip_sample(observation), 1.0 - blend),
     })
 }
 
@@ -1080,11 +1238,14 @@ mod tests {
             meter: meter(MID_GREY * 4.0, None),
             ..observation
         };
-        let next = observe_preview(Some(&running), &brighter, at(1), &settings).unwrap();
+        let one_second = at(0) + Duration::seconds(1);
+        let next = observe_preview(Some(&running), &brighter, one_second, &settings).unwrap();
         assert_eq!(next.planned_log2_exposure, Some(18.0));
-        // Smoothed toward the newly measured scene, not jumped.
+        // Smoothed toward the newly measured scene by elapsed time, not
+        // jumped (1 s of a 5 s time constant).
         let measured = (MID_GREY * 4.0).log2() - 2_000_f64.log2();
-        assert!((next.scene_ev - (-20.0 + 0.5 * (measured + 20.0))).abs() < 1e-9);
+        let blend = 1.0 - (-1.0 / PREVIEW_LEARNING_TIME_CONSTANT_S).exp();
+        assert!((next.scene_ev - (-20.0 + blend * (measured + 20.0))).abs() < 1e-9);
     }
 
     #[test]
@@ -1184,6 +1345,7 @@ mod tests {
             offset_ev: -1.0,
             last_pull_ev: 1.0,
             previous_excess_ev: Some(1.4),
+            clip_scene_ev: None,
         });
         let unguarded = night_state(HighlightGuard::default());
         let (guarded_ev, _) = capture_frame(&pulled, &settings, NIGHT_SUN, 0.0, |_| 0.0);
@@ -1210,6 +1372,7 @@ mod tests {
                 offset_ev: -1.0,
                 last_pull_ev: 1.0,
                 previous_excess_ev: Some(1.0),
+                clip_scene_ev: None,
             })
         };
         let (planned, _) = capture_frame(&state, &settings, NIGHT_SUN, 0.0, |_| 0.0);
@@ -1287,6 +1450,7 @@ mod tests {
                     offset_ev,
                     last_pull_ev: 0.0,
                     previous_excess_ev,
+                    clip_scene_ev: None,
                 })
             });
         let mut checked = 0;
@@ -1365,7 +1529,13 @@ mod tests {
         assert!((next.highlight.offset_ev - (-1.5 + GUARD_RECOVERY_EV)).abs() < 1e-9);
         // Budget 0 switches it off outright.
         let (_, off) = capture_frame(&dawn, &zero_budget, NIGHT_SUN, 0.0, |_| 0.05);
-        assert_eq!(off.highlight, HighlightGuard::default());
+        assert_eq!(
+            HighlightGuard {
+                clip_scene_ev: None,
+                ..off.highlight
+            },
+            HighlightGuard::default()
+        );
     }
 
     #[test]
@@ -1398,6 +1568,7 @@ mod tests {
             offset_ev: -1.5,
             last_pull_ev: 1.0,
             previous_excess_ev: Some(0.3),
+            clip_scene_ev: Some(-30.0),
         };
         let state = night_state(guard);
         for clip in [0.0, 0.5] {
@@ -1406,8 +1577,22 @@ mod tests {
                 analogue_gain: 16.0,
                 meter: clip_meter(0.04, clip),
             };
-            let next = observe_preview(Some(&state), &observation, at(1), &settings).unwrap();
-            assert_eq!(next.highlight, guard);
+            let two_seconds = at(0) + Duration::seconds(2);
+            let next = observe_preview(Some(&state), &observation, two_seconds, &settings).unwrap();
+            // The timelapse offset and its confirmation state are untouched
+            // (§5.6); only the clip estimate learns (§5.7).
+            assert_eq!(
+                HighlightGuard {
+                    clip_scene_ev: guard.clip_scene_ev,
+                    ..next.highlight
+                },
+                guard
+            );
+            assert_eq!(next.planned_log2_exposure, state.planned_log2_exposure);
+            let sample = clip.max(CLIP_ESTIMATE_FLOOR).log2() - (118_750.0_f64 * 16.0).log2();
+            let blend = 1.0 - (-2.0 / PREVIEW_LEARNING_TIME_CONSTANT_S).exp();
+            let expected = -30.0 + blend * (sample + 30.0);
+            assert!((next.highlight.clip_scene_ev.unwrap() - expected).abs() < 1e-9);
         }
     }
 
@@ -1583,5 +1768,380 @@ mod tests {
         for (guarded, unguarded) in on.iter().zip(&off) {
             assert!(guarded.0 <= unguarded.0 + 1e-9);
         }
+    }
+
+    // --- Highlight guard in the preview (design doc §5.7) ---
+
+    /// A night ramp whose clip estimate predicts `clipped` at the unguarded
+    /// night exposure.
+    fn night_state_clipping(clipped: f64) -> RampState {
+        let state = night_state(HighlightGuard::default());
+        let unguarded = state.planned_log2_exposure.unwrap();
+        RampState {
+            highlight: HighlightGuard {
+                clip_scene_ev: Some(clipped.log2() - unguarded),
+                ..HighlightGuard::default()
+            },
+            ..state
+        }
+    }
+
+    fn with_budget(clip_budget_percent: f64) -> RampSettings {
+        RampSettings {
+            clip_budget_percent,
+            ..RampSettings::default()
+        }
+    }
+
+    fn log2_of(setting: ExposureSetting) -> f64 {
+        (setting.shutter_us as f64 * f64::from(setting.gain)).log2()
+    }
+
+    #[test]
+    fn clip_estimate_is_normalised_by_actual_exposure() {
+        let settings = RampSettings::default();
+        let estimate = |exposure_us: f64, clipped: f64| {
+            let observation = FrameObservation {
+                exposure_us,
+                analogue_gain: 1.0,
+                meter: clip_meter(0.04, clipped),
+            };
+            let preview = observe_preview(None, &observation, at(0), &settings).unwrap();
+            let captured = observe(
+                None,
+                &RampPlan::Seed,
+                &observation,
+                at(0),
+                NIGHT_SUN,
+                &settings,
+            )
+            .unwrap();
+            assert_eq!(
+                preview.highlight.clip_scene_ev,
+                captured.highlight.clip_scene_ev
+            );
+            preview.highlight.clip_scene_ev.unwrap()
+        };
+        // Half the exposure, half the clipping: the same scene.
+        assert!((estimate(2_000_000.0, 0.02) - estimate(1_000_000.0, 0.01)).abs() < 1e-9);
+        // A clip-free frame is floored, not −∞.
+        assert!(estimate(1_000_000.0, 0.0).is_finite());
+    }
+
+    #[test]
+    fn highlight_target_follows_the_budget_without_new_frames() {
+        // Last night: 2.65% clipped at the unguarded night exposure.
+        let state = night_state_clipping(0.0265);
+        let target = |budget: f64| {
+            highlight_target_ev(
+                &state,
+                NIGHT_SUN,
+                &with_budget(budget),
+                NIGHT_MAX_SHUTTER_US,
+            )
+        };
+        assert!((target(1.0) - (0.01_f64 / 0.0265).log2()).abs() < 1e-9);
+        assert!((target(0.5) - (0.005_f64 / 0.0265).log2()).abs() < 1e-9);
+        assert_eq!(target(2.65), 0.0);
+        assert_eq!(target(5.0), 0.0);
+        assert_eq!(target(0.1), GUARD_FLOOR_EV);
+
+        // The same state, two budgets: the preview moves by the difference.
+        let preview = |budget: f64| {
+            preview_plans(
+                Some(&state),
+                at(1),
+                NIGHT_SUN,
+                &with_budget(budget),
+                NIGHT_MAX_SHUTTER_US,
+            )
+            .unwrap()
+        };
+        let loose = preview(5.0);
+        let tight = preview(1.0);
+        assert_eq!(loose.preview, loose.unguarded);
+        let difference = log2_of(loose.preview) - log2_of(tight.preview);
+        assert!((difference - 1.406).abs() < 1e-3, "{difference}");
+    }
+
+    #[test]
+    fn highlight_target_is_zero_when_the_guard_cannot_act() {
+        let state = night_state_clipping(0.05);
+        let settings = RampSettings::default();
+        for sun in [Some(0.0), Some(12.0), None] {
+            assert_eq!(
+                highlight_target_ev(&state, sun, &settings, NIGHT_MAX_SHUTTER_US),
+                0.0
+            );
+        }
+        assert_eq!(
+            highlight_target_ev(&state, NIGHT_SUN, &with_budget(0.0), NIGHT_MAX_SHUTTER_US),
+            0.0
+        );
+        let unmeasured = night_state(HighlightGuard::default());
+        assert_eq!(
+            highlight_target_ev(&unmeasured, NIGHT_SUN, &settings, NIGHT_MAX_SHUTTER_US),
+            0.0
+        );
+        assert!(highlight_target_ev(&state, NIGHT_SUN, &settings, NIGHT_MAX_SHUTTER_US) < 0.0);
+    }
+
+    #[test]
+    fn preview_plans_bracket_the_capture_plan() {
+        let settings = RampSettings::default();
+        let plan_of = |state: &RampState| {
+            let RampPlan::Manual {
+                shutter_us, gain, ..
+            } = plan(
+                Some(state),
+                at(1),
+                NIGHT_SUN,
+                &settings,
+                NIGHT_MAX_SHUTTER_US,
+            )
+            else {
+                panic!("expected a manual plan");
+            };
+            ExposureSetting { shutter_us, gain }
+        };
+        // No clipping, no guard: the preview is exactly the next frame.
+        let calm = night_state_clipping(0.001);
+        let plans = preview_plans(
+            Some(&calm),
+            at(1),
+            NIGHT_SUN,
+            &settings,
+            NIGHT_MAX_SHUTTER_US,
+        )
+        .unwrap();
+        assert_eq!(plans.target_ev, 0.0);
+        assert_eq!(plans.preview, plan_of(&calm));
+        assert_eq!(plans.unguarded, plan_of(&calm));
+
+        // The timelapse is at −0.5 EV, heading for −1.4: the preview shows
+        // the target, the compare view the frame without any guard.
+        let easing = RampState {
+            highlight: HighlightGuard {
+                offset_ev: -0.5,
+                ..night_state_clipping(0.0265).highlight
+            },
+            ..night_state_clipping(0.0265)
+        };
+        let plans = preview_plans(
+            Some(&easing),
+            at(1),
+            NIGHT_SUN,
+            &settings,
+            NIGHT_MAX_SHUTTER_US,
+        )
+        .unwrap();
+        let next = log2_of(plan_of(&easing));
+        assert!((log2_of(plans.unguarded) - (next + 0.5)).abs() < 1e-5);
+        assert!((log2_of(plans.preview) - (next + 0.5 + plans.target_ev)).abs() < 1e-5);
+        assert!(log2_of(plans.preview) <= log2_of(plans.unguarded));
+
+        // A seed has no preview plan.
+        assert!(preview_plans(None, at(1), NIGHT_SUN, &settings, NIGHT_MAX_SHUTTER_US).is_none());
+    }
+
+    /// Closed preview loop: each iteration the preview runs the planned
+    /// preview exposure (optionally `shortfall_ev` short, as a night preview
+    /// is), meters `clipped_at(actual)`, and folds the frame in.
+    fn preview_loop(
+        settings: &RampSettings,
+        shortfall_ev: f64,
+        iterations: usize,
+        clipped_at: impl Fn(f64) -> f64,
+    ) -> Vec<(f64, f64)> {
+        let mut state = night_state(HighlightGuard::default());
+        let mut trace = Vec::new();
+        for iteration in 0..iterations {
+            // One preview update per 3 s status poll.
+            let now = at(0) + Duration::seconds(3 * (iteration as i64 + 1));
+            let plans = preview_plans(Some(&state), now, NIGHT_SUN, settings, NIGHT_MAX_SHUTTER_US)
+                .unwrap();
+            let planned = log2_of(plans.preview);
+            assert!(planned <= log2_of(plans.unguarded) + 1e-9);
+            let actual = planned - shortfall_ev;
+            let observation = FrameObservation {
+                exposure_us: actual.exp2(),
+                analogue_gain: 1.0,
+                meter: clip_meter(
+                    (state.scene_ev + actual).exp2().min(1.0),
+                    clipped_at(actual).min(1.0),
+                ),
+            };
+            state = observe_preview(Some(&state), &observation, now, settings).unwrap();
+            trace.push((plans.target_ev, clipped_at(planned)));
+        }
+        trace
+    }
+
+    #[test]
+    fn simulated_preview_loop_converges_to_the_budget() {
+        let settings = RampSettings::default();
+        let budget = settings.clip_budget_percent / 100.0;
+        let unguarded = night_state(HighlightGuard::default())
+            .planned_log2_exposure
+            .unwrap();
+        for slope in [0.8, 1.0, 1.2] {
+            for shortfall_ev in [0.0, 0.8] {
+                // 2.65% at the unguarded exposure, `slope` doublings per EV.
+                let clipped_at = |exposure: f64| 0.0265 * (slope * (exposure - unguarded)).exp2();
+                let trace = preview_loop(&settings, shortfall_ev, 20, clipped_at);
+                for &(target_ev, clipped) in &trace[8..] {
+                    let ratio = clipped / budget;
+                    assert!(
+                        (0.8..=1.2).contains(&ratio),
+                        "slope {slope}, shortfall {shortfall_ev}: {ratio} at {target_ev}"
+                    );
+                }
+            }
+        }
+        // Lamp cores that clip 2% at any exposure: the target stops at the
+        // floor instead of darkening without end.
+        let trace = preview_loop(&settings, 0.0, 20, |exposure| {
+            (0.0265 * (exposure - unguarded).exp2()).max(0.02)
+        });
+        assert!(
+            trace
+                .iter()
+                .all(|&(target_ev, _)| target_ev >= GUARD_FLOOR_EV)
+        );
+        assert_eq!(trace.last().unwrap().0, GUARD_FLOOR_EV);
+    }
+
+    // --- Preview learning over time (worklog 2026-09-23, Part 3) ---
+
+    #[test]
+    fn preview_learning_is_time_based() {
+        let settings = RampSettings::default();
+        let brighter = FrameObservation {
+            exposure_us: 2_000.0,
+            analogue_gain: 1.0,
+            meter: clip_meter(MID_GREY * 4.0, 0.02),
+        };
+        let start = RampState {
+            highlight: HighlightGuard {
+                clip_scene_ev: Some(-30.0),
+                ..HighlightGuard::default()
+            },
+            ..seeded(-20.0, at(0))
+        };
+        // Sixteen frames at 8 fps against one frame after the same 2 s.
+        let mut burst = start;
+        for frame in 1..=16 {
+            let now = at(0) + Duration::milliseconds(125 * frame);
+            burst = observe_preview(Some(&burst), &brighter, now, &settings).unwrap();
+        }
+        let once = observe_preview(
+            Some(&start),
+            &brighter,
+            at(0) + Duration::seconds(2),
+            &settings,
+        )
+        .unwrap();
+        let moved = |state: &RampState| state.scene_ev - start.scene_ev;
+        assert!((moved(&burst) / moved(&once) - 1.0).abs() < 0.01);
+        let clip_moved = |state: &RampState| state.highlight.clip_scene_ev.unwrap() + 30.0;
+        assert!((clip_moved(&burst) / clip_moved(&once) - 1.0).abs() < 0.01);
+        // 2 s of a 5 s time constant: well short of a per-frame 0.5 jump.
+        let measured = (MID_GREY * 4.0).log2() - 2_000_f64.log2();
+        assert!(moved(&once) < 0.4 * (measured - start.scene_ev));
+        // A frame stamped before the last update learns nothing.
+        let stale = observe_preview(
+            Some(&start),
+            &brighter,
+            at(0) - Duration::seconds(1),
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(stale.scene_ev, start.scene_ev);
+    }
+
+    /// The live preview's closed loop as measured on 2026-09-23: the
+    /// dashboard applies the planned preview exposure once per 3 s poll,
+    /// 8 fps frames meter the scene `bias` EV brighter per EV of exposure
+    /// above `reference` (the gain-dependent night metering), and
+    /// `observe_preview` learns from every frame. Returns the planned
+    /// preview exposure per poll.
+    fn gain_biased_preview_loop(
+        learn: impl Fn(&RampState, &FrameObservation, DateTime<Utc>) -> RampState,
+        bias: f64,
+        polls: usize,
+    ) -> Vec<f64> {
+        let settings = RampSettings::default();
+        let mut state = night_state(HighlightGuard::default());
+        let reference = state.planned_log2_exposure.unwrap();
+        let true_scene = state.scene_ev;
+        let mut applied = reference + 0.2;
+        let mut trace = Vec::new();
+        for poll in 0..polls {
+            for frame in 0..24 {
+                let now = at(0) + Duration::milliseconds(3_000 * poll as i64 + 125 * frame);
+                let scene = true_scene + bias * (applied - reference);
+                let observation = FrameObservation {
+                    exposure_us: applied.exp2(),
+                    analogue_gain: 1.0,
+                    meter: clip_meter((scene + applied).exp2().min(1.0), 0.001),
+                };
+                state = learn(&state, &observation, now);
+            }
+            let now = at(0) + Duration::milliseconds(3_000 * (poll as i64 + 1));
+            let plans = preview_plans(
+                Some(&state),
+                now,
+                NIGHT_SUN,
+                &settings,
+                NIGHT_MAX_SHUTTER_US,
+            )
+            .unwrap();
+            applied = log2_of(plans.preview);
+            trace.push(applied);
+        }
+        trace
+    }
+
+    #[test]
+    fn preview_loop_with_gain_dependent_metering_settles() {
+        let settings = RampSettings::default();
+        let swing = |trace: &[f64]| {
+            let window = &trace[trace.len() - 10..];
+            window.iter().cloned().fold(f64::MIN, f64::max)
+                - window.iter().cloned().fold(f64::MAX, f64::min)
+        };
+        // Measured: ~1.2 EV brighter per EV of preview gain.
+        let fixed = gain_biased_preview_loop(
+            |state, observation, now| {
+                observe_preview(Some(state), observation, now, &settings).unwrap()
+            },
+            1.2,
+            40,
+        );
+        assert!(swing(&fixed) < 1.0 / 6.0, "still hunting: {fixed:?}");
+        for pair in fixed[20..].windows(2) {
+            assert!((pair[1] - pair[0]).abs() < 1.0 / 6.0, "{pair:?}");
+        }
+
+        // Regression guard: the old per-frame learning (weight 1 − smoothing
+        // on every 8 fps frame) keeps hunting in the same loop.
+        let per_frame = gain_biased_preview_loop(
+            |state, observation, now| {
+                let exposure = (observation.exposure_us * observation.analogue_gain).log2();
+                let scene_ev = observation.meter.luminance.log2() - exposure;
+                RampState {
+                    updated_at: now,
+                    scene_ev: state.scene_ev
+                        + (1.0 - settings.smoothing) * (scene_ev - state.scene_ev),
+                    ..*state
+                }
+            },
+            1.2,
+            40,
+        );
+        assert!(
+            swing(&per_frame) >= 1.0 / 3.0,
+            "old loop settled: {per_frame:?}"
+        );
     }
 }

@@ -991,6 +991,15 @@ pub struct LiveExposurePlan {
     pub ramp_updated_at: Option<DateTime<Utc>>,
     /// The highlight guard's darkening, EV (≤ 0; design doc §5.6).
     pub highlight_ev: f64,
+    /// Where the guard is heading, EV (≤ 0; design doc §5.7).
+    pub highlight_target_ev: f64,
+    /// The guard can act now: budget above 0 and the sun below 0°.
+    pub highlight_active: bool,
+    /// What the live preview runs: the next frame with the guard at its
+    /// target (§5.7). `None` while seeding.
+    pub preview: Option<exposure_ramp::ExposureSetting>,
+    /// The next frame without the guard, for *hold to compare*.
+    pub preview_unguarded: Option<exposure_ramp::ExposureSetting>,
 }
 
 /// How far ahead `live_exposure_plan` looks for the next two shots to size
@@ -1033,7 +1042,19 @@ pub fn live_exposure_plan(
         max_shutter_us,
         ramp_updated_at: ramp_state.map(|state| state.updated_at),
         highlight_ev: 0.0,
+        highlight_target_ev: 0.0,
+        highlight_active: settings.clip_budget_percent > 0.0
+            && exposure_ramp::guard_active(sun_elevation_deg),
+        preview: None,
+        preview_unguarded: None,
     };
+    let preview = exposure_ramp::preview_plans(
+        ramp_state,
+        now,
+        sun_elevation_deg,
+        &settings,
+        max_shutter_us,
+    );
     match exposure_ramp::plan(
         ramp_state,
         now,
@@ -1049,6 +1070,9 @@ pub fn live_exposure_plan(
             shutter_us: Some(shutter_us),
             gain: Some(gain),
             highlight_ev: ramp_state.map_or(0.0, |state| state.highlight.offset_ev),
+            highlight_target_ev: preview.map_or(0.0, |plans| plans.target_ev),
+            preview: preview.map(|plans| plans.preview),
+            preview_unguarded: preview.map(|plans| plans.unguarded),
             ..base
         }),
     }
@@ -2389,6 +2413,33 @@ mod actor_tests {
         // The live plan includes and reports the highlight guard (§5.6).
         assert_eq!(live.highlight_ev, -1.25);
         assert_eq!(seeding.highlight_ev, 0.0);
+        // No clip estimate yet: no target, so the preview drops the
+        // timelapse's −1.25 EV and matches the compare view (§5.7).
+        assert!(live.highlight_active);
+        assert_eq!(live.highlight_target_ev, 0.0);
+        assert!(live.preview.is_some());
+        assert_eq!(live.preview, live.preview_unguarded);
+        assert!(seeding.preview.is_none() && seeding.preview_unguarded.is_none());
+        let clipping = RampState {
+            highlight: exposure_ramp::HighlightGuard {
+                // 4% clipped at the unguarded frame: 2 EV over a 1% budget.
+                clip_scene_ev: Some(
+                    0.04_f64.log2() - (shutter_us as f64 * f64::from(gain)).log2() - 1.25,
+                ),
+                ..state.highlight
+            },
+            ..state
+        };
+        let guarded = live_exposure_plan(&schedule, Some(&clipping), now).unwrap();
+        assert!(
+            guarded.highlight_target_ev < -1.0,
+            "{}",
+            guarded.highlight_target_ev
+        );
+        let exposure = |setting: exposure_ramp::ExposureSetting| {
+            (setting.shutter_us as f64 * f64::from(setting.gain)).log2()
+        };
+        assert!(exposure(guarded.preview.unwrap()) < exposure(guarded.preview_unguarded.unwrap()));
     }
 
     #[tokio::test]

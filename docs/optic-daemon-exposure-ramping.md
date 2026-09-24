@@ -251,13 +251,90 @@ one. The guard can only darken, and the §5.2 night curve stays.
 (`observe_preview`, §11) leave `H` and the previous excess untouched, like
 `planned_log2_exposure`. They run at frame rate and at a different
 shutter/gain mix, and the per-frame rates above are defined per captured
-frame. The live plan and the preview still *include* the current `H`. A seed
-(start, or a reseed after 30 min) starts with `H = 0`.
+frame. A seed (start, or a reseed after 30 min) starts with `H = 0`. What
+the preview shows is covered in §5.7.
 
 **Expected effect with a 1% budget.** On the 2026-09-22 night, frames at −1.6 EV
 clipped 1.2% with a largest blob of 0.29%, so the guard should settle about
 1.5 EV below the unguarded night exposure (≈ 1.2 s instead of 3.5 s at a
 1-minute interval). On-Pi validation is pending (see the worklog).
+
+### 5.7 Seeing the budget in the live preview (2026-09-23)
+
+User requirement: a setting whose effect cannot be seen in the preview is
+useless. §5.6 alone moves `H` only on scheduled captures, one per minute,
+and not at all while the scheduler is paused. So the preview shows where the
+guard is *heading*, and the timelapse keeps walking there at the §5.6 rates.
+
+**Clip estimate (`HighlightGuard.clip_scene_ev`).** Every frame, captured or
+preview, updates a smoothed, budget-independent estimate, exactly like `Ŝ`:
+
+```
+c = log2(max(clipped_fraction, 1e-4)) − E_actual
+ĉ ← ĉ + (1 − smoothing)(c − ĉ)          captured frames
+ĉ ← ĉ + (1 − e^(−Δt / 5 s))(c − ĉ)      preview frames (§11.1)
+```
+
+Under the §5.6 model (clipped area doubles per EV), `ĉ` predicts the clipped
+fraction at any exposure `E` as `2^(ĉ + E)`. The 1e-4 floor keeps a clip-free
+frame from dragging a log average to −∞. Preview frames update `ĉ` only; they
+still leave `H`, `last_pull_ev`, `previous_excess_ev` and the capture anchor
+alone (§11).
+
+**Target (`highlight_target_ev`).** The exposure at which clipping would equal
+the budget is `E_budget = log2(budget) − ĉ`, so
+
+```
+H* = clamp(E_budget − min(log2(target) − Ŝ, E_max), −3 EV, 0)
+```
+
+It is 0 with the sun at or above 0°, without a station, with budget 0, or
+before any frame has been measured. Because `ĉ` does not depend on the budget,
+a new budget changes `H*` on the next status refresh, without waiting for a
+new frame. Staging a change already triggers that refresh.
+
+**Preview plans (`LiveExposurePlan.preview`, `.preview_unguarded`).** For
+the next planned frame `E_plan` (which includes `H`):
+
+- `preview = clamp(E_plan − H + H*)`: the next frame with the guard at its
+  target. This is what the preview's brightness-equivalent override (§10)
+  now uses.
+- `preview_unguarded = clamp(E_plan − H)`: the same frame with no guard, for
+  *hold to compare*.
+
+They are split shutter-first and gain-last, like any plan. They are not
+step-limited, because the preview has no sequence to keep smooth. When `H*`
+is not below 0 and `H = 0`, `preview` equals the plan, which was the
+behaviour before this section.
+
+**Convergence in the preview.** Each preview frame re-measures `ĉ` at the
+exposure it actually got. The fixed point is `clipped(E) = budget`. With a
+true slope of `k` doublings per EV, each update corrects the error by a factor of `1 − k`
+(measured `k` = 0.8–1.2, so within ±20% per step). Where the lamp cores
+alone exceed the budget (`k` → 0), `H*` stops at the −3 EV floor.
+
+**Readout and overlay.**
+
+- Every MJPEG part carries `X-Optic-Clipped`: the daemon meter's clipped
+  fraction for that frame (`unavailable` without a meter). The dashboard
+  shows it next to the budget, the preview target and the timelapse's `H`. It
+  says "inactive (sun +x°)" or "off" when the guard cannot act, so a daytime
+  budget change doing nothing is not mistaken for a fault.
+- *Clipping* is a focus tool, next to peaking. It paints pixels whose BT.601
+  luma is ≥ 250 (the daemon's `CLIPPED_LUMA`) with zebra stripes on the
+  overlay canvas. It shows what the budget counts: lamp cores, and the halo
+  spreading onto lit surfaces. It works in any mode and at any time of day.
+- *Hold to compare* (under Scheduled exposure): while held, the preview
+  override uses `preview_unguarded`; on release, it goes back to `preview`.
+
+**Known limits.**
+
+- The preview runs at lower resolution than a still, so small lamp cores
+  blur and may meter as less clipped. The preview-to-still ratio must be
+  measured on the Pi.
+- At night the preview can run up to about 1 EV short of the plan (§10). `ĉ`
+  is normalised by the actual exposure, so it extrapolates across that gap
+  using the slope model.
 
 ## 6. White Balance Is Not Ramped (revised 2026-09-22)
 
@@ -327,7 +404,10 @@ override carries exposure only.
   on-Pi test of long exposures, capture time and HTTP timeouts.
 - Warmup for fully manual ramped frames is unchanged (about 11 frames). Reducing it, and
   passing the still controls to `camera.start()`, needs an on-Pi test and
-  would lift the §5.5 interval budget.
+  would lift the §5.5 interval budget. It also blacks out a running preview:
+  measured 2026-09-23, 23–25 s per capture at a night frame of about 3.5 s, followed
+  by about 7 s of preview frames still at the still's exposure, so the preview is
+  live for only about half of each minute at a 1-minute interval (§11.1).
 - Per-rule fixed exposure overrides were declined for now (§3.1).
 - The metering does not yet handle a region of interest (e.g. excluding the sky).
 - The highlight guard (§5.6) learns only from captured frames, so a ramp
@@ -368,6 +448,11 @@ exposure already lives:
   gains. Brightness and colour match the next scheduled frame; noise is
   higher. `reconfigure_stream` stages only `settings`, so the override is
   never saved.
+- **Highlight guard in the preview (2026-09-23, §5.7).** The override uses
+  `exposure_plan.preview` (the guard at its target), with *Hold to compare*
+  switching to `preview_unguarded`. A guard line under the caption shows
+  the live clipped fraction, the budget, and the preview and timelapse
+  offsets. The *Clipping* focus tool shows where the frame clips.
 - **Three simple controls.** *Brightness compensation* (a slider in 1/3 EV
   steps; it shifts the whole curve, day and night), *Night look* (Dark ↔
   Bright, which maps to `night_drop_ev` 4 … 0 EV), and *Max shutter* /
@@ -394,8 +479,9 @@ So the preview is metered too:
   frames and folds them in with `exposure_ramp::observe_preview`. It re-reads
   the staged config once a second, and in `Dashboard` mode it measures
   nothing and clears the state.
-- `observe_preview` updates the smoothed scene estimate and eases white
-  balance but never writes `planned_log2_exposure`, the anchor for the
+- `observe_preview` updates the smoothed scene estimate, by elapsed time
+  rather than per frame (§11.1), but never writes `planned_log2_exposure`,
+  the anchor for the
   capture sequence's per-frame step limit. Preview frames therefore inform
   the ramp without letting a preview restart or a passing cloud jump a
   running timelapse.
@@ -407,4 +493,58 @@ So the preview is metered too:
 - The loop stays correct because each observation uses the frame's *actual*
   exposure from its metadata, even when the preview cannot reach the planned
   exposure (a multi-second night shutter clamps to the preview frame time and
-  makes up the difference in gain, up to 16×).
+  makes up the difference in gain, up to 16×). But see §11.1: at night that
+  gain does *not* leave the metering exposure-invariant.
+
+### 11.1 Preview hunting and colour pumping (fixed 2026-09-23)
+
+**Symptom (user).** With Scheduled exposure on, the night preview's colour
+pumped warm and cool as the Shutter field moved between about 600 and 800 ms.
+With it off, the colour was steady.
+
+**Measured** (`worklogs/2026-09-23-highlight-guard.md`, Part 3; 40 s of
+the live stream):
+
+- The colour gains were constant (Daylight preset), so it was not white balance.
+- The preview shutter was fixed at the 119 ms frame time, and the analogue gain
+  hunted 5.2–6.9× (0.40 EV), with 86 stream re-requests in 40 s.
+- Colour tracked gain (corr(gain, B/G) = 0.81), almost entirely in the
+  shadows: dark-half R/G sd 0.18, brightest 5% sd 0.02.
+
+**Cause:** two faults that reinforced each other.
+
+1. **Metering that depends on gain.** At high preview gain, a dark frame's
+   trimmed log-mean rises about 1.2 EV per EV of gain (corr 0.93), so the
+   "exposure-normalised" scene estimate is not normalised. The plan answers a
+   brighter-reading scene with less gain, and so on. With 8 fps frames each weighted
+   `1 − smoothing` = 0.5, the loop gain was above 1, so it hunted.
+2. **A re-request storm.** Every plan change re-requested the stream *and*
+   refreshed status immediately. That refresh returned a slightly different plan,
+   so the dashboard re-requested again at network round-trip rate.
+
+**Fix:**
+
+- `observe_preview` blends the scene and clip estimates by
+  `1 − e^(−Δt / 5 s)`, where Δt is the time since the last update, whatever the
+  frame rate. Per 3 s poll the estimate moves at most ≈ 45%, so the loop gain is
+  ≈ 1.2 × 0.45 ≈ 0.54 and the loop settles. Captures keep the per-frame `smoothing`.
+- Plan-driven preview updates use a separate event,
+  `scheduled-exposure-preview-change`, which re-requests the stream without
+  refreshing status. User edits still refresh immediately.
+- A new preview exposure is sent only when it moves by more than 1/6 EV from
+  the one last sent, or when seeding starts or ends. Compare press and release
+  always send. (Sending is a controls-only `/api/stream/reconfigure`: the
+  running pipeline takes the new controls on its next requests, with no
+  restart. The threshold only avoids tiny gain steps, each of which nudges
+  the shadow colour.)
+
+**Separate: the preview pauses during every scheduled capture.** A still
+capture stops the preview, takes 11 warm-up frames at the capture's own
+exposure (about 23–25 s with a night frame of about 3.5 s), then restarts the preview. The
+first restarted frames still carry the still's exposure. See §9.
+
+**What remains:** a real exposure change (dusk, the guard) still changes
+the preview's shadow colour at a given gain. That is sensor and ISP behaviour at
+high analogue gain, not isolated. It now happens only when the exposure really
+changes, and slowly. The scene estimate learned from a high-gain preview is also
+biased relative to stills at gain 1. Its size has not been measured.

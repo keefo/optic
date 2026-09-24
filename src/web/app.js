@@ -545,10 +545,13 @@ function frameMetadata(headers) {
   const exposureUs = Number(headers["x-optic-exposure-us"]);
   const analogueGain = Number(headers["x-optic-analogue-gain"]);
   const gains = (headers["x-optic-colour-gains"] || "").split(",").map(Number);
+  // "unavailable" (no meter) parses to NaN -> null.
+  const clippedFraction = Number.parseFloat(headers["x-optic-clipped"]);
   return {
     exposureUs: Number.isFinite(exposureUs) ? exposureUs : null,
     analogueGain: Number.isFinite(analogueGain) ? analogueGain : null,
     colourGains: gains.length === 2 && gains.every(Number.isFinite) ? gains : null,
+    clippedFraction: Number.isFinite(clippedFraction) ? clippedFraction : null,
   };
 }
 
@@ -1055,6 +1058,12 @@ document.addEventListener("scheduled-exposure-change", () => {
   controlRevision += 1;
   schedulePreviewUpdate();
   void refreshStatus();
+});
+// Plan-driven preview updates: no status refresh, which would feed straight
+// back into the next plan (worklogs/2026-09-23-highlight-guard.md, Part 3).
+document.addEventListener("scheduled-exposure-preview-change", () => {
+  controlRevision += 1;
+  schedulePreviewUpdate();
 });
 elements.preview.addEventListener("error", () => {
   if (livePreview) {
