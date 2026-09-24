@@ -106,3 +106,16 @@ test("a ramped plan ignores the preview's (override) values", () => {
   assert.equal(ramp.describePlan(manualPlan(3843022, 1), preview).shutter, "3.8 s");
   assert.equal(ramp.describePlan(manualPlan(3843022, 1), preview).gain, "1.00×");
 });
+
+test("the highlight guard shows in the caption only while it darkens", () => {
+  assert.equal(ramp.describeHighlightGuard(null), "");
+  assert.equal(ramp.describeHighlightGuard({ highlight_ev: 0 }), "");
+  // A plan from an older daemon has no highlight_ev at all.
+  assert.equal(ramp.describeHighlightGuard({ seeding: false }), "");
+  assert.equal(ramp.describeHighlightGuard({ highlight_ev: -0.04 }), "");
+  assert.equal(ramp.describeHighlightGuard({ highlight_ev: -1.44 }), "highlight guard −1.4 EV");
+});
+
+test("ramp defaults mirror RampSettings::default()", () => {
+  assert.equal(ramp.RAMP_DEFAULTS.clip_budget_percent, 1);
+});

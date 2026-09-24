@@ -18,6 +18,7 @@
     night_drop_ev: 2,
     max_step_ev: 1 / 3,
     smoothing: 0.5,
+    clip_budget_percent: 1,
   };
   // The Night look slider runs Dark (0) to Bright (NIGHT_LOOK_MAX); the
   // ramp's `night_drop_ev` is its mirror image.
@@ -95,6 +96,13 @@
     };
   }
 
+  // Caption fragment for the highlight guard (design doc §5.6): how much it
+  // is darkening the plan, or "" when it isn't.
+  function describeHighlightGuard(plan) {
+    const ev = plan?.highlight_ev ?? 0;
+    return ev <= -0.05 ? `highlight guard ${formatEv(ev)}` : "";
+  }
+
   const pure = {
     RAMP_DEFAULTS,
     nightLookFromDrop,
@@ -103,6 +111,7 @@
     formatShutter,
     formatEv,
     describePlan,
+    describeHighlightGuard,
   };
 
   if (typeof module !== "undefined" && module.exports) {
@@ -128,6 +137,7 @@
     maxStep: $("#ramp-max-step"),
     smoothing: $("#ramp-smoothing"),
     minShutter: $("#ramp-min-shutter"),
+    clipBudget: $("#ramp-clip-budget"),
     shutterLive: $("#shutter-ramp-value"),
     gainLive: $("#gain-ramp-value"),
     shutter: $("#shutter"),
@@ -144,6 +154,7 @@
     [ui.maxStep, "max_step_ev", (v) => Math.round(v * 100) / 100, (v) => v],
     [ui.smoothing, "smoothing", (v) => v, (v) => v],
     [ui.minShutter, "min_shutter_us", (us) => us / 1000, (ms) => Math.round(ms * 1000)],
+    [ui.clipBudget, "clip_budget_percent", (v) => v, (v) => v],
   ];
 
   let exposure = { mode: "Dashboard" };
@@ -249,7 +260,8 @@
       previewShortfallEv >= 0.1
         ? ` · preview ≈ ${previewShortfallEv.toFixed(1)} EV darker than the frame (preview frames are shorter)`
         : "";
-    return `Next scheduled frame · ${target} · shutter cap ${formatShutter(current.max_shutter_us)}${learned}${darker}`;
+    const guard = describeHighlightGuard(current);
+    return `Next scheduled frame · ${target}${guard ? ` · ${guard}` : ""} · shutter cap ${formatShutter(current.max_shutter_us)}${learned}${darker}`;
   }
 
   function notifyChange() {

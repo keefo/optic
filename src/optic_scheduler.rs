@@ -989,6 +989,8 @@ pub struct LiveExposurePlan {
     pub max_shutter_us: u64,
     /// When the ramp last learned from a captured frame.
     pub ramp_updated_at: Option<DateTime<Utc>>,
+    /// The highlight guard's darkening, EV (≤ 0; design doc §5.6).
+    pub highlight_ev: f64,
 }
 
 /// How far ahead `live_exposure_plan` looks for the next two shots to size
@@ -1030,6 +1032,7 @@ pub fn live_exposure_plan(
         sun_elevation_deg,
         max_shutter_us,
         ramp_updated_at: ramp_state.map(|state| state.updated_at),
+        highlight_ev: 0.0,
     };
     match exposure_ramp::plan(
         ramp_state,
@@ -1045,6 +1048,7 @@ pub fn live_exposure_plan(
             seeding: false,
             shutter_us: Some(shutter_us),
             gain: Some(gain),
+            highlight_ev: ramp_state.map_or(0.0, |state| state.highlight.offset_ev),
             ..base
         }),
     }
@@ -1581,8 +1585,17 @@ async fn fire_capture(
                 &ramp_shot.plan,
                 &observation,
                 Utc::now(),
+                ramp_shot.sun_elevation_deg,
                 &ramp_shot.settings,
             ) {
+                if next.highlight.last_pull_ev > 0.0 {
+                    tracing::info!(
+                        clipped_fraction = meter.clipped_fraction,
+                        pull_ev = next.highlight.last_pull_ev,
+                        offset_ev = next.highlight.offset_ev,
+                        "highlight guard darkened the ramp"
+                    );
+                }
                 store_ramp(ramp, Some(next));
             }
         }
@@ -2286,6 +2299,7 @@ mod actor_tests {
             updated_at: now,
             scene_ev: -12.0,
             planned_log2_exposure: Some(10.0),
+            highlight: Default::default(),
         })));
         // Dashboard mode drops the state, so switching back to AutoRamp
         // starts from a fresh measurement.
@@ -2350,6 +2364,10 @@ mod actor_tests {
             updated_at: now - Duration::minutes(1),
             scene_ev: -26.0,
             planned_log2_exposure: Some(21.0),
+            highlight: exposure_ramp::HighlightGuard {
+                offset_ev: -1.25,
+                ..Default::default()
+            },
         };
         let live = live_exposure_plan(&schedule, Some(&state), now).unwrap();
         let RampPlan::Manual {
@@ -2368,6 +2386,9 @@ mod actor_tests {
         assert_eq!(live.shutter_us, Some(shutter_us));
         assert_eq!(live.gain, Some(gain));
         assert_eq!(live.ramp_updated_at, Some(state.updated_at));
+        // The live plan includes and reports the highlight guard (§5.6).
+        assert_eq!(live.highlight_ev, -1.25);
+        assert_eq!(seeding.highlight_ev, 0.0);
     }
 
     #[tokio::test]
