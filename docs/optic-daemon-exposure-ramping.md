@@ -408,6 +408,11 @@ override carries exposure only.
   measured 2026-09-23, 23–25 s per capture at a night frame of about 3.5 s, followed
   by about 7 s of preview frames still at the still's exposure, so the preview is
   live for only about half of each minute at a 1-minute interval (§11.1).
+  **Addressed 2026-09-23** for manual (ramped) stills: pipelines start with
+  their own controls, and a manual still keeps the first frame really at its
+  exposure (`docs/optic-daemon-capture-performance.md` §8). The §5.5 budget
+  still assumes 11 frames, which is now conservative; lifting it waits for
+  hardware results.
 - Per-rule fixed exposure overrides were declined for now (§3.1).
 - The metering does not yet handle a region of interest (e.g. excluding the sky).
 - The highlight guard (§5.6) learns only from captured frames, so a ramp

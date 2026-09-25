@@ -756,3 +756,22 @@ frames after a capture use the preview exposure; shorten the 11-frame warm-up
 for fully manual stills (needs an on-Pi test); longer term, a combined preview and still
 configuration that never stops the preview.
 
+
+## Part 1 observed on hardware (2026-09-23 23:55–23:58 PDT, journal, read-only)
+
+The first night with the guard deployed (branch build), AutoRamp defaults, 1%
+budget, with the room lights off as on 2026-09-22:
+
+| Time | Clipped (daemon meter) | Pull | Offset `H` |
+|---|---|---|---|
+| 23:55:23 | 2.65% | 1.0 EV (second over-budget frame, capped) | −1.00 EV |
+| 23:56:11 | 1.12% | 0.17 EV | −1.17 EV |
+| 23:57:10 | 1.005% | 0.008 EV | −1.18 EV |
+| 23:58:11 | 1.03% | 0.008 EV | −1.19 EV |
+
+The captured exposure went from 3.47 s to 3.13 s (the step-limited ramp) and then 1.46 s
+(the guard's widened downward step). This matches the replay's prediction (settled about
+1.44 EV darker at about 1%), with no oscillation. Frames sitting just above the budget make
+tiny pulls (0.008 EV per frame) until clipping drops below 1%; this
+self-limits by design (hold band). Hardware-observed for 4 frames only: the
+overnight comparison is still pending.
