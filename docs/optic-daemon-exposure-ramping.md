@@ -8,6 +8,10 @@
 but not user-accepted; see `worklogs/2026-09-21-exposure-ramping.md`. The
 highlight guard (§5.6) is implemented and unit-tested but **not deployed and
 not hardware-validated**; see `worklogs/2026-09-23-highlight-guard.md`.
+The 2026-09-28 fix (§5.4 capture-anchored reseed and meter-then-shoot, §5.3
+time-based step limit, §5.8 daylight ceiling, §5.9 decision logging) is
+implemented and unit-tested on the Mac, **not yet compiled for Linux, deployed
+or hardware-validated**; see `worklogs/2026-09-28-ramp-overexposure.md`.
 
 ## 1. Goal
 
@@ -146,24 +150,55 @@ or clamping cannot mislead the loop.
   `E_max = log2(max_shutter_eff × max_gain)` and `H ≤ 0` is the highlight
   guard's offset (§5.6; 0 when it is inactive, which makes the `min` a no-op
   because of the final clamp). It then moves at most
-  `max_step_ev` from the previous frame's planned `E` (downward, plus whatever
-  the guard just pulled), and is clamped to
-  `[log2(min_shutter), log2(max_shutter_eff × max_gain)]`.
+  `max_step_ev × max(1, minutes since the anchoring capture)` from the
+  previous frame's planned `E` (downward, plus whatever the guard just
+  pulled), and is clamped to
+  `[log2(min_shutter), log2(max_shutter_eff × max_gain)]` and to the daylight
+  ceiling (§5.8).
+- **Time-based step limit (2026-09-28).** The step limit is per minute of
+  gap, never less than one step, so 1-minute and faster timelapses step
+  exactly as before (one plan ~50 s after the last observation is still one
+  step), while a 10-minute rule may move 10 steps to follow dawn.
 - **Split (shutter first, gain last):** `shutter = clamp(2^E, min, max_eff)`,
   `gain = clamp(2^E / shutter, 1, max_gain)`. When darkening, gain falls to
   1 before the shutter shortens. This matches the usual rule of adding gain
   last and removing it first.
 
-### 5.4 Seeding and reseeding
+### 5.4 Seeding, reseeding and meter-then-shoot
 
-With no ramp state (daemon start, or switching to `AutoRamp`), or when more
-than 30 minutes have passed since the last ramped frame, the next capture is
-a **seed frame**. It uses libcamera auto exposure and AWB (shutter 0,
-gain 0, `awb: auto`), as `Dashboard` defaults do. Its measurement
-initializes `Ŝ`. The first planned frame after a seed
-may jump straight to the desired exposure (no step limit), because there is
-no smooth sequence to protect yet. Every frame after that is step-limited.
-The seed frame is a normal output frame.
+**Rule (revised 2026-09-28).** A scheduled capture may *plan* only from a
+state that a **scheduled capture** (or its metering pass) updated within the
+last 30 minutes (`RampState.captured_at`). Otherwise the plan is a seed, with
+a reason: `no_state` (daemon start, or just switched to `AutoRamp`),
+`no_capture` (the state was learned from live preview frames only, §11), or
+`capture_gap` (the last capture is older than 30 minutes). Live preview frames
+refresh `updated_at` but never `captured_at`, so preview activity can no
+longer keep a stale or wrong estimate "fresh" for captures.
+
+**Why.** On 2026-09-28 the daemon restarted at 01:31. A live preview then ran
+unattended until 08:00 at the preview override's 16× ceiling. At dawn every
+preview frame was white, and a saturated meter (`linear(255)`) is only a lower
+bound on the scene's brightness. The estimate converged to that bound, and the
+first capture of an hourly rule planned from it with no step limit:
+`0.18 × 118,750 µs × 16 / 1.0043 ≈ 343 ms` at gain 1, about 3 EV over, a white
+frame. Replayed in `exposure_ramp::tests::replay_2026_09_28_dawn_overexposure`.
+
+**Meter-then-shoot.** When a scheduled `AutoRamp` shot's plan is a seed, the
+scheduler first takes an **unsaved metering still** (`OpticCamera::meter`: the
+same pipeline, warmup and libcamera auto exposure/AWB (shutter 0, gain 0) as
+a seed still, but no JPEG/DNG encode, no file and no capture-history row). It
+folds that frame in as a seed, plans again, and shoots the resulting manual
+plan. So long-gap shots (hourly rules) get the §5.2 target curve and the §5.8
+ceiling too. The first plan after a seed may still jump without a step limit,
+because there is no smooth sequence to protect. The metering pass costs one
+extra still: about 1 s by day, and up to 11 × 0.5 s at night (auto exposure's
+frame-duration cap). If metering fails, the seed still itself is the output
+frame, as before this pass existed, with a WARN.
+
+The dashboard's live plan (§10) and preview override still use preview-learned
+state (`exposure_ramp::preview_plan`), so the preview shows the settings
+before any capture. `exposure_plan.capture_meters_first` says that the next
+capture will meter first anyway.
 
 Ramp state lives only in the scheduler actor's memory. A daemon restart
 reseeds, which is intended: after a restart, the last exposure may be stale.
@@ -336,6 +371,56 @@ alone exceed the budget (`k` → 0), `H*` stops at the −3 EV floor.
   is normalised by the actual exposure, so it extrapolates across that gap
   using the slope model.
 
+### 5.8 Daylight sanity ceiling (2026-09-28)
+
+With the sun at or above the horizon, a plan's exposure product
+(`shutter × gain`) is capped at
+
+```
+ceiling(el) = max(160 ms, 2.5 s · 2^(−el / 2°)) · 2^day_bias_ev
+```
+
+There is no ceiling below the horizon or without a station. It is a backstop
+for a wrong scene estimate, not the fix for one (§5.4): at +7.6° it is 180 ms,
+so on 2026-09-28 it would have removed only about 0.9 EV of the 3 EV error.
+
+**Why this curve (user decision, 2026-09-28).** A flat "no multi-hundred-ms
+exposure while the sun is up" would be wrong for this station. On the
+2026-09-24/25 dawns and dusks the mid-grey exposure was up to 621 ms at sun
+0…1°, 283 ms at +2…3°, 79 ms at +6…7°, 53 ms at +7…9°, and at most 41 ms
+above +10°. Frame by frame, the curve stays at least 1.6 EV above every one
+of these (tightest: 52.8 ms at +8.2°). It is fitted to one station and two
+mornings. A much darker day (storm, snow cloud) could reach it, and the WARN
+below would show that.
+
+The ceiling applies to capture plans and to the preview's plans (§5.7) alike.
+It can only darken a plan. `RampDecision.ceiling_bound` records when it cut
+one, and the scheduler logs a WARN (`exposure ramp plan cut by the daylight
+ceiling`).
+
+### 5.9 Decision logging (2026-09-28)
+
+Before this, the ramp logged nothing about its decisions, so the 2026-09-28
+frame could only be explained by arithmetic. Every scheduled `AutoRamp` shot
+now logs at INFO:
+
+- `exposure ramp decision`: `decision` (`seed`/`plan`), `seed_reason`,
+  `capture_age_s`, `scene_ev`, `sun_elevation_deg`, `target_bias_ev`,
+  `desired_log2_exposure` (before the step limit and ceilings),
+  `planned_log2_exposure`, `step_limit_ev`, `step_limited`,
+  `ceiling_log2_exposure`, `ceiling_bound`, `guard_offset_ev`,
+  `guard_previous_excess_ev`, `max_shutter_us`, `shutter_us`, `gain`,
+  `rules`. A metering pass logs a second decision after it.
+- `exposure ramp observed`: `frame` (`metering`/`seed`/`plan`), the actual
+  exposure and gain, `luminance`, `clipped_fraction`, the new `scene_ev` and
+  guard offset.
+- WARN `ramped capture is overexposed` when an output frame has ≥ 25% of
+  samples clipped (daytime sky and glass clipped 1–7% on 2026-09-22; the
+  2026-09-28 frame clipped 60%).
+
+`GET /api/status` → `schedule.exposure` also reports `metered`,
+`seed_reason`, `ceiling_bound` and `clipped_fraction` for the last shot.
+
 ## 6. White Balance Is Not Ramped (revised 2026-09-22)
 
 The ramp controls exposure only. Scheduled captures use whatever the
@@ -393,7 +478,9 @@ override carries exposure only.
 
 | Case | Behaviour |
 |---|---|
-| Capture fails | Ramp state unchanged. The next shot plans from the last good state (or reseeds after 30 min). |
+| Capture fails | Ramp state unchanged. The next shot plans from the last good state (or meters first after 30 min without a capture). |
+| Metering pass fails (§5.4) | WARN; the auto-exposure seed still is the output frame. |
+| Preview frames saturated or unattended | They still teach the preview's view (§11), but captures never plan from preview-only state (§5.4). |
 | No meter (non-Linux backend, missing metadata) | State unchanged. A seed that never completes keeps the next shot a seed. |
 | Invalid exposure config in `config.json` | Clamped into range at run time. The preview endpoint rejects it on input. |
 | No station | Target stays at the day level. Ramping still works. |
@@ -426,6 +513,13 @@ override carries exposure only.
   sidecar (`worklogs/2026-09-22-capture-exposure-metadata.md`) should show
   whether the camera used a shorter exposure.
 - Ramp state is not persisted across daemon restarts (§5.4, intended).
+- (2026-09-28) Preview learning takes a saturated frame as a measurement. For
+  captures this is now harmless (§5.4), but the preview's own plan can still
+  sit on that lower bound while no client re-sends the override. A
+  saturation-aware estimate, and surfacing ramp WARNs as system events or
+  alerts, are follow-ups.
+- (2026-09-28) The daylight ceiling (§5.8) is fitted to one station and two
+  mornings. The meter-then-shoot pass (§5.4) is unmeasured on the Pi.
 
 ## 10. Dashboard UI (redesign, 2026-09-22)
 
@@ -491,10 +585,11 @@ So the preview is metered too:
   the ramp without letting a preview restart or a passing cloud jump a
   running timelapse.
 - Effects: unsaved settings show up in the preview within about a second of
-  it running, with the scheduler paused; the locked fields show real values
-  instead of "Auto"; and a scheduled run starts from a converged estimate
-  instead of a seed frame, removing the ~1 EV first-frame overshoot measured
-  in the first hardware test.
+  it running, with the scheduler paused, and the locked fields show real values
+  instead of "Auto". (Until 2026-09-28 a scheduled run also *started* from
+  the preview's estimate instead of a seed. That is withdrawn: captures now
+  plan only from a capture measurement, §5.4, and the metering pass replaces
+  the seed frame's ~1 EV first-frame overshoot.)
 - The loop stays correct because each observation uses the frame's *actual*
   exposure from its metadata, even when the preview cannot reach the planned
   exposure (a multi-second night shutter clamps to the preview frame time and

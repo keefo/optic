@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
+    camera::CaptureExposure,
     camera::{AppConfig, CaptureProfile, CaptureRequest, CaptureSource},
     durable_state, ephemeris,
-    exposure_ramp::{self, FrameObservation, RampPlan, RampState, ScheduleExposure},
+    exposure_ramp::{self, FrameObservation, RampDecision, RampPlan, RampState, ScheduleExposure},
     optic_camera::OpticCamera,
     optic_capture_log::{CaptureLog, CaptureLogEntry},
 };
@@ -987,8 +988,14 @@ pub struct LiveExposurePlan {
     pub target_bias_ev: f64,
     pub sun_elevation_deg: Option<f64>,
     pub max_shutter_us: u64,
-    /// When the ramp last learned from a captured frame.
+    /// When the ramp last learned from any frame, preview included.
     pub ramp_updated_at: Option<DateTime<Utc>>,
+    /// When a scheduled capture last measured the scene.
+    pub ramp_captured_at: Option<DateTime<Utc>>,
+    /// The next scheduled capture meters the scene first (design doc
+    /// §5.4): no capture has measured it within the reseed window. The
+    /// fields above still show the preview's plan.
+    pub capture_meters_first: bool,
     /// The highlight guard's darkening, EV (≤ 0; design doc §5.6).
     pub highlight_ev: f64,
     /// Where the guard is heading, EV (≤ 0; design doc §5.7).
@@ -1041,6 +1048,14 @@ pub fn live_exposure_plan(
         sun_elevation_deg,
         max_shutter_us,
         ramp_updated_at: ramp_state.map(|state| state.updated_at),
+        ramp_captured_at: ramp_state.and_then(|state| state.captured_at),
+        capture_meters_first: exposure_ramp::plan(
+            ramp_state,
+            now,
+            sun_elevation_deg,
+            &settings,
+            max_shutter_us,
+        ) == RampPlan::Seed,
         highlight_ev: 0.0,
         highlight_target_ev: 0.0,
         highlight_active: settings.clip_budget_percent > 0.0
@@ -1055,7 +1070,8 @@ pub fn live_exposure_plan(
         &settings,
         max_shutter_us,
     );
-    match exposure_ramp::plan(
+    // The preview's view (design doc §11): preview-learned state counts.
+    match exposure_ramp::preview_plan(
         ramp_state,
         now,
         sun_elevation_deg,
@@ -1083,8 +1099,16 @@ pub fn live_exposure_plan(
 #[derive(Debug, Clone, Serialize)]
 pub struct RampSnapshot {
     pub at: DateTime<Utc>,
-    /// An auto-exposure seed frame rather than a ramped one.
+    /// An auto-exposure seed frame rather than a ramped one (only when a
+    /// metering pass failed).
     pub seed: bool,
+    /// An unsaved auto-exposure metering still ran first (design doc §5.4).
+    pub metered: bool,
+    /// Why the shot had to meter or seed, if it did.
+    pub seed_reason: Option<exposure_ramp::SeedReason>,
+    /// The daylight sanity ceiling cut the plan (design doc §5.8).
+    pub ceiling_bound: bool,
+    pub clipped_fraction: Option<f64>,
     pub exposure_us: Option<i32>,
     pub analogue_gain: Option<f32>,
     pub colour_gains: Option<[f32; 2]>,
@@ -1452,10 +1476,27 @@ async fn observe_preview_frames(
 /// The ramp inputs for one `AutoRamp` shot.
 struct RampShot {
     settings: exposure_ramp::RampSettings,
-    plan: RampPlan,
+    decision: RampDecision,
     target_bias_ev: f64,
     sun_elevation_deg: Option<f64>,
     max_shutter_us: u64,
+}
+
+impl RampShot {
+    fn plan(&self) -> RampPlan {
+        self.decision.plan
+    }
+
+    /// Plans again from the current state, e.g. after a metering pass.
+    fn replan(&mut self, ramp: &RampStore, now: DateTime<Utc>) {
+        self.decision = exposure_ramp::decide(
+            ramp_snapshot(ramp).as_ref(),
+            now,
+            self.sun_elevation_deg,
+            &self.settings,
+            self.max_shutter_us,
+        );
+    }
 }
 
 /// Builds a `CaptureRequest` from the committed profile/settings (design
@@ -1532,7 +1573,7 @@ fn plan_ramp_shot(
         .map(|station| sun_elevation_at(station)(shot.at.with_timezone(&Utc)));
     let max_shutter_us = exposure_ramp::max_shutter_for_gap(gap, &settings);
     Some(RampShot {
-        plan: exposure_ramp::plan(
+        decision: exposure_ramp::decide(
             ramp_snapshot(ramp).as_ref(),
             now,
             sun_elevation_deg,
@@ -1560,12 +1601,20 @@ async fn fire_capture(
     gap: Option<Duration>,
     ramp: &RampStore,
 ) -> (LastCapture, Option<RampSnapshot>) {
-    let ramp_shot = plan_ramp_shot(config, shot, gap, ramp, Utc::now());
-    let request = build_capture_request(
-        config,
-        &shot.rule_slugs,
-        ramp_shot.as_ref().map(|ramp_shot| &ramp_shot.plan),
-    );
+    let mut ramp_shot = plan_ramp_shot(config, shot, gap, ramp, Utc::now());
+    let mut metered = false;
+    // Why this shot had to meter, kept past the re-plan.
+    let seed_reason = ramp_shot
+        .as_ref()
+        .and_then(|ramp_shot| ramp_shot.decision.seed_reason);
+    if let Some(ramp_shot) = ramp_shot.as_mut() {
+        log_ramp_decision(&ramp_shot.decision, &shot.rule_slugs);
+        if ramp_shot.plan() == RampPlan::Seed {
+            metered = meter_then_plan(camera, config, shot, ramp, ramp_shot).await;
+        }
+    }
+    let plan = ramp_shot.as_ref().map(RampShot::plan);
+    let request = build_capture_request(config, &shot.rule_slugs, plan.as_ref());
     let save_dng = request.save_dng;
     let settings = request.settings.clone();
     let source = request.source.clone();
@@ -1596,25 +1645,23 @@ async fn fire_capture(
             .ok()
             .and_then(|capture| capture.exposure)
             .unwrap_or_default();
-        if let (Some(exposure_us), Some(analogue_gain), Some(meter)) =
-            (exposure.exposure_us, exposure.analogue_gain, exposure.meter)
-        {
-            let observation = FrameObservation {
-                exposure_us: f64::from(exposure_us),
-                analogue_gain: f64::from(analogue_gain),
-                meter,
+        if let Some(observation) = frame_observation(&exposure) {
+            let kind = match ramp_shot.plan() {
+                RampPlan::Seed => "seed",
+                RampPlan::Manual { .. } => "plan",
             };
             if let Some(next) = exposure_ramp::observe(
                 ramp_snapshot(ramp).as_ref(),
-                &ramp_shot.plan,
+                &ramp_shot.plan(),
                 &observation,
                 Utc::now(),
                 ramp_shot.sun_elevation_deg,
                 &ramp_shot.settings,
             ) {
+                log_ramp_observation(kind, &observation, &next, &shot.rule_slugs);
                 if next.highlight.last_pull_ev > 0.0 {
                     tracing::info!(
-                        clipped_fraction = meter.clipped_fraction,
+                        clipped_fraction = observation.meter.clipped_fraction,
                         pull_ev = next.highlight.last_pull_ev,
                         offset_ev = next.highlight.offset_ev,
                         "highlight guard darkened the ramp"
@@ -1625,7 +1672,11 @@ async fn fire_capture(
         }
         RampSnapshot {
             at: Utc::now(),
-            seed: ramp_shot.plan == RampPlan::Seed,
+            seed: ramp_shot.plan() == RampPlan::Seed,
+            metered,
+            seed_reason,
+            ceiling_bound: ramp_shot.decision.ceiling_bound,
+            clipped_fraction: exposure.meter.map(|meter| meter.clipped_fraction),
             exposure_us: exposure.exposure_us,
             analogue_gain: exposure.analogue_gain,
             colour_gains: exposure.colour_gains,
@@ -1654,6 +1705,140 @@ async fn fire_capture(
         }
     };
     (outcome, snapshot)
+}
+
+/// Meter-then-shoot (design doc §5.4): with no capture measurement within
+/// the reseed window, take an unsaved auto-exposure still, fold it in as a
+/// seed and plan the shot from it, so the target curve and the daylight
+/// ceiling apply to long-gap shots too. `false` (and `ramp_shot` left a
+/// seed) when metering failed: the seed still is then the output frame, as
+/// before this pass existed.
+async fn meter_then_plan(
+    camera: &OpticCamera,
+    config: &AppConfig,
+    shot: &ForecastedShot,
+    ramp: &RampStore,
+    ramp_shot: &mut RampShot,
+) -> bool {
+    let request = build_capture_request(config, &shot.rule_slugs, Some(&RampPlan::Seed));
+    let exposure = match camera.meter(request).await {
+        Ok(exposure) => exposure,
+        Err(error) => {
+            tracing::warn!(%error, rules = ?shot.rule_slugs, "exposure ramp metering pass failed; shooting the auto-exposure seed instead");
+            return false;
+        }
+    };
+    let Some(observation) = frame_observation(&exposure) else {
+        tracing::warn!(rules = ?shot.rule_slugs, "exposure ramp metering pass had no exposure metadata or meter; shooting the auto-exposure seed instead");
+        return false;
+    };
+    let now = Utc::now();
+    let Some(next) = exposure_ramp::observe(
+        ramp_snapshot(ramp).as_ref(),
+        &RampPlan::Seed,
+        &observation,
+        now,
+        ramp_shot.sun_elevation_deg,
+        &ramp_shot.settings,
+    ) else {
+        return false;
+    };
+    log_ramp_observation("metering", &observation, &next, &shot.rule_slugs);
+    store_ramp(ramp, Some(next));
+    ramp_shot.replan(ramp, now);
+    log_ramp_decision(&ramp_shot.decision, &shot.rule_slugs);
+    matches!(ramp_shot.plan(), RampPlan::Manual { .. })
+}
+
+/// A frame's actual exposure and meter, when the backend reported them.
+fn frame_observation(exposure: &CaptureExposure) -> Option<FrameObservation> {
+    let (Some(exposure_us), Some(analogue_gain), Some(meter)) =
+        (exposure.exposure_us, exposure.analogue_gain, exposure.meter)
+    else {
+        return None;
+    };
+    Some(FrameObservation {
+        exposure_us: f64::from(exposure_us),
+        analogue_gain: f64::from(analogue_gain),
+        meter,
+    })
+}
+
+/// One INFO line per ramp decision (design doc §5.9): enough to tell from
+/// the journal alone which path planned a frame and why.
+fn log_ramp_decision(decision: &RampDecision, rules: &[String]) {
+    let (kind, shutter_us, gain, planned_log2_exposure) = match decision.plan {
+        RampPlan::Seed => ("seed", None, None, None),
+        RampPlan::Manual {
+            shutter_us,
+            gain,
+            log2_exposure,
+        } => ("plan", Some(shutter_us), Some(gain), Some(log2_exposure)),
+    };
+    tracing::info!(
+        decision = kind,
+        seed_reason = ?decision.seed_reason,
+        capture_age_s = ?decision.capture_age_s,
+        scene_ev = ?decision.scene_ev,
+        sun_elevation_deg = ?decision.sun_elevation_deg,
+        target_bias_ev = decision.target_bias_ev,
+        desired_log2_exposure = ?decision.desired_log2_exposure,
+        planned_log2_exposure = ?planned_log2_exposure,
+        step_limit_ev = ?decision.step_limit_ev,
+        step_limited = decision.step_limited,
+        ceiling_log2_exposure = ?decision.ceiling_log2_exposure,
+        ceiling_bound = decision.ceiling_bound,
+        guard_offset_ev = decision.guard_offset_ev,
+        guard_previous_excess_ev = ?decision.guard_previous_excess_ev,
+        max_shutter_us = decision.max_shutter_us,
+        shutter_us = ?shutter_us,
+        gain = ?gain,
+        rules = ?rules,
+        "exposure ramp decision"
+    );
+    if decision.ceiling_bound {
+        tracing::warn!(
+            desired_log2_exposure = ?decision.desired_log2_exposure,
+            ceiling_log2_exposure = ?decision.ceiling_log2_exposure,
+            sun_elevation_deg = ?decision.sun_elevation_deg,
+            scene_ev = ?decision.scene_ev,
+            rules = ?rules,
+            "exposure ramp plan cut by the daylight ceiling; the scene estimate is probably wrong"
+        );
+    }
+}
+
+/// One INFO line per frame the ramp learns from, and a WARN for an
+/// overexposed output frame.
+fn log_ramp_observation(
+    kind: &'static str,
+    observation: &FrameObservation,
+    next: &RampState,
+    rules: &[String],
+) {
+    tracing::info!(
+        frame = kind,
+        exposure_us = observation.exposure_us,
+        analogue_gain = observation.analogue_gain,
+        luminance = observation.meter.luminance,
+        clipped_fraction = observation.meter.clipped_fraction,
+        scene_ev = next.scene_ev,
+        guard_offset_ev = next.highlight.offset_ev,
+        rules = ?rules,
+        "exposure ramp observed"
+    );
+    if kind != "metering"
+        && observation.meter.clipped_fraction >= exposure_ramp::OVEREXPOSED_CLIPPED_FRACTION
+    {
+        tracing::warn!(
+            exposure_us = observation.exposure_us,
+            analogue_gain = observation.analogue_gain,
+            luminance = observation.meter.luminance,
+            clipped_fraction = observation.meter.clipped_fraction,
+            rules = ?rules,
+            "ramped capture is overexposed"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2321,6 +2506,7 @@ mod actor_tests {
         };
         let ramp: RampStore = Arc::new(Mutex::new(Some(RampState {
             updated_at: now,
+            captured_at: Some(now),
             scene_ev: -12.0,
             planned_log2_exposure: Some(10.0),
             highlight: Default::default(),
@@ -2335,7 +2521,7 @@ mod actor_tests {
         auto.schedule.exposure = ScheduleExposure::AutoRamp(exposure_ramp::RampSettings::default());
         let ramp_shot =
             plan_ramp_shot(&auto, &shot, Some(Duration::seconds(30)), &ramp, now).unwrap();
-        assert_eq!(ramp_shot.plan, RampPlan::Seed);
+        assert_eq!(ramp_shot.plan(), RampPlan::Seed);
         assert_eq!(ramp_shot.max_shutter_us, 2_045_454);
         // No station: the target stays at the day level.
         assert_eq!(ramp_shot.sun_elevation_deg, None);
@@ -2386,6 +2572,7 @@ mod actor_tests {
 
         let state = RampState {
             updated_at: now - Duration::minutes(1),
+            captured_at: Some(now - Duration::minutes(1)),
             scene_ev: -26.0,
             planned_log2_exposure: Some(21.0),
             highlight: exposure_ramp::HighlightGuard {
@@ -2420,6 +2607,20 @@ mod actor_tests {
         assert!(live.preview.is_some());
         assert_eq!(live.preview, live.preview_unguarded);
         assert!(seeding.preview.is_none() && seeding.preview_unguarded.is_none());
+        // A capture a minute ago: the next capture plans, no metering pass.
+        assert!(seeding.capture_meters_first);
+        assert!(!live.capture_meters_first);
+        assert_eq!(live.ramp_captured_at, state.captured_at);
+        // Preview frames alone (2026-09-28): the preview still shows the
+        // plan, but the next capture meters first.
+        let preview_only = RampState {
+            captured_at: None,
+            updated_at: now,
+            ..state
+        };
+        let preview_live = live_exposure_plan(&schedule, Some(&preview_only), now).unwrap();
+        assert!(!preview_live.seeding && preview_live.preview.is_some());
+        assert!(preview_live.capture_meters_first);
         let clipping = RampState {
             highlight: exposure_ramp::HighlightGuard {
                 // 4% clipped at the unguarded frame: 2 EV over a 1% budget.

@@ -11,7 +11,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, warn};
 
 use crate::{
-    camera::{CameraError, CaptureRequest, CaptureResult, PreviewFrame, StreamRequest},
+    camera::{
+        CameraError, CaptureExposure, CaptureRequest, CaptureResult, PreviewFrame, StreamRequest,
+    },
     native_camera::NativeCameraBackend,
 };
 
@@ -73,6 +75,10 @@ enum CameraCommand {
         capture_dir: PathBuf,
         request: CaptureRequest,
         reply: oneshot::Sender<Result<CaptureResult, CameraError>>,
+    },
+    Meter {
+        request: CaptureRequest,
+        reply: oneshot::Sender<Result<CaptureExposure, CameraError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -164,6 +170,16 @@ impl OpticCamera {
         receive(response).await?
     }
 
+    /// Takes a still exactly like `capture_to_stage` and meters it, but
+    /// encodes and writes nothing: exposure ramping's metering pass
+    /// (`docs/optic-daemon-exposure-ramping.md` §5.4).
+    pub async fn meter(&self, request: CaptureRequest) -> Result<CaptureExposure, CameraError> {
+        let (reply, response) = oneshot::channel();
+        self.enqueue(CameraCommand::Meter { request, reply })
+            .await?;
+        receive(response).await?
+    }
+
     pub async fn shutdown(&self) -> Result<(), CameraError> {
         let (reply, response) = oneshot::channel();
         self.enqueue(CameraCommand::Shutdown { reply }).await?;
@@ -240,6 +256,10 @@ async fn run_actor(
                 reply,
             } => {
                 let _ = reply.send(backend.capture_to_stage(&capture_dir, request).await);
+                false
+            }
+            CameraCommand::Meter { request, reply } => {
+                let _ = reply.send(backend.meter(request).await);
                 false
             }
             CameraCommand::Shutdown { reply } => {
