@@ -38,8 +38,8 @@ mod imp {
     use crate::{
         camera::{
             CameraError, CameraSettings, CaptureExposure, CaptureFile, CaptureProfile,
-            CaptureRequest, CaptureResult, CaptureSource, PreviewFrame, StreamRequest,
-            format_rule_tags, still_frame_duration_limits_us,
+            CaptureRequest, CaptureResult, CaptureSource, PreviewFrame, StreamRequest, WarmupFrame,
+            capture_this_frame, format_rule_tags, still_frame_duration_limits_us,
         },
         exif::{ExifMetadata, exif_app1, insert_exif},
         exposure_ramp::meter_yuv420,
@@ -588,7 +588,13 @@ mod imp {
         camera.on_request_completed(move |request| {
             let _ = completed_tx.send(request);
         });
-        camera.start(None)?;
+        let mut start_controls = ControlList::new();
+        set_controls(
+            &mut start_controls,
+            &settings,
+            streaming.then_some(profile.preview_spec(downsample).fps),
+        )?;
+        camera.start(Some(&start_controls))?;
         for request in requests {
             if let Err((_, error)) = camera.queue_request(request) {
                 let _ = camera.stop();
@@ -690,8 +696,17 @@ mod imp {
         settings: &CameraSettings,
         fps: Option<u8>,
     ) -> Result<(), CameraError> {
-        let controls = request.controls_mut();
+        set_controls(request.controls_mut(), settings, fps)
+    }
 
+    /// The controls every request of a pipeline carries; also passed to
+    /// `camera.start()` so the first frames use them instead of the previous
+    /// pipeline's (worklogs/2026-09-23-capture-preview-blackout.md).
+    fn set_controls(
+        controls: &mut ControlList,
+        settings: &CameraSettings,
+        fps: Option<u8>,
+    ) -> Result<(), CameraError> {
         // Permanent AEC Bypass: Pure Manual open-loop
         controls
             .set(controls::AeEnable(false))
@@ -803,9 +818,11 @@ mod imp {
 
         let warmup_started = Instant::now();
         let mut last_frame_at = warmup_started;
+        let settings = pipeline.settings.clone();
         let result = (|| {
             let target = pipeline.request_count + CAPTURE_WARMUP_FRAMES;
             let mut captured = None;
+            let mut previous_colour_gains = None;
             while pipeline.frame_count < target {
                 let mut request = pipeline
                     .completed
@@ -861,7 +878,32 @@ mod imp {
                     "capture perf"
                 );
 
-                if pipeline.frame_count == target {
+                // A manual still keeps the first frame really exposed as
+                // requested; anything else waits for `target` as before
+                // (worklogs/2026-09-23-capture-preview-blackout.md).
+                let frame = WarmupFrame {
+                    index: u32::try_from(pipeline.frame_count).unwrap_or(u32::MAX),
+                    exposure_us,
+                    analogue_gain,
+                    colour_gains,
+                };
+                let keep = pipeline.frame_count >= target
+                    || capture_this_frame(&settings, &frame, previous_colour_gains);
+                previous_colour_gains = colour_gains;
+                if keep
+                    && pipeline.frame_count >= target
+                    && settings.shutter_us > 0
+                    && settings.gain > 0.0
+                {
+                    warn!(
+                        requested_us = settings.shutter_us,
+                        requested_gain = settings.gain,
+                        ?exposure_us,
+                        ?analogue_gain,
+                        "manual still never matched its requested exposure; kept the last warmup frame"
+                    );
+                }
+                if keep {
                     let yuv = copy_buffer(
                         request
                             .buffer(&pipeline.streams[pipeline.still_index])
@@ -890,6 +932,9 @@ mod imp {
                         still: pipeline.still_info.clone(),
                         raw_info: pipeline.raw_info.clone(),
                     });
+                    // An early keep must end the loop, or a later frame
+                    // would replace it.
+                    break;
                 } else {
                     request.reuse(ReuseFlag::REUSE_BUFFERS);
                     apply_controls(&mut request, &pipeline.settings, None)?;

@@ -59,6 +59,7 @@
       <fieldset class="focus-tools" aria-label="Focus tools">
         <button id="focus-histogram-toggle" type="button" aria-pressed="false">Histogram</button>
         <button id="focus-peaking-toggle" type="button" aria-pressed="false">Peaking</button>
+        <button id="focus-clipping-toggle" type="button" aria-pressed="false" title="Zebra stripes where the frame blows out (luma ≥ 250) — what the highlight clip budget counts">Clipping</button>
         <button id="focus-loupe-toggle" type="button" aria-pressed="false">Loupe</button>
         <label id="peaking-sensitivity-field" class="focus-slider" hidden>
           <span>Peaking sensitivity</span>
@@ -215,6 +216,10 @@
             </label>
             <div id="scheduled-exposure-panel" hidden>
               <p id="scheduled-exposure-caption" class="ramp-caption" role="status"></p>
+              <div class="ramp-guard">
+                <p id="ramp-guard-line" class="ramp-caption" aria-live="off" hidden></p>
+                <button id="ramp-compare" type="button" aria-pressed="false" hidden title="While held, the live preview drops the highlight guard so you can see what it prevents">Hold to compare without guard</button>
+              </div>
               <div class="ramp-grid">
                 <label>
                   <span>Night look <output id="ramp-night-look-value">−2.0 EV at night</output></span>
@@ -251,6 +256,10 @@
                   <label>
                     <span>Min shutter (ms)</span>
                     <input id="ramp-min-shutter" type="number" min="0.1" max="5000" step="0.1" value="0.1" data-ramp-input>
+                  </label>
+                  <label title="At night, the share of the frame allowed to blow out (lamps, signs) before the ramp backs off. 0 turns the guard off.">
+                    <span>Highlight clip budget (%)</span>
+                    <input id="ramp-clip-budget" type="number" min="0" max="10" step="0.25" value="1" data-ramp-input>
                   </label>
                 </div>
               </details>

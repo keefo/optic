@@ -106,3 +106,85 @@ test("a ramped plan ignores the preview's (override) values", () => {
   assert.equal(ramp.describePlan(manualPlan(3843022, 1), preview).shutter, "3.8 s");
   assert.equal(ramp.describePlan(manualPlan(3843022, 1), preview).gain, "1.00×");
 });
+
+const guardPlan = (extra = {}) => ({
+  seeding: false,
+  shutter_us: 3000000,
+  gain: 1,
+  sun_elevation_deg: -25,
+  highlight_active: true,
+  highlight_ev: -0.5,
+  highlight_target_ev: -1.41,
+  preview: { shutter_us: 1130000, gain: 1 },
+  preview_unguarded: { shutter_us: 4227272, gain: 1.13 },
+  ...extra,
+});
+
+test("the preview runs the guard target, or the unguarded frame while comparing", () => {
+  assert.equal(ramp.previewSource(null), null);
+  assert.deepEqual(ramp.previewSource({ seeding: true }), { seeding: true });
+  assert.deepEqual(ramp.previewSource(guardPlan()), {
+    seeding: false,
+    shutter_us: 1130000,
+    gain: 1,
+  });
+  assert.deepEqual(ramp.previewSource(guardPlan(), true), {
+    seeding: false,
+    shutter_us: 4227272,
+    gain: 1.13,
+  });
+  // An older daemon without preview plans: the next frame, as before.
+  const old = { seeding: false, shutter_us: 3000000, gain: 1 };
+  assert.equal(ramp.previewSource(old), old);
+  assert.equal(ramp.previewSource(old, true), old);
+});
+
+test("the guard line reports active, inactive and off states", () => {
+  assert.equal(ramp.describeGuardLine(null, 1), "");
+  // A daemon without the guard fields shows nothing.
+  assert.equal(ramp.describeGuardLine({ seeding: false }, 1), "");
+  assert.equal(
+    ramp.describeGuardLine(guardPlan(), 1, 0.0265),
+    "Highlight guard · budget 1.00% · clipped now 2.65% · preview −1.4 EV · timelapse −0.5 EV",
+  );
+  assert.equal(
+    ramp.describeGuardLine(guardPlan(), 0.5),
+    "Highlight guard · budget 0.50% · preview −1.4 EV · timelapse −0.5 EV",
+  );
+  assert.equal(
+    ramp.describeGuardLine(guardPlan({ highlight_active: false, sun_elevation_deg: 12.34 }), 1, 0.05),
+    "Highlight guard inactive (sun 12.3°); it acts only with the sun below the horizon · clipped now 5.00%",
+  );
+  assert.equal(
+    ramp.describeGuardLine(guardPlan({ highlight_active: false, sun_elevation_deg: null }), 1),
+    "Highlight guard inactive (no station set); it acts only with the sun below the horizon",
+  );
+  assert.equal(
+    ramp.describeGuardLine(guardPlan({ highlight_active: false }), 0, 0.123),
+    "Highlight guard off (budget 0%) · clipped now 12.3%",
+  );
+});
+
+test("ramp defaults mirror RampSettings::default()", () => {
+  assert.equal(ramp.RAMP_DEFAULTS.clip_budget_percent, 1);
+});
+
+test("the preview is re-requested only for a real change", () => {
+  const source = (shutter_us, gain = 1) => ({ seeding: false, shutter_us, gain });
+  const seeding = { seeding: true };
+  // First request, and switching Scheduled exposure off or on.
+  assert.equal(ramp.previewNeedsUpdate(null, source(600000)), true);
+  assert.equal(ramp.previewNeedsUpdate(source(600000), null), true);
+  assert.equal(ramp.previewNeedsUpdate(null, null), false);
+  // Seeding starts or ends.
+  assert.equal(ramp.previewNeedsUpdate(seeding, source(600000)), true);
+  assert.equal(ramp.previewNeedsUpdate(source(600000), seeding), true);
+  assert.equal(ramp.previewNeedsUpdate(seeding, { seeding: true }), false);
+  // Measured jitter on 2026-09-23: gain 5.22-6.87 around 118,745 µs. A step
+  // inside 1/6 EV is left alone; a larger one goes through.
+  assert.equal(ramp.previewNeedsUpdate(source(118745, 6.28), source(118745, 6.48)), false);
+  assert.equal(ramp.previewNeedsUpdate(source(650000), source(600000)), false); // 0.12 EV
+  assert.equal(ramp.previewNeedsUpdate(source(700000), source(600000)), true); // 0.22 EV
+  assert.equal(ramp.previewNeedsUpdate(source(118745, 5.22), source(118745, 6.87)), true);
+  assert.equal(ramp.previewNeedsUpdate(source(1000000), source(500000)), true);
+});

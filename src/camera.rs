@@ -262,6 +262,71 @@ pub(crate) const STILL_AUTO_MAX_FRAME_DURATION_US: i64 = 500_000;
 /// interval (`exposure_ramp::max_shutter_for_gap`).
 pub(crate) const STILL_CAPTURE_FRAMES: u32 = 11;
 
+/// How close a warmup frame's metadata exposure and gain must be to a manual
+/// request for the frame to count as exposed as requested. The sensor
+/// quantises: 3,440,629 µs requested ran at 3,474,267 µs (+1.0%).
+const MANUAL_EXPOSURE_TOLERANCE: f64 = 0.05;
+/// Largest frame-to-frame colour-gain change that counts as AWB settled.
+const SETTLED_COLOUR_GAIN_TOLERANCE: f64 = 0.01;
+
+/// One completed still-pipeline frame as the capture loop sees it: its
+/// 1-based index and the metadata the camera reports for it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct WarmupFrame {
+    pub index: u32,
+    pub exposure_us: Option<i32>,
+    pub analogue_gain: Option<f32>,
+    pub colour_gains: Option<[f32; 2]>,
+}
+
+/// Whether the capture loop should keep `frame` as the still
+/// (worklogs/2026-09-23-capture-preview-blackout.md). A fully manual request
+/// (shutter and gain both set, as every ramped frame is) takes the first
+/// frame that the camera reports at the requested exposure and gain, with
+/// white balance no longer moving: at night that is frame 5 of 11, and
+/// frames 6–11 only repeated it at the cost of about 21 s of preview
+/// blackout. Everything else, and a manual request that never matches,
+/// takes frame `STILL_CAPTURE_FRAMES` as before.
+pub(crate) fn capture_this_frame(
+    settings: &CameraSettings,
+    frame: &WarmupFrame,
+    previous_colour_gains: Option<[f32; 2]>,
+) -> bool {
+    if frame.index >= STILL_CAPTURE_FRAMES {
+        return true;
+    }
+    if settings.shutter_us == 0 || settings.gain <= 0.0 {
+        return false;
+    }
+    let close = |actual: f64, wanted: f64, tolerance: f64| {
+        wanted > 0.0 && ((actual - wanted) / wanted).abs() <= tolerance
+    };
+    let exposed_as_requested = frame.exposure_us.is_some_and(|us| {
+        close(
+            f64::from(us),
+            settings.shutter_us as f64,
+            MANUAL_EXPOSURE_TOLERANCE,
+        )
+    }) && frame.analogue_gain.is_some_and(|gain| {
+        close(
+            f64::from(gain),
+            f64::from(settings.gain),
+            MANUAL_EXPOSURE_TOLERANCE,
+        )
+    });
+    let white_balance_settled = match (frame.colour_gains, previous_colour_gains) {
+        (Some(now), Some(before)) => now.iter().zip(before).all(|(&now, before)| {
+            close(
+                f64::from(now),
+                f64::from(before),
+                SETTLED_COLOUR_GAIN_TOLERANCE,
+            )
+        }),
+        _ => false,
+    };
+    exposed_as_requested && white_balance_settled
+}
+
 /// `FrameDurationLimits` for still-capture requests: as fast as the sensor
 /// mode and the exposure allow. Auto shutter leaves auto exposure its old
 /// headroom; a manual shutter is never truncated by the limit.
@@ -733,6 +798,122 @@ mod tests {
         assert_eq!(
             still_frame_duration_limits_us(5_000_000),
             [STILL_MIN_FRAME_DURATION_US, 5_000_000]
+        );
+    }
+
+    /// The 2026-09-23 23:54 night capture's warmup, from the journal:
+    /// frames 1–3 at the preview's exposure, frame 4 transitional (preview
+    /// exposure, long frame duration), frames 5–11 at the still's.
+    fn night_warmup() -> Vec<WarmupFrame> {
+        let preview = (118_745, 12.190_476);
+        let still = (3_474_267, 1.0);
+        let gains = [
+            [3.240_152_1, 1.430_216_4],
+            [3.240_35, 1.430_151_2],
+            [3.240_538_1, 1.430_089_4],
+            [3.240_716_7, 1.430_030_6],
+            [3.240_886_4, 1.429_974_7],
+            [3.241_047_9, 1.429_921_6],
+            [3.241_201, 1.429_871_2],
+            [3.241_346_4, 1.429_823_3],
+            [3.241_484_6, 1.429_777_9],
+            [3.239_718_2, 1.430_359_2],
+            [3.238_04, 1.430_911_7],
+        ];
+        (1..=11)
+            .map(|index| {
+                let (exposure_us, analogue_gain) = if index <= 4 { preview } else { still };
+                WarmupFrame {
+                    index,
+                    exposure_us: Some(exposure_us),
+                    analogue_gain: Some(analogue_gain),
+                    colour_gains: Some(gains[index as usize - 1]),
+                }
+            })
+            .collect()
+    }
+
+    fn manual(shutter_us: u64, gain: f32) -> CameraSettings {
+        CameraSettings {
+            shutter_us,
+            gain,
+            ..CameraSettings::default()
+        }
+    }
+
+    /// The index of the frame the capture loop keeps.
+    fn kept(settings: &CameraSettings, frames: &[WarmupFrame]) -> u32 {
+        let mut previous = None;
+        for frame in frames {
+            if capture_this_frame(settings, frame, previous) {
+                return frame.index;
+            }
+            previous = frame.colour_gains;
+        }
+        panic!("no frame kept");
+    }
+
+    #[test]
+    fn a_manual_night_still_keeps_the_first_frame_at_its_exposure() {
+        // Requested 3,440,629 µs; the sensor ran 3,474,267 (+1.0%).
+        let settings = manual(3_440_629, 1.0);
+        assert_eq!(kept(&settings, &night_warmup()), 5);
+        // Never a frame still at the preview's exposure (1–3) or the
+        // transitional frame 4.
+        for frame in &night_warmup()[..4] {
+            assert!(!capture_this_frame(&settings, frame, Some([3.24, 1.43])));
+        }
+    }
+
+    #[test]
+    fn exposure_and_gain_must_match_within_five_percent() {
+        let frames = night_warmup();
+        // 6% off in shutter or gain: no frame matches, so frame 11 as before.
+        assert_eq!(kept(&manual(3_700_000, 1.0), &frames), 11);
+        assert_eq!(kept(&manual(3_474_267, 1.07), &frames), 11);
+        assert_eq!(kept(&manual(3_474_267 * 104 / 100, 1.04), &frames), 5);
+    }
+
+    #[test]
+    fn white_balance_must_have_settled() {
+        let mut frames = night_warmup();
+        // AWB Auto still moving after the exposure change (+3%, then
+        // +1.5%), then settling at its new value.
+        frames[4].colour_gains = Some([3.34, 1.43]);
+        frames[5].colour_gains = Some([3.39, 1.43]);
+        for frame in &mut frames[6..] {
+            frame.colour_gains = Some([3.395, 1.43]);
+        }
+        assert_eq!(kept(&manual(3_440_629, 1.0), &frames), 7);
+        // No colour gains reported at all: never judged settled, frame 11.
+        let blind: Vec<_> = night_warmup()
+            .into_iter()
+            .map(|frame| WarmupFrame {
+                colour_gains: None,
+                ..frame
+            })
+            .collect();
+        assert_eq!(kept(&manual(3_440_629, 1.0), &blind), 11);
+        // A frame at the right exposure but with no previous frame to
+        // compare against waits one frame (start controls may make frame 1
+        // correct already).
+        let first = WarmupFrame {
+            index: 1,
+            exposure_us: Some(3_474_267),
+            analogue_gain: Some(1.0),
+            colour_gains: Some([3.24, 1.43]),
+        };
+        assert!(!capture_this_frame(&manual(3_440_629, 1.0), &first, None));
+    }
+
+    #[test]
+    fn auto_exposure_stills_keep_the_full_warmup() {
+        let frames = night_warmup();
+        assert_eq!(kept(&manual(0, 1.0), &frames), 11);
+        assert_eq!(kept(&manual(3_474_267, 0.0), &frames), 11);
+        assert_eq!(
+            kept(&CameraSettings::default(), &frames),
+            STILL_CAPTURE_FRAMES
         );
     }
 }

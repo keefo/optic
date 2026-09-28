@@ -172,3 +172,19 @@ test("clientToImagePoint: clamp pins drags outside the image to its edges", () =
   // An unsized element still gives null, even with clamp.
   assert.equal(focus.clientToImagePoint(1, 1, { left: 0, top: 0, width: 0, height: 0 }, 400, 200, true), null);
 });
+
+test("clipping marks BT.601 luma >= 250, the daemon's clipped threshold", () => {
+  assert.equal(focus.clippedMask(solid(4, 4, [250, 250, 250])).fraction, 1);
+  assert.equal(focus.clippedMask(solid(4, 4, [249, 249, 249])).fraction, 0);
+  // Saturated colour is not clipped luma: pure red is Y = 76.
+  assert.equal(focus.clippedMask(solid(4, 4, [255, 0, 0])).fraction, 0);
+  // Warm lamp light either side of the threshold: Y = 248.7 and 250.4.
+  assert.equal(focus.clippedMask(solid(4, 4, [255, 255, 200])).fraction, 0);
+  assert.equal(focus.clippedMask(solid(4, 4, [255, 255, 215])).fraction, 1);
+});
+
+test("clipping reports which pixels and what fraction", () => {
+  const { mask, fraction } = focus.clippedMask(step(8, 2, 40, 255));
+  assert.equal(fraction, 0.5);
+  assert.deepEqual(Array.from(mask.slice(0, 8)), [0, 0, 0, 0, 1, 1, 1, 1]);
+});

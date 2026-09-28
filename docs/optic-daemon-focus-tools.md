@@ -45,6 +45,7 @@ viewing computer, not the Pi.
    | `toGray(image)` | Rec. 709 luma as `Float32Array` |
    | `sobelMagnitude(gray, w, h)` | Sobel gradient magnitude; one-pixel border is 0 |
    | `peakingThreshold(sensitivity)` | Absolute Sobel threshold: sensitivity 0 → 220, 1 → 40 (linear, clamped) |
+   | `clippedMask(image)` | 0/1 mask and fraction of pixels whose BT.601 luma is ≥ 250, the daemon's `CLIPPED_LUMA` (added 2026-09-23) |
    | `sharpnessScore(gray, w, h)` | Tenengrad: mean squared Sobel magnitude over the interior |
    | `loupeRect(cx, cy, size, fw, fh)` | Crop rectangle centred on the point, clamped inside the frame, shrunk to the frame if smaller |
    | `clientToImagePoint(x, y, rect, nw, nh, clamp)` | Maps a click to image pixels under `object-fit: contain` letterboxing; `null` outside the image, or with `clamp` the nearest image-edge point (used while dragging) |
@@ -56,8 +57,9 @@ viewing computer, not the Pi.
 
 ### 3.1 Controls
 
-Under the preview is a toolbar with three toggle buttons (`aria-pressed`):
-**Histogram**, **Peaking** and **Loupe**. A **Peaking sensitivity** slider
+Under the preview is a toolbar with four toggle buttons (`aria-pressed`):
+**Histogram**, **Peaking**, **Clipping** (added 2026-09-23, §3.3.1) and
+**Loupe**. A **Peaking sensitivity** slider
 (0–100, default 50) is shown only while peaking is on. All tools are off by
 default. The toggle state and sensitivity are remembered per viewer in
 `localStorage` (`optic.focusTools`); every access is wrapped in try/catch
@@ -83,6 +85,19 @@ would always highlight the same fraction of pixels; an absolute threshold
 makes a defocused frame light up less, so the highlighted area grows as
 focus improves. Higher sensitivity lowers the threshold and highlights
 more.
+
+### 3.3.1 Clipping (2026-09-23)
+
+The **Clipping** tool paints red and dark zebra stripes on the same overlay canvas
+over every pixel whose BT.601 luma is ≥ 250. That is the daemon's own
+definition of a clipped sample, and what the exposure ramp's highlight clip
+budget counts (`docs/optic-daemon-exposure-ramping.md` §5.6–§5.7). It
+differs from the histogram's `highlightClip`, which counts any channel
+≥ 254. It works in every exposure mode. With peaking also on, both marks
+are drawn into one image. Like peaking, it runs on the ≤ 960 px working copy,
+so a lamp core smaller than a working pixel can fall under the threshold.
+The authoritative figure is the daemon's metered fraction, which the
+Scheduled exposure panel shows from `X-Optic-Clipped`.
 
 ### 3.4 Loupe
 

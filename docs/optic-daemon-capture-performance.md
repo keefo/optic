@@ -394,3 +394,29 @@ Tracked in `worklogs/2026-09-20-capture-latency.md`.
   stopped first. Candidate next step: pass the still limits to
   `camera.start()`. After that, reducing `CAPTURE_WARMUP_FRAMES` (§4 item 2).
 
+## 8. Start Controls and Early Keep for Manual Stills (2026-09-23)
+
+Implemented and measured on the Pi; see
+`worklogs/2026-09-23-capture-preview-blackout.md`. Results: start controls
+apply from **frame 1** for both pipelines. A manual night still keeps frame 2:
+`warmup_and_capture` went from 25.1 s (at 3.47 s) to 12.8 s (at 4.2 s) and 6.2 s (at 3.05 s).
+The restarted preview's first frames use the preview exposure, and a dusk capture
+left a 4.0 s preview gap. The first frame after start sometimes takes about 2× its
+exposure.
+
+- Measured before, at night (a 23:54 ramped capture of 3,440,629 µs × 1.0):
+  frames 1–3 ran at the preview's 118,745 µs × 12.19, frame 4 was
+  transitional, and frames 5–11 were all at the still's 3,474,267 µs. Colour
+  gains moved < 0.1% across all 11 frames. `warmup_and_capture` took 25,072 ms,
+  and the preview was blacked out for that long, then restarted with its first
+  frames still at the still's exposure.
+- **Start controls:** `start_pipeline` passes the same controls its requests
+  carry to `camera.start()` (`set_controls`), for preview and still pipelines.
+- **Early keep:** a fully manual still (shutter and gain both > 0) keeps the
+  first frame whose metadata exposure and gain are within 5% of the request
+  and whose colour gains are within 1% of the previous frame's
+  (`camera::capture_this_frame`). Auto-exposure stills, and manual stills
+  that never match, keep frame 11 as before (the latter with a warning).
+  `CAPTURE_WARMUP_FRAMES` is unchanged, and so is the §5.5 interval budget in the
+  exposure-ramping doc (still sized for 11 frames, now a conservative bound).
+

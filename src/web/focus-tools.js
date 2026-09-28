@@ -12,6 +12,9 @@
   const LUMA_B = 0.0722;
   const SHADOW_CLIP_LUMA = 2;
   const HIGHLIGHT_CLIP_CHANNEL = 254;
+  // The daemon's own definition of a clipped sample: BT.601 luma >= 250
+  // (`CLIPPED_LUMA`, docs/optic-daemon-exposure-ramping.md §5.1/§5.7).
+  const CLIPPED_LUMA = 250;
 
   // Histogram of R, G, B and Rec. 709 luma (256 bins each), plus the
   // fraction of pixels crushed to black (luma <= 2) or with any channel
@@ -140,8 +143,26 @@
     return { x, y };
   }
 
+  // Which pixels the highlight guard counts as clipped: BT.601 luma (the Y
+  // the daemon meters) >= CLIPPED_LUMA. Returns a 0/1 mask and the fraction.
+  function clippedMask(image) {
+    const { data, width, height } = image;
+    const total = width * height;
+    const mask = new Uint8Array(total);
+    let clipped = 0;
+    for (let pixel = 0, index = 0; pixel < total; pixel += 1, index += 4) {
+      const y = 0.299 * data[index] + 0.587 * data[index + 1] + 0.114 * data[index + 2];
+      if (Math.round(y) >= CLIPPED_LUMA) {
+        mask[pixel] = 1;
+        clipped += 1;
+      }
+    }
+    return { mask, fraction: total ? clipped / total : 0 };
+  }
+
   const pure = {
     computeHistogram,
+    clippedMask,
     toGray,
     sobelMagnitude,
     peakingThreshold,
@@ -167,6 +188,7 @@
   const ui = {
     histogramToggle: $("#focus-histogram-toggle"),
     peakingToggle: $("#focus-peaking-toggle"),
+    clippingToggle: $("#focus-clipping-toggle"),
     loupeToggle: $("#focus-loupe-toggle"),
     sensitivityField: $("#peaking-sensitivity-field"),
     sensitivity: $("#peaking-sensitivity"),
@@ -187,6 +209,7 @@
   const state = {
     histogram: false,
     peaking: false,
+    clipping: false,
     loupe: false,
     sensitivity: 0.5,
     point: null, // normalized { x, y } in 0..1; null = frame centre
@@ -203,6 +226,7 @@
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
       state.histogram = saved.histogram === true;
       state.peaking = saved.peaking === true;
+      state.clipping = saved.clipping === true;
       state.loupe = saved.loupe === true;
       if (Number.isFinite(saved.sensitivity)) state.sensitivity = saved.sensitivity;
     } catch (_) {
@@ -217,6 +241,7 @@
         JSON.stringify({
           histogram: state.histogram,
           peaking: state.peaking,
+          clipping: state.clipping,
           loupe: state.loupe,
           sensitivity: state.sensitivity,
         }),
@@ -227,18 +252,19 @@
   }
 
   function anyEnabled() {
-    return state.histogram || state.peaking || state.loupe;
+    return state.histogram || state.peaking || state.clipping || state.loupe;
   }
 
   function syncControls() {
     ui.histogramToggle.setAttribute("aria-pressed", String(state.histogram));
     ui.peakingToggle.setAttribute("aria-pressed", String(state.peaking));
+    ui.clippingToggle?.setAttribute("aria-pressed", String(state.clipping));
     ui.loupeToggle.setAttribute("aria-pressed", String(state.loupe));
     ui.sensitivityField.hidden = !state.peaking;
     ui.sensitivity.value = String(Math.round(state.sensitivity * 100));
     ui.histogramPanel.hidden = !state.histogram;
     ui.loupePanel.hidden = !state.loupe;
-    ui.overlay.hidden = !(state.peaking || state.loupe);
+    ui.overlay.hidden = !(state.peaking || state.clipping || state.loupe);
     ui.preview.classList.toggle("loupe-target", state.loupe);
     if (!state.histogram) ui.histogramClip.textContent = "";
     if (!state.loupe) resetBest();
@@ -304,17 +330,34 @@
     }
     const context = overlay.getContext("2d");
     context.clearRect(0, 0, width, height);
-    if (state.peaking) {
-      const gray = toGray(image);
-      const magnitude = sobelMagnitude(gray, width, height);
-      const threshold = peakingThreshold(state.sensitivity);
+    if (state.peaking || state.clipping) {
+      // One ImageData for both: putImageData replaces, it doesn't blend.
       const mask = context.createImageData(width, height);
-      for (let pixel = 0, index = 0; pixel < magnitude.length; pixel += 1, index += 4) {
-        if (magnitude[pixel] >= threshold) {
-          mask.data[index] = 255;
-          mask.data[index + 1] = 40;
-          mask.data[index + 2] = 90;
-          mask.data[index + 3] = 255;
+      if (state.peaking) {
+        const gray = toGray(image);
+        const magnitude = sobelMagnitude(gray, width, height);
+        const threshold = peakingThreshold(state.sensitivity);
+        for (let pixel = 0, index = 0; pixel < magnitude.length; pixel += 1, index += 4) {
+          if (magnitude[pixel] >= threshold) {
+            mask.data[index] = 255;
+            mask.data[index + 1] = 40;
+            mask.data[index + 2] = 90;
+            mask.data[index + 3] = 255;
+          }
+        }
+      }
+      if (state.clipping) {
+        // Zebra stripes, red and dark, so they show on a white blow-out.
+        const clipped = clippedMask(image).mask;
+        for (let pixel = 0, index = 0; pixel < clipped.length; pixel += 1, index += 4) {
+          if (!clipped[pixel]) continue;
+          const x = pixel % width;
+          const y = (pixel - x) / width;
+          const stripe = ((x + y) >> 2) & 1;
+          mask.data[index] = stripe ? 235 : 20;
+          mask.data[index + 1] = stripe ? 30 : 20;
+          mask.data[index + 2] = stripe ? 30 : 20;
+          mask.data[index + 3] = stripe ? 255 : 170;
         }
       }
       context.putImageData(mask, 0, 0);
@@ -375,7 +418,7 @@
     const width = Math.max(1, Math.round(img.naturalWidth * scale));
     const height = Math.max(1, Math.round(img.naturalHeight * scale));
     try {
-      if (state.histogram || state.peaking) {
+      if (state.histogram || state.peaking || state.clipping) {
         if (work.width !== width || work.height !== height) {
           work.width = width;
           work.height = height;
@@ -383,7 +426,9 @@
         workContext.drawImage(img, 0, 0, width, height);
         const image = workContext.getImageData(0, 0, width, height);
         if (state.histogram) drawHistogram(computeHistogram(image));
-        if (state.peaking || state.loupe) drawOverlay(image, width, height, scale);
+        if (state.peaking || state.clipping || state.loupe) {
+          drawOverlay(image, width, height, scale);
+        }
       } else if (state.loupe) {
         drawOverlay({ data: new Uint8ClampedArray(0), width, height }, width, height, scale);
       }
@@ -406,6 +451,7 @@
 
   ui.histogramToggle.addEventListener("click", () => toggle("histogram"));
   ui.peakingToggle.addEventListener("click", () => toggle("peaking"));
+  ui.clippingToggle?.addEventListener("click", () => toggle("clipping"));
   ui.loupeToggle.addEventListener("click", () => toggle("loupe"));
   ui.sensitivity.addEventListener("input", () => {
     state.sensitivity = Number(ui.sensitivity.value) / 100;
