@@ -182,6 +182,8 @@ deployed, hardware-validated, soak-tested, and user-accepted.
 - Do not use bare `swapon` (or other `/usr/sbin` tools) in non-interactive SSH commands on the Pi (`liam`'s PATH there is `/usr/local/bin:/usr/bin:/bin:/usr/games`: `swapon: command not found`); use the full path such as `/usr/sbin/swapon --show`, or `cat /proc/swaps`, instead.
 - Do not use `iw` or `rfkill` on the Pi (not installed); use `nmcli -t device wifi list --rescan no` and `/sys/class/rfkill/rfkill*/{name,type,soft,hard}` instead.
 - Do not use `[ "$a" \> "$b" ]` for string comparison in zsh (zsh's `[` rejects it: `condition expected: >`, so an `until` loop spins forever on errors); use `[[ "$a" > "$b" ]]` or run the loop under `bash -c` instead.
+- Do not use `rg -E <pattern>` expecting extended regex (`-E` is rg's `--encoding` flag: `error parsing flag -E: unknown encoding`); rg patterns are already regex, so drop the flag.
+- Do not use `brew install <formula>` on this Intel Mac for new tools (Homebrew stopped building x86_64 bottles, so it builds from source and can fail on unwritable `/usr/local/share/man`); download the project's official `mac_amd64` release binary instead (e.g. caddy into `~/bin`).
 - Do not use `ssh host 'cat > f && ... && nohup cmd &' < local` (the trailing `&` backgrounds the whole `&&` list, so `cat` reads `/dev/null` and writes an empty file); upload with `scp local host:f` first, then start it with a separate `ssh host 'setsid nohup cmd > log 2>&1 < /dev/null &'` instead.
 
 ## Orca Worktree Completion Rules
