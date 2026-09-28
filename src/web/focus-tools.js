@@ -184,6 +184,11 @@
   const LOUPE_ZOOM = 2;
   const SENSOR_WIDTH = 4056;
 
+  // The preview is a <canvas> (app.js draws decoded frames into it); these
+  // also accept an <img>, whose intrinsic size is naturalWidth/Height.
+  const frameWidth = (el) => el.naturalWidth || el.width || 0;
+  const frameHeight = (el) => el.naturalHeight || el.height || 0;
+
   const $ = (selector) => document.querySelector(selector);
   const ui = {
     histogramToggle: $("#focus-histogram-toggle"),
@@ -279,7 +284,7 @@
     state[key] = !state[key];
     saveState();
     syncControls();
-    if (anyEnabled() && ui.preview.complete && ui.preview.naturalWidth) onFrame(ui.preview);
+    if (anyEnabled() && frameWidth(ui.preview)) onFrame(ui.preview);
   }
 
   function drawHistogram(histogram) {
@@ -374,8 +379,8 @@
   }
 
   function drawLoupe(img) {
-    const naturalWidth = img.naturalWidth;
-    const naturalHeight = img.naturalHeight;
+    const naturalWidth = frameWidth(img);
+    const naturalHeight = frameHeight(img);
     const centre = focusPoint(naturalWidth, naturalHeight);
     const rect = loupeRect(centre.x, centre.y, LOUPE_SOURCE, naturalWidth, naturalHeight);
 
@@ -464,7 +469,8 @@
   let redrawPending = false;
 
   function moveLoupeTo(event, clamp) {
-    const { naturalWidth, naturalHeight } = ui.preview;
+    const naturalWidth = frameWidth(ui.preview);
+    const naturalHeight = frameHeight(ui.preview);
     const point = clientToImagePoint(
       event.clientX,
       event.clientY,

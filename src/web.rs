@@ -1365,7 +1365,32 @@ async fn stop_stream(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-async fn mjpeg_stream(State(state): State<AppState>) -> Result<Response, AppError> {
+/// `?parser=js` asks for the same byte stream under a neutral media type.
+/// WebKit handles `multipart/x-mixed-replace` inside its network layer (the
+/// legacy `<img>` push-replace mechanism), so a `fetch()` of it never
+/// reaches JavaScript: on iOS Safari the body arrives empty and the fetch
+/// fails ("Load failed"). `app.js` parses the framing itself, so it asks for
+/// this form; a plain request still gets multipart for direct `<img>` use.
+/// See `worklogs/2026-09-28-ios-preview-stream.md`.
+#[derive(Deserialize)]
+struct MjpegParams {
+    parser: Option<String>,
+}
+
+const MJPEG_MULTIPART_CONTENT_TYPE: &str = "multipart/x-mixed-replace; boundary=frame";
+const MJPEG_RAW_CONTENT_TYPE: &str = "application/octet-stream";
+
+fn mjpeg_content_type(params: &MjpegParams) -> &'static str {
+    match params.parser.as_deref() {
+        Some("js") => MJPEG_RAW_CONTENT_TYPE,
+        _ => MJPEG_MULTIPART_CONTENT_TYPE,
+    }
+}
+
+async fn mjpeg_stream(
+    State(state): State<AppState>,
+    Query(params): Query<MjpegParams>,
+) -> Result<Response, AppError> {
     let mut receiver = state.camera.subscribe().await?;
     let stream = async_stream::stream! {
         loop {
@@ -1382,7 +1407,7 @@ async fn mjpeg_stream(State(state): State<AppState>) -> Result<Response, AppErro
     let mut response = Response::new(Body::from_stream(stream));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        header::HeaderValue::from_static("multipart/x-mixed-replace; boundary=frame"),
+        header::HeaderValue::from_static(mjpeg_content_type(&params)),
     );
     add_no_store_headers(&mut response);
     Ok(response)
@@ -1392,7 +1417,7 @@ fn mjpeg_part(frame: PreviewFrame) -> Bytes {
     let mut part = BytesMut::with_capacity(frame.jpeg.len() + 256);
     part.extend_from_slice(
         format!(
-            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Optic-Sequence: {}\r\nX-Optic-Control-Revision: {}\r\nX-Optic-AE-State: {}\r\nX-Optic-AWB-State: {}\r\nX-Optic-Exposure-Us: {}\r\nX-Optic-Analogue-Gain: {}\r\nX-Optic-Colour-Gains: {}\r\nX-Optic-Clipped: {}\r\n\r\n",
+            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Optic-Sequence: {}\r\nX-Optic-Control-Revision: {}\r\nX-Optic-AE-State: {}\r\nX-Optic-AWB-State: {}\r\nX-Optic-Exposure-Us: {}\r\nX-Optic-Analogue-Gain: {}\r\nX-Optic-Colour-Gains: {}\r\nX-Optic-Clipped: {}\r\nX-Optic-Captured-At: {}\r\n\r\n",
             frame.jpeg.len(),
             frame.sequence,
             frame.control_revision,
@@ -1407,6 +1432,13 @@ fn mjpeg_part(frame: PreviewFrame) -> Bytes {
             // The daemon meter's clipped fraction: what the highlight guard
             // sees (docs/optic-daemon-exposure-ramping.md §5.7).
             optional_header(frame.meter.map(|meter| meter.clipped_fraction)),
+            // Epoch milliseconds by the Pi's own clock, so the page can show
+            // when the frame was taken rather than when it arrived.
+            optional_header(frame.captured_at.and_then(|at| {
+                at.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|since| since.as_millis())
+            })),
         )
         .as_bytes(),
     );
@@ -1760,6 +1792,64 @@ mod tests {
             .await
             .expect("read response body");
         String::from_utf8(bytes.to_vec()).expect("utf8 response body")
+    }
+
+    #[test]
+    fn preview_shows_the_pi_side_frame_time() {
+        assert!(INDEX_HTML.contains("id=\"frame-time\""));
+        assert!(APP_JS.contains("x-optic-captured-at"));
+        // Rendered in the station timezone, not the viewer's.
+        assert!(APP_JS.contains("stationTimezone"));
+        assert!(APP_JS.contains("renderFrameTime(headers)"));
+    }
+
+    #[test]
+    fn preview_frames_are_drawn_into_a_canvas() {
+        // An <img> flickers on iOS Safari: WebKit blanks the element while the
+        // new frame decodes. The canvas keeps the last frame's pixels until
+        // the next drawImage (worklogs/2026-09-28-ios-preview-stream.md).
+        assert!(INDEX_HTML.contains("<canvas id=\"preview\""));
+        assert!(!INDEX_HTML.contains("<img id=\"preview\""));
+        assert!(APP_JS.contains("createImageBitmap"));
+        assert!(APP_JS.contains("drawPreviewFrame(bitmap)"));
+        // No blob URLs left to leak now that frames decode to an ImageBitmap.
+        assert!(!APP_JS.contains("createObjectURL"));
+    }
+
+    #[test]
+    fn mjpeg_content_type_depends_on_who_parses_the_stream() {
+        // Default: still multipart, so a direct <img src="/api/stream/mjpeg">
+        // keeps working (docs/optic-daemon.md, Web API Endpoints).
+        assert_eq!(
+            mjpeg_content_type(&MjpegParams { parser: None }),
+            "multipart/x-mixed-replace; boundary=frame"
+        );
+        // `parser=js`: neutral type, so WebKit does not consume the parts
+        // before JavaScript sees them (iOS Safari "Load failed").
+        assert_eq!(
+            mjpeg_content_type(&MjpegParams {
+                parser: Some("js".to_owned()),
+            }),
+            "application/octet-stream"
+        );
+        // Anything unrecognised keeps the documented default.
+        for value in ["", "JS", "img", "true"] {
+            assert_eq!(
+                mjpeg_content_type(&MjpegParams {
+                    parser: Some(value.to_owned()),
+                }),
+                "multipart/x-mixed-replace; boundary=frame",
+                "parser={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_requests_the_js_parsed_stream() {
+        // app.js parses the multipart framing itself, so it must ask for the
+        // non-intercepted content type; otherwise the preview dies on iOS.
+        assert!(APP_JS.contains("/api/stream/mjpeg?parser=js&t="));
+        assert!(APP_JS.contains("parsePartHeaders"));
     }
 
     #[test]
@@ -2243,6 +2333,9 @@ mod tests {
             analogue_gain: Some(2.5),
             colour_gains: Some([1.25, 1.5]),
             meter: None,
+            captured_at: Some(
+                std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_790_000_000_123),
+            ),
         });
         let text = String::from_utf8(part.to_vec()).unwrap();
 
@@ -2251,6 +2344,9 @@ mod tests {
         assert!(text.contains("X-Optic-Control-Revision: 7\r\n"));
         assert!(text.contains("X-Optic-Exposure-Us: 12500\r\n"));
         assert!(text.contains("X-Optic-Clipped: unavailable\r\n"));
+        // Preview frames carry the Pi's own capture time; the dashboard shows
+        // it over the live preview (worklogs/2026-09-28-preview-frame-time.md).
+        assert!(text.contains("X-Optic-Captured-At: 1790000000123\r\n"));
         assert!(text.ends_with("\r\n\r\njpeg\r\n"));
     }
 
@@ -2271,8 +2367,11 @@ mod tests {
                 samples: 1000,
                 grey_world: None,
             }),
+            // A frame with no timestamp still streams; the label just hides.
+            captured_at: None,
         });
         let text = String::from_utf8(part.to_vec()).unwrap();
         assert!(text.contains("X-Optic-Clipped: 0.0265\r\n"));
+        assert!(text.contains("X-Optic-Captured-At: unavailable\r\n"));
     }
 }

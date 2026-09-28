@@ -475,6 +475,11 @@ pub struct PreviewFrame {
     /// from it, so unsaved exposure settings show in the live preview even
     /// before any capture (`docs/optic-daemon-exposure-ramping.md` §11).
     pub meter: Option<crate::exposure_ramp::FrameMeter>,
+    /// When the Pi produced this preview frame, by the Pi's own clock. Shown
+    /// over the live preview so the operator can tell how fresh the image is
+    /// (`worklogs/2026-09-28-preview-frame-time.md`). Preview only: captured
+    /// files are unaffected.
+    pub captured_at: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
