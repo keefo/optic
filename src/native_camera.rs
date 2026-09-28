@@ -998,6 +998,7 @@ mod imp {
             let meter = meter_yuv420(&yuv, info.width, info.height, info.stride);
             let _ = frames.send(PreviewFrame {
                 jpeg: Bytes::from(jpeg),
+                captured_at: Some(SystemTime::now()),
                 sequence: request.sequence(),
                 control_revision,
                 ae_state: ae_state(request.metadata()),
