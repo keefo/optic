@@ -68,6 +68,10 @@ mod imp {
             CaptureRequest,
             oneshot::Sender<Result<CaptureResult, CameraError>>,
         ),
+        Meter(
+            CaptureRequest,
+            oneshot::Sender<Result<CaptureExposure, CameraError>>,
+        ),
         Shutdown(oneshot::Sender<()>),
     }
 
@@ -186,6 +190,18 @@ mod imp {
                 request,
                 reply,
             ))?;
+            response.await.map_err(|_| CameraError::Unavailable)?
+        }
+
+        /// A still taken and metered like a capture, never encoded or
+        /// written (exposure ramping's metering pass).
+        pub(crate) async fn meter(
+            &self,
+            request: CaptureRequest,
+        ) -> Result<CaptureExposure, CameraError> {
+            request.validate()?;
+            let (reply, response) = oneshot::channel();
+            self.send(NativeCommand::Meter(request, reply))?;
             response.await.map_err(|_| CameraError::Unavailable)?
         }
 
@@ -420,6 +436,43 @@ mod imp {
                     ?profile,
                     save_dng,
                     stage = "total",
+                    elapsed_ms = total_started.elapsed().as_millis(),
+                    "capture perf"
+                );
+                let _ = reply.send(result);
+            }
+            NativeCommand::Meter(request, reply) => {
+                // The same pipeline, warmup and meter as a capture (so the
+                // same auto exposure), minus encoding and publishing.
+                let total_started = Instant::now();
+                let result = stop_pipeline(camera, pipeline, streaming_state).and_then(|_| {
+                    capture_frame(camera, request.profile, request.settings, false, model).map(
+                        |frame| CaptureExposure {
+                            meter: meter_yuv420(
+                                &frame.yuv,
+                                frame.still.width,
+                                frame.still.height,
+                                frame.still.stride,
+                            ),
+                            ..frame.exposure
+                        },
+                    )
+                });
+                info!(
+                    stage = "metering_pass",
+                    exposure_us = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|exposure| exposure.exposure_us),
+                    analogue_gain = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|exposure| exposure.analogue_gain),
+                    luminance = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|exposure| exposure.meter)
+                        .map(|meter| meter.luminance),
                     elapsed_ms = total_started.elapsed().as_millis(),
                     "capture perf"
                 );
@@ -1417,7 +1470,9 @@ mod imp_stub {
 
     use tokio::sync::{broadcast, watch};
 
-    use crate::camera::{CameraError, CaptureRequest, CaptureResult, PreviewFrame, StreamRequest};
+    use crate::camera::{
+        CameraError, CaptureExposure, CaptureRequest, CaptureResult, PreviewFrame, StreamRequest,
+    };
 
     pub(crate) struct NativeCameraBackend {
         frames: broadcast::Sender<PreviewFrame>,
@@ -1472,6 +1527,14 @@ mod imp_stub {
             _capture_dir: &Path,
             request: CaptureRequest,
         ) -> Result<CaptureResult, CameraError> {
+            request.validate()?;
+            Err(CameraError::Unavailable)
+        }
+
+        pub(crate) async fn meter(
+            &self,
+            request: CaptureRequest,
+        ) -> Result<CaptureExposure, CameraError> {
             request.validate()?;
             Err(CameraError::Unavailable)
         }

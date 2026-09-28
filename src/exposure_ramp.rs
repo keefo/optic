@@ -21,10 +21,17 @@ pub const MID_GREY: f64 = 0.18;
 pub const DAY_ELEVATION_DEG: f64 = 6.0;
 /// Sun elevation at and below which the target is fully at the night level.
 pub const NIGHT_ELEVATION_DEG: f64 = -18.0;
-/// A gap longer than this since the last ramped frame breaks the sequence:
-/// the next capture reseeds from auto exposure instead of stepping from a
-/// stale exposure (design doc §5.4).
+/// A gap longer than this since the last *captured* ramped frame breaks the
+/// sequence: the next capture meters itself afresh instead of planning from
+/// a stale exposure (design doc §5.4). Live preview frames don't count:
+/// they refresh `updated_at`, and on 2026-09-28 six hours of unattended,
+/// saturated preview frames kept a wrong estimate "fresh"
+/// (worklogs/2026-09-28-ramp-overexposure.md).
 pub const RESEED_GAP: Duration = Duration::minutes(30);
+/// A ramped output frame with at least this share of samples clipped is
+/// logged as overexposed. Daytime sky and glass clipped 1–7% on 2026-09-22;
+/// the 2026-09-28 white frame clipped 60%.
+pub const OVEREXPOSED_CLIPPED_FRACTION: f64 = 0.25;
 
 /// Metering samples every 4th pixel of every 4th row (1/16 of the frame).
 const SAMPLE_STEP: usize = 4;
@@ -71,6 +78,18 @@ const PREVIEW_LEARNING_TIME_CONSTANT_S: f64 = 5.0;
 /// Floor for the clipped fraction in the clip estimate (design doc §5.7), so
 /// a clip-free frame can't drag its log average towards −∞.
 const CLIP_ESTIMATE_FLOOR: f64 = 1e-4;
+
+// Daylight sanity ceiling (design doc §5.8), in µs × gain at the day
+// target. Fitted to this station's 2026-09-24/25 dawns and dusks: the
+// mid-grey exposure peaked at 621 ms at sun 0…1°, 283 ms at +2…3°, 79 ms at
+// +6…7°, 53 ms at +7…9° and 41 ms above +10°. Frame by frame, the curve
+// stays at least 1.6 EV above every one of them (tightest: 52.8 ms at +8.2°).
+/// The ceiling with the sun on the horizon.
+const DAYLIGHT_CEILING_AT_HORIZON_US: f64 = 2_500_000.0;
+/// The ceiling halves for every this many degrees of sun elevation...
+const DAYLIGHT_CEILING_HALVING_DEG: f64 = 2.0;
+/// ...down to this floor in full daylight.
+const DAYLIGHT_CEILING_FLOOR_US: f64 = 160_000.0;
 
 /// How scheduled captures are exposed — `ScheduleConfig.exposure`. One
 /// global mode, deliberately not per rule: merged rules share one physical
@@ -390,7 +409,12 @@ pub struct FrameObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct RampState {
+    /// When anything, captured or preview frame, last updated the state.
     pub updated_at: DateTime<Utc>,
+    /// When a scheduled capture (or its metering pass) last updated it.
+    /// `None` for a state learned from preview frames only. Only this
+    /// decides whether the next capture may plan rather than reseed.
+    pub captured_at: Option<DateTime<Utc>>,
     /// Smoothed scene brightness: `log2(luminance) − log2(exposure product)`.
     pub scene_ev: f64,
     /// The previous frame's planned exposure. `None` right after a seed,
@@ -486,6 +510,57 @@ pub fn guard_active(sun_elevation_deg: Option<f64>) -> bool {
     sun_elevation_deg.is_some_and(|elevation| elevation < GUARD_SUN_ELEVATION_DEG)
 }
 
+/// Why a plan is a seed (design doc §5.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedReason {
+    /// No ramp state at all (daemon start, or just switched to `AutoRamp`).
+    NoState,
+    /// State learned from preview frames only; no capture has measured the
+    /// scene yet.
+    NoCapture,
+    /// The last capture is older than `RESEED_GAP`.
+    CaptureGap,
+}
+
+/// Everything that went into one plan, for the per-capture log line and
+/// `/api/status` (design doc §5.9).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct RampDecision {
+    pub plan: RampPlan,
+    pub seed_reason: Option<SeedReason>,
+    /// Seconds since the capture that last updated the state.
+    pub capture_age_s: Option<i64>,
+    /// The scene estimate the plan used (`None` without state).
+    pub scene_ev: Option<f64>,
+    pub sun_elevation_deg: Option<f64>,
+    pub target_bias_ev: f64,
+    /// The planned exposure before the step limit and the ceilings,
+    /// highlight guard included.
+    pub desired_log2_exposure: Option<f64>,
+    /// The step limit this plan allowed each way (`None` without an anchor).
+    pub step_limit_ev: Option<f64>,
+    pub step_limited: bool,
+    /// The daylight sanity ceiling (§5.8), when the sun is up.
+    pub ceiling_log2_exposure: Option<f64>,
+    /// The ceiling cut this plan.
+    pub ceiling_bound: bool,
+    pub guard_offset_ev: f64,
+    /// The last captured frame's clipping excess over the budget, EV.
+    pub guard_previous_excess_ev: Option<f64>,
+    pub max_shutter_us: u64,
+}
+
+/// Which updates keep a state usable for planning.
+#[derive(Clone, Copy)]
+enum Freshness {
+    /// Scheduled captures: only a capture within `RESEED_GAP` counts.
+    Capture,
+    /// The live preview's view (§11): preview frames count too, so the
+    /// dashboard can show the settings before any capture.
+    Preview,
+}
+
 /// Plans the next ramped capture (design doc §5.3/§5.4).
 pub fn plan(
     state: Option<&RampState>,
@@ -494,52 +569,168 @@ pub fn plan(
     settings: &RampSettings,
     max_shutter_us: u64,
 ) -> RampPlan {
-    let Some(state) = state.filter(|state| now - state.updated_at <= RESEED_GAP) else {
-        return RampPlan::Seed;
+    decide(state, now, sun_elevation_deg, settings, max_shutter_us).plan
+}
+
+/// `plan`, with the inputs and limits that produced it.
+pub fn decide(
+    state: Option<&RampState>,
+    now: DateTime<Utc>,
+    sun_elevation_deg: Option<f64>,
+    settings: &RampSettings,
+    max_shutter_us: u64,
+) -> RampDecision {
+    decide_with(
+        state,
+        now,
+        sun_elevation_deg,
+        settings,
+        max_shutter_us,
+        Freshness::Capture,
+    )
+}
+
+/// What the live preview plans for (design doc §11): like `plan`, but a
+/// state kept fresh by preview frames alone still plans, so the preview
+/// shows the settings before any capture. Scheduled captures never use it.
+pub fn preview_plan(
+    state: Option<&RampState>,
+    now: DateTime<Utc>,
+    sun_elevation_deg: Option<f64>,
+    settings: &RampSettings,
+    max_shutter_us: u64,
+) -> RampPlan {
+    decide_with(
+        state,
+        now,
+        sun_elevation_deg,
+        settings,
+        max_shutter_us,
+        Freshness::Preview,
+    )
+    .plan
+}
+
+/// The step limit for a plan anchored to a capture `since` ago: `max_step_ev`
+/// per minute, never less than one step (design doc §5.3). A 1-minute or
+/// faster timelapse steps exactly as before; a slower one can follow dawn.
+pub fn step_limit_ev(settings: &RampSettings, since: Duration) -> f64 {
+    let minutes = since.num_milliseconds() as f64 / 60_000.0;
+    settings.max_step_ev * minutes.max(1.0)
+}
+
+/// The daylight sanity ceiling (design doc §5.8) as a log2 exposure
+/// product, or `None` with the sun below the horizon or no station.
+pub fn daylight_ceiling_log2(
+    sun_elevation_deg: Option<f64>,
+    settings: &RampSettings,
+) -> Option<f64> {
+    let elevation = sun_elevation_deg.filter(|elevation| *elevation >= 0.0)?;
+    let ceiling_us = (DAYLIGHT_CEILING_AT_HORIZON_US
+        * (-elevation / DAYLIGHT_CEILING_HALVING_DEG).exp2())
+    .max(DAYLIGHT_CEILING_FLOOR_US);
+    Some(ceiling_us.log2() + settings.day_bias_ev)
+}
+
+fn decide_with(
+    state: Option<&RampState>,
+    now: DateTime<Utc>,
+    sun_elevation_deg: Option<f64>,
+    settings: &RampSettings,
+    max_shutter_us: u64,
+    freshness: Freshness,
+) -> RampDecision {
+    let limits = ExposureLimits::new(settings, max_shutter_us, sun_elevation_deg);
+    let capture_age = state.and_then(|state| state.captured_at).map(|at| now - at);
+    let mut decision = RampDecision {
+        plan: RampPlan::Seed,
+        seed_reason: None,
+        capture_age_s: capture_age.map(|age| age.num_seconds()),
+        scene_ev: state.map(|state| state.scene_ev),
+        sun_elevation_deg,
+        target_bias_ev: target_bias_ev(sun_elevation_deg, settings),
+        desired_log2_exposure: None,
+        step_limit_ev: None,
+        step_limited: false,
+        ceiling_log2_exposure: limits.ceiling,
+        ceiling_bound: false,
+        guard_offset_ev: state.map_or(0.0, |state| state.highlight.offset_ev),
+        guard_previous_excess_ev: state.and_then(|state| state.highlight.previous_excess_ev),
+        max_shutter_us: limits.max_shutter_us,
     };
-    let limits = ExposureLimits::new(settings, max_shutter_us);
+    let seed_reason = match (state, freshness) {
+        (None, _) => Some(SeedReason::NoState),
+        (Some(_), Freshness::Capture) => match capture_age {
+            None => Some(SeedReason::NoCapture),
+            Some(age) if age > RESEED_GAP => Some(SeedReason::CaptureGap),
+            Some(_) => None,
+        },
+        (Some(state), Freshness::Preview) => {
+            (now - state.updated_at > RESEED_GAP).then_some(SeedReason::CaptureGap)
+        }
+    };
+    let Some(state) = state.filter(|_| seed_reason.is_none()) else {
+        decision.seed_reason = seed_reason;
+        return decision;
+    };
     // The guard darkens what the ramp would actually shoot, so a scene too
     // dark for max shutter × max gain can't hide the offset above the
     // ceiling (design doc §5.6). With no offset this is the plain ramp.
-    let mut desired = unguarded_log2_exposure(state, sun_elevation_deg, settings, &limits)
+    let desired = unguarded_log2_exposure(state, sun_elevation_deg, settings, &limits)
         + state.highlight.offset_ev;
+    let mut stepped = desired;
     if let Some(previous) = state.planned_log2_exposure {
-        // A guard pull may step down further than `max_step_ev` (design
+        let step = step_limit_ev(settings, capture_age.unwrap_or_else(Duration::zero));
+        // A guard pull may step down further than the step limit (design
         // doc §5.6); upward the step limit is unchanged.
-        desired = desired.clamp(
-            previous - settings.max_step_ev - state.highlight.last_pull_ev,
-            previous + settings.max_step_ev,
+        stepped = desired.clamp(
+            previous - step - state.highlight.last_pull_ev,
+            previous + step,
         );
+        decision.step_limit_ev = Some(step);
+        decision.step_limited = stepped != desired;
     }
-    let (shutter_us, gain) = limits.split(desired, settings);
-    RampPlan::Manual {
+    decision.desired_log2_exposure = Some(desired);
+    decision.ceiling_bound = limits.ceiling.is_some_and(|ceiling| stepped > ceiling);
+    let (shutter_us, gain) = limits.split(stepped, settings);
+    decision.plan = RampPlan::Manual {
         shutter_us,
         gain,
         log2_exposure: (shutter_us as f64 * f64::from(gain)).log2(),
-    }
+    };
+    decision
 }
 
 /// The exposure range one shot may use.
 struct ExposureLimits {
     max_shutter_us: u64,
     lowest: f64,
+    /// The hardware ceiling: `max_shutter_eff × max_gain`.
     highest: f64,
+    /// The daylight sanity ceiling (design doc §5.8), when the sun is up.
+    ceiling: Option<f64>,
 }
 
 impl ExposureLimits {
-    fn new(settings: &RampSettings, max_shutter_us: u64) -> Self {
+    fn new(settings: &RampSettings, max_shutter_us: u64, sun_elevation_deg: Option<f64>) -> Self {
         let max_shutter_us = max_shutter_us.clamp(settings.min_shutter_us, settings.max_shutter_us);
         Self {
             max_shutter_us,
             lowest: (settings.min_shutter_us as f64).log2(),
             highest: (max_shutter_us as f64 * f64::from(settings.max_gain)).log2(),
+            ceiling: daylight_ceiling_log2(sun_elevation_deg, settings),
         }
     }
 
-    /// Clamps into range, then splits shutter first, gain last.
+    /// Clamps into range, the daylight ceiling included, then splits
+    /// shutter first, gain last.
     fn split(&self, log2_exposure: f64, settings: &RampSettings) -> (u64, f32) {
+        let highest = self
+            .ceiling
+            .map_or(self.highest, |ceiling| ceiling.min(self.highest))
+            .max(self.lowest);
         split_exposure(
-            log2_exposure.clamp(self.lowest, self.highest),
+            log2_exposure.clamp(self.lowest, highest),
             settings.min_shutter_us,
             self.max_shutter_us,
             settings.max_gain,
@@ -574,7 +765,7 @@ pub fn highlight_target_ev(
     if settings.clip_budget_percent <= 0.0 || !guard_active(sun_elevation_deg) {
         return 0.0;
     }
-    let limits = ExposureLimits::new(settings, max_shutter_us);
+    let limits = ExposureLimits::new(settings, max_shutter_us, sun_elevation_deg);
     let at_budget = (settings.clip_budget_percent / 100.0).log2() - clip_scene_ev;
     let unguarded = unguarded_log2_exposure(state, sun_elevation_deg, settings, &limits);
     let target = (at_budget - unguarded).clamp(GUARD_FLOOR_EV, 0.0);
@@ -609,12 +800,12 @@ pub fn preview_plans(
     max_shutter_us: u64,
 ) -> Option<PreviewPlans> {
     let RampPlan::Manual { log2_exposure, .. } =
-        plan(state, now, sun_elevation_deg, settings, max_shutter_us)
+        preview_plan(state, now, sun_elevation_deg, settings, max_shutter_us)
     else {
         return None;
     };
     let state = state?;
-    let limits = ExposureLimits::new(settings, max_shutter_us);
+    let limits = ExposureLimits::new(settings, max_shutter_us, sun_elevation_deg);
     let target_ev = highlight_target_ev(state, sun_elevation_deg, settings, max_shutter_us);
     let unguarded = log2_exposure - state.highlight.offset_ev;
     let setting = |log2: f64| {
@@ -655,6 +846,7 @@ pub fn observe(
                 + (log2_exposure - exposure);
             Some(RampState {
                 updated_at: now,
+                captured_at: Some(now),
                 scene_ev: state.scene_ev + blend * (scene_ev - state.scene_ev),
                 planned_log2_exposure: Some(*log2_exposure),
                 highlight: HighlightGuard {
@@ -672,6 +864,7 @@ pub fn observe(
         }
         _ => Some(RampState {
             updated_at: now,
+            captured_at: Some(now),
             scene_ev,
             planned_log2_exposure: None,
             highlight: HighlightGuard::default()
@@ -698,6 +891,8 @@ pub fn observe_preview(
     let Some(state) = state else {
         return Some(RampState {
             updated_at: now,
+            // Preview frames never count as a capture (design doc §5.4).
+            captured_at: None,
             scene_ev,
             planned_log2_exposure: None,
             highlight: HighlightGuard::default()
@@ -713,6 +908,7 @@ pub fn observe_preview(
     let blend = 1.0 - (-elapsed_s / PREVIEW_LEARNING_TIME_CONSTANT_S).exp();
     Some(RampState {
         updated_at: now,
+        captured_at: state.captured_at,
         scene_ev: state.scene_ev + blend * (scene_ev - state.scene_ev),
         planned_log2_exposure: state.planned_log2_exposure,
         // Only the clip estimate learns here (design doc §5.7).
@@ -1012,9 +1208,11 @@ mod tests {
         assert_eq!(again, parsed);
     }
 
+    /// A state last updated by a capture at `updated_at`.
     fn seeded(scene_ev: f64, updated_at: DateTime<Utc>) -> RampState {
         RampState {
             updated_at,
+            captured_at: Some(updated_at),
             scene_ev,
             planned_log2_exposure: None,
             highlight: HighlightGuard::default(),
@@ -1249,8 +1447,8 @@ mod tests {
     }
 
     #[test]
-    fn a_preview_seeded_ramp_plans_without_a_step_limit() {
-        // The first plan after preview seeding may jump straight to the
+    fn a_preview_seeded_ramp_previews_without_a_step_limit_but_captures_meter_first() {
+        // The preview's plan after preview seeding may jump straight to the
         // target: there is no capture sequence to keep smooth yet.
         let settings = RampSettings::default();
         let observation = FrameObservation {
@@ -1259,10 +1457,16 @@ mod tests {
             meter: meter(MID_GREY / 16.0, None),
         };
         let state = observe_preview(None, &observation, at(0), &settings).unwrap();
+        assert_eq!(state.captured_at, None);
+        // A scheduled capture never plans from preview frames alone
+        // (worklogs/2026-09-28-ramp-overexposure.md).
+        let decision = decide(Some(&state), at(1), None, &settings, 5_000_000);
+        assert_eq!(decision.plan, RampPlan::Seed);
+        assert_eq!(decision.seed_reason, Some(SeedReason::NoCapture));
         let RampPlan::Manual { log2_exposure, .. } =
-            plan(Some(&state), at(1), None, &settings, 5_000_000)
+            preview_plan(Some(&state), at(1), None, &settings, 5_000_000)
         else {
-            panic!("expected a manual plan");
+            panic!("expected a manual preview plan");
         };
         // Metered 4 EV dark at 2 ms -> 32 ms.
         assert!(
@@ -2143,5 +2347,293 @@ mod tests {
             swing(&per_frame) >= 1.0 / 3.0,
             "old loop settled: {per_frame:?}"
         );
+    }
+
+    // --- 2026-09-28 08:00 dawn overexposure (worklogs/2026-09-28-ramp-overexposure.md) ---
+
+    /// The preview override's ceiling: one 8 fps frame × 0.95, at 16× gain
+    /// (`previewEquivalent` in `scheduled-exposure.js`).
+    const PREVIEW_CEILING_US: f64 = 118_750.0;
+    const PREVIEW_CEILING_GAIN: f64 = 16.0;
+    /// Sun at the 08:00 PDT capture, from the station's ephemeris.
+    const DAWN_SUN: Option<f64> = Some(7.6);
+
+    fn pdt(hour: u32, minute: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 9, 28, hour + 7, minute, 0)
+            .unwrap()
+    }
+
+    /// The scene over the night of 2026-09-27/28: the 2026-09-22 night level
+    /// until 06:30, then brightening to about 45 ms mid-grey at 08:00 (the
+    /// 2026-09-25 dawn at the same sun elevation).
+    fn dawn_scene_ev(now: DateTime<Utc>) -> f64 {
+        let dawn_start = pdt(6, 30);
+        let day = MID_GREY.log2() - 45_000_f64.log2();
+        let t = ((now - dawn_start).num_seconds() as f64 / 5_400.0).clamp(0.0, 1.0);
+        NIGHT_SCENE_EV + t * (day - NIGHT_SCENE_EV)
+    }
+
+    /// A frame of `scene_ev` at `exposure_us` × `gain`, metered as the
+    /// daemon would: a white frame's trimmed log-mean is `linear(255)`.
+    fn frame_of(scene_ev: f64, exposure_us: f64, gain: f64) -> FrameObservation {
+        let luminance = (scene_ev + (exposure_us * gain).log2()).exp2();
+        let white = linear(255);
+        FrameObservation {
+            exposure_us,
+            analogue_gain: gain,
+            meter: clip_meter(
+                luminance.min(white),
+                if luminance >= white { 1.0 } else { 0.0 },
+            ),
+        }
+    }
+
+    /// The ramp as the Pi held it at 08:00: the 01:31 restart dropped all
+    /// state, and 6.5 h of live preview frames at the preview override's
+    /// ceiling (nothing re-sent it) rebuilt it. No capture in between.
+    fn replay_2026_09_28_state(settings: &RampSettings) -> RampState {
+        let mut state = None;
+        let mut now = pdt(1, 31);
+        while now < pdt(8, 0) {
+            let frame = frame_of(dawn_scene_ev(now), PREVIEW_CEILING_US, PREVIEW_CEILING_GAIN);
+            state = observe_preview(state.as_ref(), &frame, now, settings);
+            now += Duration::seconds(2);
+        }
+        state.unwrap()
+    }
+
+    #[test]
+    fn replay_2026_09_28_dawn_overexposure() {
+        let settings = RampSettings::default();
+        let state = replay_2026_09_28_state(&settings);
+        // The preview only ever saw white frames at dawn, so the estimate
+        // sits on their lower bound, about 3 EV darker than the real scene.
+        let bound = linear(255).log2() - (PREVIEW_CEILING_US * PREVIEW_CEILING_GAIN).log2();
+        assert!((state.scene_ev - bound).abs() < 0.01, "{}", state.scene_ev);
+        assert!(dawn_scene_ev(pdt(8, 0)) - state.scene_ev > 2.5);
+        assert_eq!(state.planned_log2_exposure, None);
+        assert_eq!(state.captured_at, None);
+        let max_shutter = max_shutter_for_gap(Some(Duration::hours(1)), &settings);
+
+        // Before the fix the capture planned from this state. The preview
+        // rule is that same rule, and without the daylight ceiling (no
+        // station: same day-level target, no ceiling) it reproduces the
+        // Pi's 343,529 µs at gain 1.0.
+        let RampPlan::Manual {
+            shutter_us, gain, ..
+        } = preview_plan(Some(&state), pdt(8, 0), None, &settings, max_shutter)
+        else {
+            panic!("expected the old rule's manual plan");
+        };
+        assert_eq!(gain, 1.0);
+        assert!(
+            (shutter_us as f64 / 343_529.0 - 1.0).abs() < 0.02,
+            "{shutter_us}"
+        );
+        // The daylight ceiling alone would have cut it to 180 ms at +7.6°.
+        let RampPlan::Manual { shutter_us, .. } =
+            preview_plan(Some(&state), pdt(8, 0), DAWN_SUN, &settings, max_shutter)
+        else {
+            panic!("expected a manual preview plan");
+        };
+        assert!((175_000..=185_000).contains(&shutter_us), "{shutter_us}");
+
+        // Now: no capture since the restart, so the capture meters first.
+        let decision = decide(Some(&state), pdt(8, 0), DAWN_SUN, &settings, max_shutter);
+        assert_eq!(decision.plan, RampPlan::Seed);
+        assert_eq!(decision.seed_reason, Some(SeedReason::NoCapture));
+
+        // The metering still (auto exposure; the 09:00 frame's 7.2 ms
+        // at gain 1 equivalent) measures the real scene, and the shot is
+        // planned from it: the day target, about 45 ms, not 343 ms.
+        let metering = frame_of(dawn_scene_ev(pdt(8, 0)), 635.0, 11.38);
+        assert!(metering.meter.clipped_fraction == 0.0);
+        let metered = observe(
+            Some(&state),
+            &RampPlan::Seed,
+            &metering,
+            pdt(8, 0),
+            DAWN_SUN,
+            &settings,
+        )
+        .unwrap();
+        let decision = decide(Some(&metered), pdt(8, 0), DAWN_SUN, &settings, max_shutter);
+        let RampPlan::Manual {
+            shutter_us,
+            gain,
+            log2_exposure,
+        } = decision.plan
+        else {
+            panic!("expected a manual plan after metering, got {decision:?}");
+        };
+        assert_eq!(decision.seed_reason, None);
+        assert!(!decision.ceiling_bound && !decision.step_limited);
+        assert!(
+            (log2_exposure - 45_000_f64.log2()).abs() < 0.1,
+            "{shutter_us} × {gain}"
+        );
+    }
+
+    fn preview_frame(scene_ev: f64) -> FrameObservation {
+        frame_of(scene_ev, 100_000.0, 4.0)
+    }
+
+    #[test]
+    fn preview_activity_does_not_keep_a_stale_capture_state_fresh() {
+        let settings = RampSettings::default();
+        let mut state = Some(seeded(-20.0, at(0)));
+        // Two hours of preview frames every 2 s after the last capture.
+        for second in (2..=7_200).step_by(2) {
+            let now = at(0) + Duration::seconds(second);
+            state = observe_preview(state.as_ref(), &preview_frame(-20.0), now, &settings);
+        }
+        let state = state.unwrap();
+        assert_eq!(state.updated_at, at(120));
+        assert_eq!(state.captured_at, Some(at(0)));
+        let decision = decide(Some(&state), at(120), None, &settings, 5_000_000);
+        assert_eq!(decision.plan, RampPlan::Seed);
+        assert_eq!(decision.seed_reason, Some(SeedReason::CaptureGap));
+        assert_eq!(decision.capture_age_s, Some(7_200));
+        // The dashboard still previews from it (design doc §11).
+        assert!(preview_plans(Some(&state), at(120), None, &settings, 5_000_000).is_some());
+    }
+
+    #[test]
+    fn a_recent_capture_keeps_planning_through_preview_updates() {
+        let settings = RampSettings::default();
+        let mut state = Some(RampState {
+            planned_log2_exposure: Some(12.0),
+            ..seeded(MID_GREY.log2() - 12.0, at(0))
+        });
+        for second in (2..=600).step_by(2) {
+            let now = at(0) + Duration::seconds(second);
+            // The scene got 4 EV darker; the preview measures it.
+            state = observe_preview(
+                state.as_ref(),
+                &preview_frame(MID_GREY.log2() - 16.0),
+                now,
+                &settings,
+            );
+        }
+        let decision = decide(state.as_ref(), at(10), None, &settings, 5_000_000);
+        let RampPlan::Manual { log2_exposure, .. } = decision.plan else {
+            panic!("expected a manual plan");
+        };
+        // Step-limited from the capture's 12.0: 10 minutes allow 10 steps.
+        assert!(decision.step_limited);
+        assert!((decision.step_limit_ev.unwrap() - 10.0 * settings.max_step_ev).abs() < 1e-9);
+        assert!((log2_exposure - (12.0 + 10.0 * settings.max_step_ev)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn step_limit_scales_with_minutes_since_the_capture() {
+        let settings = RampSettings::default();
+        let step = settings.max_step_ev;
+        assert_eq!(step_limit_ev(&settings, Duration::seconds(30)), step);
+        assert_eq!(step_limit_ev(&settings, Duration::seconds(60)), step);
+        assert!((step_limit_ev(&settings, Duration::minutes(10)) - 10.0 * step).abs() < 1e-12);
+        // A 1-minute timelapse is planned about 50 s after its previous
+        // frame was observed: exactly one step, as before.
+        let state = RampState {
+            planned_log2_exposure: Some(12.0),
+            ..seeded(-30.0, at(0))
+        };
+        let decision = decide(
+            Some(&state),
+            at(0) + Duration::seconds(50),
+            None,
+            &settings,
+            5_000_000,
+        );
+        assert_eq!(decision.step_limit_ev, Some(step));
+        let RampPlan::Manual { log2_exposure, .. } = decision.plan else {
+            panic!("expected a manual plan");
+        };
+        assert!((log2_exposure - (12.0 + step)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn seeds_report_why() {
+        let settings = RampSettings::default();
+        let no_state = decide(None, at(0), None, &settings, 5_000_000);
+        assert_eq!(no_state.seed_reason, Some(SeedReason::NoState));
+        let stale = decide(
+            Some(&seeded(-12.0, at(0))),
+            at(31),
+            None,
+            &settings,
+            5_000_000,
+        );
+        assert_eq!(stale.seed_reason, Some(SeedReason::CaptureGap));
+        let fresh = decide(
+            Some(&seeded(-12.0, at(0))),
+            at(30),
+            None,
+            &settings,
+            5_000_000,
+        );
+        assert_eq!(fresh.seed_reason, None);
+        assert_eq!(fresh.capture_age_s, Some(1_800));
+    }
+
+    #[test]
+    fn daylight_ceiling_follows_the_sun() {
+        let settings = RampSettings::default();
+        let ceiling_ms =
+            |sun: f64| daylight_ceiling_log2(Some(sun), &settings).unwrap().exp2() / 1e3;
+        assert!((ceiling_ms(0.0) - 2_500.0).abs() < 1e-6);
+        assert!((ceiling_ms(2.0) - 1_250.0).abs() < 1e-6);
+        assert!((ceiling_ms(7.6) - 179.5).abs() < 0.5, "{}", ceiling_ms(7.6));
+        assert!((ceiling_ms(10.0) - 160.0).abs() < 1e-6);
+        assert!((ceiling_ms(50.0) - 160.0).abs() < 1e-6);
+        // At least 1.58 EV (3×) above the worst-case mid-grey exposures
+        // measured on the 2026-09-24/25 dawns and dusks, at their own sun
+        // elevation (worklog 2026-09-28): the tightest is 52.8 ms at +8.2°.
+        for (sun, measured_ms) in [(0.29, 612.6), (8.22, 52.8), (15.58, 41.0)] {
+            assert!(ceiling_ms(sun) >= 3.0 * measured_ms, "{sun}°");
+        }
+        // Below the horizon or without a station there is none.
+        assert_eq!(daylight_ceiling_log2(Some(-0.1), &settings), None);
+        assert_eq!(daylight_ceiling_log2(None, &settings), None);
+        // Brightness compensation shifts it with the target.
+        let brighter = RampSettings {
+            day_bias_ev: 1.0,
+            ..settings
+        };
+        let shifted = daylight_ceiling_log2(Some(20.0), &brighter).unwrap();
+        assert!((shifted - (160_000_f64.log2() + 1.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn daylight_ceiling_only_ever_darkens_a_plan() {
+        let settings = RampSettings::default();
+        for scene_ev in [-30.0, -24.0, -20.0, -17.0, -12.0, -8.0] {
+            let state = seeded(scene_ev, at(0));
+            for sun in [-10.0, -0.5, 0.0, 3.0, 7.6, 20.0] {
+                let log2 =
+                    |sun: Option<f64>| match plan(Some(&state), at(1), sun, &settings, 5_000_000) {
+                        RampPlan::Manual { log2_exposure, .. } => log2_exposure,
+                        RampPlan::Seed => panic!("expected a manual plan"),
+                    };
+                // Same day-level target without a station and at ≥ +6°, so
+                // compare at the same target: only the ceiling differs.
+                if sun >= DAY_ELEVATION_DEG {
+                    assert!(log2(Some(sun)) <= log2(None) + 1e-9);
+                }
+                let decision = decide(Some(&state), at(1), Some(sun), &settings, 5_000_000);
+                let RampPlan::Manual { log2_exposure, .. } = decision.plan else {
+                    panic!("expected a manual plan");
+                };
+                if let Some(ceiling) = decision.ceiling_log2_exposure {
+                    assert!(log2_exposure <= ceiling + 1e-3, "{scene_ev} {sun}");
+                    assert_eq!(
+                        decision.ceiling_bound,
+                        decision.desired_log2_exposure.unwrap() > ceiling
+                    );
+                } else {
+                    assert!(!decision.ceiling_bound);
+                }
+            }
+        }
     }
 }
