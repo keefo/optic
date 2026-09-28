@@ -1,5 +1,6 @@
 const elements = {
   preview: document.querySelector("#preview"),
+  frameTime: document.querySelector("#frame-time"),
   previewFrame: document.querySelector(".preview-frame"),
   placeholder: document.querySelector("#preview-placeholder"),
   notice: document.querySelector("#notice"),
@@ -76,7 +77,6 @@ const profiles = {
   },
 };
 
-let objectUrl = null;
 let livePreview = false;
 // Operator's persisted Stop preview choice (daemon `preview_state.json`);
 // while set, nothing on this page auto-starts the preview.
@@ -294,12 +294,9 @@ async function fnDiscardConfig() {
 
 function hidePreview(state = "Starting automatically") {
   stopMjpegPreview();
-  if (objectUrl) {
-    URL.revokeObjectURL(objectUrl);
-    objectUrl = null;
-  }
-  elements.preview.removeAttribute("src");
+  clearPreviewCanvas();
   elements.preview.hidden = true;
+  elements.frameTime.hidden = true;
   window.OpticFocus?.clear();
   window.OpticScheduledExposure?.clearPreview();
   elements.placeholder.hidden = false;
@@ -335,7 +332,10 @@ function startMjpegPreview(state) {
 
 async function consumeMjpeg(generation, signal) {
   try {
-    const response = await api(`/api/stream/mjpeg?t=${Date.now()}`, { signal });
+    // `parser=js`: this code parses the multipart framing itself, so the
+    // stream must not arrive as multipart/x-mixed-replace — WebKit consumes
+    // that in its network layer and the fetch fails on iOS Safari.
+    const response = await api(`/api/stream/mjpeg?parser=js&t=${Date.now()}`, { signal });
     if (!response.body) throw new Error("Streaming response body is unavailable");
     const reader = response.body.getReader();
     let buffer = new Uint8Array(0);
@@ -398,28 +398,84 @@ function parsePartHeaders(text) {
   return headers;
 }
 
+// The Pi's own capture time for the displayed preview frame, rendered in the
+// station's timezone (the Pi's clock and this browser's may differ, and the
+// phone may be in another zone entirely). Preview only.
+let stationTimezone = null;
+let frameTimeFormatter = null;
+let frameTimeFormatterZone = null;
+
+function frameTimeFormat(at) {
+  const zone = stationTimezone || undefined;
+  if (!frameTimeFormatter || frameTimeFormatterZone !== zone) {
+    frameTimeFormatter = new Intl.DateTimeFormat(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+      timeZone: zone,
+      timeZoneName: "short",
+    });
+    frameTimeFormatterZone = zone;
+  }
+  return frameTimeFormatter.format(at);
+}
+
+function renderFrameTime(headers) {
+  const raw = Number(headers["x-optic-captured-at"]);
+  if (!Number.isFinite(raw) || raw <= 0) {
+    elements.frameTime.hidden = true;
+    return;
+  }
+  elements.frameTime.textContent = frameTimeFormat(new Date(raw));
+  elements.frameTime.hidden = false;
+}
+
+let previewContext = null;
+
+function clearPreviewCanvas() {
+  const canvas = elements.preview;
+  if (!previewContext) previewContext = canvas.getContext("2d");
+  previewContext.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+// Sizes the canvas to the frame (only when it changes: assigning width or
+// height clears the canvas) and draws it.
+function drawPreviewFrame(bitmap) {
+  const canvas = elements.preview;
+  if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+  }
+  if (!previewContext) previewContext = canvas.getContext("2d");
+  previewContext.drawImage(bitmap, 0, 0);
+}
+
+// Frames are decoded to an ImageBitmap and drawn into the preview canvas.
+// An <img> was tried first and flickers on iOS Safari: WebKit blanks the
+// element the moment `src` changes and only repaints once the new frame has
+// decoded, which reads as a black flash 2-3 times a second. A canvas keeps
+// the previous frame's pixels until the next `drawImage` replaces them, so
+// there is no blank state at all (worklogs/2026-09-28-ios-preview-stream.md).
 async function renderMjpegFrame(jpeg, headers, generation) {
   if (generation !== mjpegGeneration) return;
-  const nextUrl = URL.createObjectURL(new Blob([jpeg], { type: "image/jpeg" }));
-  const previousUrl = objectUrl;
-  objectUrl = nextUrl;
-  elements.preview.src = nextUrl;
+  let bitmap;
   try {
-    await elements.preview.decode();
+    bitmap = await createImageBitmap(new Blob([jpeg], { type: "image/jpeg" }));
   } catch (_) {
-    if (objectUrl === nextUrl) objectUrl = null;
-    URL.revokeObjectURL(nextUrl);
+    return; // A corrupt or truncated frame: skip it, keep the last good one.
+  }
+  if (generation !== mjpegGeneration) {
+    bitmap.close();
     return;
   }
-  if (generation !== mjpegGeneration || objectUrl !== nextUrl) {
-    URL.revokeObjectURL(nextUrl);
-    return;
-  }
+  drawPreviewFrame(bitmap);
+  bitmap.close();
   const paintedAt = await new Promise((resolve) => {
     requestAnimationFrame(() => requestAnimationFrame(resolve));
   });
-  if (previousUrl) URL.revokeObjectURL(previousUrl);
   recordRenderedFrame(headers, paintedAt);
+  renderFrameTime(headers);
   // After the measurement, so focus-tool processing never skews it.
   window.OpticFocus?.onFrame(elements.preview);
   window.OpticScheduledExposure?.onPreviewFrame(frameMetadata(headers));
@@ -911,6 +967,7 @@ async function refreshStatus() {
     document.querySelector("#queue").textContent =
       `${status.capture_stage.queued_files} files · ${formatBytes(status.capture_stage.queued_bytes)}`;
     document.querySelector("#sensor").textContent = status.camera.sensor || "Not detected";
+    stationTimezone = status.config.schedule?.station?.timezone || null;
     renderSync(status.sync);
     renderSchedulerSummary(status.schedule, status.config.schedule.rules);
     if (!cameraFieldsInitialized) {
@@ -1064,11 +1121,6 @@ document.addEventListener("scheduled-exposure-change", () => {
 document.addEventListener("scheduled-exposure-preview-change", () => {
   controlRevision += 1;
   schedulePreviewUpdate();
-});
-elements.preview.addEventListener("error", () => {
-  if (livePreview) {
-    showNotice("Waiting for camera frames…");
-  }
 });
 window.addEventListener("pagehide", () => {
   pageActive = false;
