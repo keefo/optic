@@ -25,7 +25,7 @@ observed on the Pi is marked **unverified**.
 | Network link is **Wi-Fi** | `ip -br addr`: `wlan0 UP 192.168.0.195/24`, `eth0 DOWN` (carrier 0). `default via 192.168.0.1 dev wlan0`. nmcli: `wlan0:wifi:connected:netplan-wlan0-…`, 5180 MHz, signal 82 |
 | Network manager | NetworkManager 1.52.1 (active), with connections generated from netplan (`/run/NetworkManager/system-connections/netplan-*.nmconnection`). `systemd-networkd` disabled; `networkctl` shows every link `unmanaged`; `dhcpcd` inactive |
 | Wi-Fi profile on disk | `/etc/netplan/90-NM-af6538bb-….yaml` (root 0600). Its UUID matches the active connection `af6538bb-…`. NetworkManager rewrote it at 21:18:58, when NM started |
-| `imacpro.local` resolution | `getent hosts imacpro.local` → `192.168.0.202`. `nsswitch`: `files mdns4_minimal [NOTFOUND=return] dns` (libnss-mdns, which queries **avahi-daemon**). `systemd-resolved` inactive; `/etc/resolv.conf` → `192.168.0.1` |
+| `imac.local` resolution | `getent hosts imac.local` → `192.168.0.202`. `nsswitch`: `files mdns4_minimal [NOTFOUND=return] dns` (libnss-mdns, which queries **avahi-daemon**). `systemd-resolved` inactive; `/etc/resolv.conf` → `192.168.0.1` |
 | Beszel hub address | `beszel-agent` uses `HUB_URL=http://192.168.0.202:8090` (an IP, not mDNS) |
 | Time | `timedatectl`: synchronized yes, NTP active (timesyncd, `2.debian.pool.ntp.org`). `systemd-time-wait-sync` enabled with the `optic-bounded-wait.conf` drop-in active; it took 31.5 s this boot. `critical-chain`: `optic-daemon` ← `time-sync.target` @32.6 s |
 | Linger | `loginctl show-user liam`: `Linger=yes` |
@@ -48,7 +48,7 @@ observed on the Pi is marked **unverified**.
 | `ssh.service` | OpenSSH server | 9.6 MiB | Yes. Listens on :22; this audit used it | KEEP | Only remote access path |
 | `NetworkManager.service` | Manages `wlan0` (DHCP, Wi-Fi) | 6.2 MiB | Yes. Owns the default route over `wlan0` | KEEP | The network link |
 | `wpa_supplicant.service` | Wi-Fi authentication for NM | 0.8 MiB | Yes. Wi-Fi is the real link (`eth0` DOWN) | KEEP | Disabling it would drop the Pi off the network |
-| `avahi-daemon.service` (+ `.socket`) | mDNS: announces `optic.local`, resolves `.local` | 1.5 MiB | Yes. `optic.local` is how the Mac reaches it; `imacpro.local` for `optic_sync` resolves via `mdns4_minimal` → avahi | KEEP | Needed both ways; `verify.sh` Phase 4 requires it |
+| `avahi-daemon.service` (+ `.socket`) | mDNS: announces `optic.local`, resolves `.local` | 1.5 MiB | Yes. `optic.local` is how the Mac reaches it; `imac.local` for `optic_sync` resolves via `mdns4_minimal` → avahi | KEEP | Needed both ways; `verify.sh` Phase 4 requires it |
 | `systemd-timesyncd.service` | NTP client | 1.3 MiB | Yes. Synchronized; the dashboard's NTP button restarts it | KEEP | No RTC battery |
 | `systemd-timedated.service` | D-Bus time/timezone API (on demand) | 2.2 MiB | Yes. Started 21:44:06, with the daemon; the dashboard timezone uses it | KEEP | Exits by itself when idle |
 | `polkit.service` | Authorization for the D-Bus calls | 5.2 MiB | Yes. Rules 60–64 (reboot, NTP, timezone, power-off, daemon restart) | KEEP | Dashboard buttons and unprivileged deploys |
@@ -328,7 +328,7 @@ mv ~/.local/bin/optic-capture-transfer.sh ~/.local/bin/setup-phase-06-pi-ram-tra
 
 - **`wpa_supplicant`, `NetworkManager`, `NetworkManager-wait-online`**:
   Wi-Fi is the only live link (`eth0` has no carrier).
-- **`avahi-daemon`**: `optic.local` and `imacpro.local` (`optic_sync`) both
+- **`avahi-daemon`**: `optic.local` and `imac.local` (`optic_sync`) both
   depend on it; `systemd-resolved` is not running.
 - **`fstrim.timer`**: useful on an SD card over a year.
 - **`serial-getty@ttyAMA10`**: the rescue console when the network fails;

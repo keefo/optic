@@ -15,7 +15,7 @@ CLIENT_KEY_FILE=""
 # is being run on the intended Mac before making system changes, using a
 # stable identity (mDNS hostname) rather than a DHCP-assigned IP that can
 # and did change.
-EXPECTED_HOSTNAME="imacpro"
+EXPECTED_HOSTNAME="imac"
 RECEIVER_PORT="2222"
 RECEIVER_USER="admin"
 RECEIVER_GROUP="staff"

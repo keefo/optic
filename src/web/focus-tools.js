@@ -160,7 +160,16 @@
     return { mask, fraction: total ? clipped / total : 0 };
   }
 
+  // Intrinsic pixel size of a frame source. The preview is a <canvas> (app.js
+  // draws decoded frames into it), which has `width`/`height` and no
+  // `naturalWidth`; an <img> has `naturalWidth`. Reading `naturalWidth`
+  // directly silently disabled every tool once the preview became a canvas.
+  const frameWidth = (el) => el.naturalWidth || el.width || 0;
+  const frameHeight = (el) => el.naturalHeight || el.height || 0;
+
   const pure = {
+    frameWidth,
+    frameHeight,
     computeHistogram,
     clippedMask,
     toGray,
@@ -183,11 +192,6 @@
   const LOUPE_SOURCE = 160;
   const LOUPE_ZOOM = 2;
   const SENSOR_WIDTH = 4056;
-
-  // The preview is a <canvas> (app.js draws decoded frames into it); these
-  // also accept an <img>, whose intrinsic size is naturalWidth/Height.
-  const frameWidth = (el) => el.naturalWidth || el.width || 0;
-  const frameHeight = (el) => el.naturalHeight || el.height || 0;
 
   const $ = (selector) => document.querySelector(selector);
   const ui = {
@@ -418,10 +422,16 @@
   }
 
   function onFrame(img) {
-    if (!anyEnabled() || !img.naturalWidth || !img.naturalHeight) return;
-    const scale = Math.min(1, WORK_LONG_EDGE / Math.max(img.naturalWidth, img.naturalHeight));
-    const width = Math.max(1, Math.round(img.naturalWidth * scale));
-    const height = Math.max(1, Math.round(img.naturalHeight * scale));
+    // frameWidth/frameHeight, never `naturalWidth`: the preview is a <canvas>
+    // since the iOS flicker fix, and a canvas has no naturalWidth, so reading
+    // it here silently disabled every tool
+    // (worklogs/2026-09-29-focus-tools-canvas-regression.md).
+    const sourceWidth = frameWidth(img);
+    const sourceHeight = frameHeight(img);
+    if (!anyEnabled() || !sourceWidth || !sourceHeight) return;
+    const scale = Math.min(1, WORK_LONG_EDGE / Math.max(sourceWidth, sourceHeight));
+    const width = Math.max(1, Math.round(sourceWidth * scale));
+    const height = Math.max(1, Math.round(sourceHeight * scale));
     try {
       if (state.histogram || state.peaking || state.clipping) {
         if (work.width !== width || work.height !== height) {

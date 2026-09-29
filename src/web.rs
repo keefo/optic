@@ -1804,6 +1804,18 @@ mod tests {
     }
 
     #[test]
+    fn focus_tools_read_the_preview_size_through_the_canvas_aware_helpers() {
+        // Regression: onFrame() read `img.naturalWidth`, which a <canvas> does
+        // not have, so every focus tool silently did nothing
+        // (worklogs/2026-09-29-focus-tools-canvas-regression.md).
+        let focus_tools = include_str!("web/focus-tools.js");
+        assert!(focus_tools.contains("frameWidth(img)"));
+        // The only `naturalWidth` reads live in the helpers themselves.
+        assert_eq!(focus_tools.matches(".naturalWidth").count(), 1);
+        assert_eq!(focus_tools.matches(".naturalHeight").count(), 1);
+    }
+
+    #[test]
     fn preview_frames_are_drawn_into_a_canvas() {
         // An <img> flickers on iOS Safari: WebKit blanks the element while the
         // new frame decodes. The canvas keeps the last frame's pixels until

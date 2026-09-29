@@ -71,7 +71,7 @@ a plain file:
 systemctl stop optic-daemon.service   # was --user before the 2026-09-21 system-service migration
 OPTIC_BIND_ADDR=0.0.0.0:8000 \
 OPTIC_CAPTURE_DIR=/mnt/capture \
-OPTIC_SYNC_REMOTE_HOST=imacpro.local \
+OPTIC_SYNC_REMOTE_HOST=imac.local \
 RUST_LOG=info \
 LD_LIBRARY_PATH=/home/liam/.local/optic-sysroot/usr/lib/aarch64-linux-gnu \
 nohup /home/liam/.local/bin/optic-daemon > /tmp/optic-perf.log 2>&1 &
