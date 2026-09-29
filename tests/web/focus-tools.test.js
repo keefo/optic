@@ -188,3 +188,23 @@ test("clipping reports which pixels and what fraction", () => {
   assert.equal(fraction, 0.5);
   assert.deepEqual(Array.from(mask.slice(0, 8)), [0, 0, 0, 0, 1, 1, 1, 1]);
 });
+
+test("frameWidth/frameHeight read a canvas as well as an image", () => {
+  // The preview became a <canvas> with the iOS flicker fix. A canvas has
+  // width/height and no naturalWidth, so reading naturalWidth directly
+  // disabled every focus tool (2026-09-29 regression).
+  const canvas = { width: 1352, height: 1014 };
+  assert.equal(focus.frameWidth(canvas), 1352);
+  assert.equal(focus.frameHeight(canvas), 1014);
+
+  const img = { naturalWidth: 4056, naturalHeight: 3040, width: 800, height: 600 };
+  assert.equal(focus.frameWidth(img), 4056, "an image's intrinsic size wins over its layout size");
+  assert.equal(focus.frameHeight(img), 3040);
+
+  // A frame source that is not ready yet reports 0, which callers treat as
+  // "skip this frame" rather than dividing by undefined.
+  assert.equal(focus.frameWidth({}), 0);
+  assert.equal(focus.frameHeight({}), 0);
+  assert.equal(focus.frameWidth({ naturalWidth: 0, width: 0 }), 0);
+});
+
