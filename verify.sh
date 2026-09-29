@@ -18,7 +18,7 @@ EXPECTED_BESZEL_VERSION="0.19.0"
 # below is different and correctly a hostname: it feeds `optic_sync`'s SSH
 # connection, which shells out to the real `ssh` binary and resolves
 # `.local` names fine via the Pi's normal system resolver.
-EXPECTED_HUB_URL="http://192.168.0.202:8090"
+EXPECTED_HUB_URL="http://192.168.0.231:8090"
 EXPECTED_CAPTURE_HOST="imac.local"
 EXPECTED_CAPTURE_USER="admin"
 EXPECTED_CAPTURE_PORT="2222"
