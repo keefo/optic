@@ -22,7 +22,7 @@ SupplementaryGroups=video render
 ExecStart=/home/liam/.local/bin/optic-daemon
 Environment=OPTIC_BIND_ADDR=0.0.0.0:8000
 Environment=OPTIC_CAPTURE_DIR=/mnt/capture
-Environment=OPTIC_SYNC_REMOTE_HOST=imacpro.local
+Environment=OPTIC_SYNC_REMOTE_HOST=imac.local
 Environment=RUST_LOG=info
 Environment=LD_LIBRARY_PATH=/home/liam/.local/optic-sysroot/usr/lib/aarch64-linux-gnu
 Restart=on-failure

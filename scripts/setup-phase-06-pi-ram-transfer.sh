@@ -21,7 +21,7 @@ CAPTURE_GROUP="liam"
 CAPTURE_UID=1000
 CAPTURE_GID=1000
 CAPTURE_DIR="/mnt/capture"
-REMOTE_HOST="imacpro.local"
+REMOTE_HOST="imac.local"
 REMOTE_PORT="2222"
 REMOTE_USER="admin"
 BACKUP_DIR="/var/backups/optic-hardening"
@@ -47,7 +47,7 @@ usage() {
 Usage: setup-phase-06-pi-ram-transfer.sh [--dry-run] [--host-key FILE] [--help]
 
 Configures a 256 MiB tmpfs capture stage, the capture key, and the pinned host
-key of the dedicated iMac receiver at imacpro.local:2222 that optic_sync uses.
+key of the dedicated iMac receiver at imac.local:2222 that optic_sync uses.
 Retires the old shell transfer timer and its files if present.
 
   --dry-run        Report required changes without modifying the system.
