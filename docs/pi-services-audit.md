@@ -26,7 +26,7 @@ observed on the Pi is marked **unverified**.
 | Network manager | NetworkManager 1.52.1 (active), with connections generated from netplan (`/run/NetworkManager/system-connections/netplan-*.nmconnection`). `systemd-networkd` disabled; `networkctl` shows every link `unmanaged`; `dhcpcd` inactive |
 | Wi-Fi profile on disk | `/etc/netplan/90-NM-af6538bb-….yaml` (root 0600). Its UUID matches the active connection `af6538bb-…`. NetworkManager rewrote it at 21:18:58, when NM started |
 | `imac.local` resolution | `getent hosts imac.local` → `192.168.0.231` (`192.168.0.202` when audited). `nsswitch`: `files mdns4_minimal [NOTFOUND=return] dns` (libnss-mdns, which queries **avahi-daemon**). `systemd-resolved` inactive; `/etc/resolv.conf` → `192.168.0.1` |
-| Beszel hub address | `beszel-agent` uses `HUB_URL=http://192.168.0.231:8090` (an IP, not mDNS). Was `192.168.0.202` when audited; the Mac's DHCP lease moved and the hub was unreachable for days (`worklogs/2026-09-29-beszel-hub-address.md`) |
+| Beszel hub address | Beszel was **removed entirely on 2026-10-07** (`worklogs/2026-10-07-remove-beszel.md`). It used a literal `HUB_URL` IP and broke on every DHCP change on the Mac |
 | Time | `timedatectl`: synchronized yes, NTP active (timesyncd, `2.debian.pool.ntp.org`). `systemd-time-wait-sync` enabled with the `optic-bounded-wait.conf` drop-in active; it took 31.5 s this boot. `critical-chain`: `optic-daemon` ← `time-sync.target` @32.6 s |
 | Linger | `loginctl show-user liam`: `Linger=yes` |
 | Listening ports | TCP `0.0.0.0:8000` (optic-daemon), TCP `22` v4 and v6 (sshd), UDP `5353` (avahi), plus two ephemeral UDP ports. `nftables` is disabled (no host firewall) |
@@ -59,7 +59,7 @@ observed on the Pi is marked **unverified**.
 | `cron.service` | Classic cron | 0.5 MiB | Nothing found: every `/etc/cron.*` script and `/etc/cron.d/e2scrub_all` exits when systemd is running; `liam` has no crontab. **Root's crontab unverified** (`/var/spool/cron/crontabs` unreadable without sudo) | DISABLE WITH CARE | §3.7 |
 | `getty@tty1.service` | HDMI console login, **with autologin as `liam`** | 0.5 MiB + session 0.4 MiB | Only if a keyboard and screen are attached. `who`: `liam tty1` logged in since boot | DISABLE WITH CARE (the autologin, not the getty) | §3.6 |
 | `serial-getty@ttyAMA10.service` | Login on the Pi 5 debug UART | 0.2 MiB | Not in use now. It is the rescue console if Wi-Fi fails | KEEP | Cheapest recovery path on a headless box |
-| `user@1000.service` | `liam`'s user manager | 19.7 MiB (beszel-agent is 14.2 of it) | Yes. Hosts beszel-agent; needs linger | KEEP | Beszel |
+| `user@1000.service` | `liam`'s user manager | 19.7 MiB when audited, 14.2 of it beszel-agent | No longer hosts anything of ours since Beszel was removed (2026-10-07) | KEEP | Default user manager; linger no longer required |
 
 ### 2.2 System services, enabled (boot oneshots and on-demand)
 
@@ -121,7 +121,7 @@ behind them until used, so disabling them saves nothing and some are core
 
 | Unit | What it does | RAM | Used here? Evidence | Verdict | Why |
 |------|--------------|-----|---------------------|---------|-----|
-| `beszel-agent.service` | Beszel monitoring agent → hub `192.168.0.231:8090` | 14.2 MiB | Yes. Phase 6 "Beszel exports the capture RAM stage" PASS | KEEP | Monitoring; needs linger (`Linger=yes`) |
+| ~~`beszel-agent.service`~~ | Beszel monitoring agent | 14.2 MiB | **Removed 2026-10-07** (`worklogs/2026-10-07-remove-beszel.md`) | GONE | Never caught an outage; broke on every DHCP change and flooded the journal |
 | `dbus.service` (+ `.socket`) | Session bus | 0.3 MiB | Yes. The user manager needs it | KEEP | Core |
 | `mpris-proxy.service` | **Bluetooth** media-player proxy (package `bluez`), enabled for all users via `/etc/systemd/user/default.target.wants` | 0.2 MiB (RSS 2 MiB) | No. The Bluetooth controller is disabled in firmware and `bluetooth.service` is off | SAFE TO DISABLE | §3.4 |
 | `gpg-agent.socket`, `gpg-agent-ssh.socket`, `gpg-agent-extra.socket`, `gpg-agent-browser.socket`, `dirmngr.socket`, `keyboxd.socket` | GnuPG, on demand | – (0 connections accepted) | No | KEEP (no gain) | Sockets only; zero RAM until something runs `gpg` |

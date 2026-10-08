@@ -4,6 +4,8 @@ Optic is an ultra-reliable, long-term timelapse system engineered around the Ras
 
 ---
 
+> **Host monitoring was removed on 2026-10-07.** Beszel (hub on the Mac, agent on the Pi) is gone: it never caught a real outage, and its dependence on a literal hub IP broke on every DHCP change, flooding the bounded journal and evicting crash evidence (`worklogs/2026-10-07-remove-beszel.md`). Nothing watches the host now. The external heartbeat in `docs/optic-daemon-alerts.md` is the intended replacement and is not built yet.
+
 ## Hardware & System Specifications
 
 ### Compute & System
@@ -29,34 +31,6 @@ Optic is an ultra-reliable, long-term timelapse system engineered around the Ras
 * **Hostname:** `optic.local`
 * **Remote Access:** OpenSSH (key-based authentication recommended)
 * **Service Discovery:** mDNS / Avahi zero-configuration networking
-
----
-
-## Monitoring Baseline: Beszel
-
-Beszel `0.19.0` runs with the Hub on the always-on iMac and the native ARM64 Agent on the Pi. Open the LAN-only dashboard at [http://imac.local:8090](http://imac.local:8090). The login is stored locally on the iMac in `~/.local/share/beszel/admin-credentials` with owner-only permissions.
-
-The iMac Hub runs as the `dev.beszel.hub` LaunchAgent. Its launcher must bind `0.0.0.0:8090`, not the LAN address found at startup: binding one address left the hub listening on a lease the Mac no longer held after a DHCP change, so the Pi's agent logged `no route to host` every 10 s and monitoring was silently dead for days (2026-09-29; `worklogs/2026-09-29-beszel-hub-address.md`). Its data is in `~/.local/share/beszel/data`, and its logs are in `~/Library/Logs/Beszel`. The wrapper uses `caffeinate -s` to prevent system sleep while the iMac is on AC power. Because it is a per-user LaunchAgent, the `admin` account must be logged in after an iMac restart. Reserve a fixed IP address for the iMac in the router's DHCP settings (by its MAC address — a hostname reservation doesn't help here) and keep `beszel-agent.service`'s `HUB_URL` pointed at that IP: confirmed directly (2026-09-20) that the statically linked Pi Agent's Go resolver only ever queries the router's regular unicast DNS server, never mDNS multicast, so `imac.local` fails outright (`no such host`) regardless of network state — this is not a transient issue that "usually resolves," it structurally cannot work for this binary. `optic_sync`'s `OPTIC_SYNC_REMOTE_HOST` is different — it shells out to the real `ssh` binary, which resolves `.local` names fine via the Pi's normal system resolver.
-
-The Pi Agent runs as the persistent `liam` user service `beszel-agent.service`. Agent-initiated WebSocket mode avoids exposing the Agent's SSH port to the LAN. Beszel records CPU, load, memory, CPU and RP1 temperatures, Active Cooler RPM, root-disk usage and I/O, and network traffic. Check service health with:
-
-```bash
-launchctl print "gui/$(id -u)/dev.beszel.hub"
-ssh liam@optic.local 'systemctl --user status beszel-agent.service'
-```
-
-Phase 6 adds the following Beszel Agent override so the bounded RAM capture stage is visible in monitoring:
-
-```ini
-Environment="EXTRA_FILESYSTEMS=/mnt/capture__Capture-RAM"
-```
-
-```bash
-systemctl --user daemon-reload
-systemctl --user restart beszel-agent.service
-```
-
-The Phase 6 Pi setup script installs this override only after configuring `/mnt/capture` as `tmpfs`.
 
 ---
 
@@ -140,7 +114,7 @@ ssh liam@optic.local 'chmod 700 /home/liam/.local/bin/optic-setup-phase-02-memor
 ssh -t liam@optic.local '/home/liam/.local/bin/optic-setup-phase-02-memory --reboot'
 ```
 
-The same script also re-enables the kernel memory cgroup: the firmware prepends `cgroup_disable=memory`, so it appends `cgroup_enable=memory` to `/boot/firmware/cmdline.txt` (backed up, kept on one line). This makes systemd's `MemoryHigh=`/`MemoryMax=` limits (optic-daemon's 350/500 MiB) take effect, and gives Beszel per-service memory. There must be no swap on the SD card: a hand-added `/var/swap.img` line in `/etc/fstab` was found and disabled on 2026-09-21. A real on-Pi release build (LTO) still fit in RAM + zram, at 25 MiB available at its peak (`worklogs/2026-09-21-system-service-migration.md`).
+The same script also re-enables the kernel memory cgroup: the firmware prepends `cgroup_disable=memory`, so it appends `cgroup_enable=memory` to `/boot/firmware/cmdline.txt` (backed up, kept on one line). This makes systemd's `MemoryHigh=`/`MemoryMax=` limits (optic-daemon's 350/500 MiB) take effect, and makes per-service memory accounting available. There must be no swap on the SD card: a hand-added `/var/swap.img` line in `/etc/fstab` was found and disabled on 2026-09-21. A real on-Pi release build (LTO) still fit in RAM + zram, at 25 MiB available at its peak (`worklogs/2026-09-21-system-service-migration.md`).
 
 The native swap generator requires a reboot to replace the active zram device. After `optic` returns, verify only Phase 2:
 
@@ -436,7 +410,7 @@ cd /Users/admin/Documents/projects/optic
 ssh liam@optic.local 'bash -s -- --phase 6 --color' < verify.sh
 ```
 
-Phase 6 verification checks the tmpfs size and hardening, the `optic_sync` target in the daemon unit, that the retired timer is not running, the pinned key, the authenticated receiver probe, `optic_sync` status from `/api/status`, the Beszel export, and queued file/byte counts.
+Phase 6 verification checks the tmpfs size and hardening, the `optic_sync` target in the daemon unit, that the retired timer is not running, the pinned key, the authenticated receiver probe, `optic_sync` status from `/api/status`, and queued file/byte counts.
 
 ---
 
@@ -626,7 +600,7 @@ The daemon's sandbox cannot use `sudo`, so the footer Power menu's **Reboot** an
 | `63-optic-daemon-power-off.rules` | `org.freedesktop.login1.power-off` |
 | `64-optic-daemon-manage-unit.rules` | `org.freedesktop.systemd1.manage-units`, only `start`/`stop`/`restart` of `optic-daemon.service` |
 
-The same script enables `Linger=yes` for `liam` (still needed by the Beszel agent's user service) and ensures `video` and `render` membership. It changes only what differs, backs up any rule it replaces to `/var/backups/optic-hardening/`, and needs no service restart because `polkitd` reloads its rules on change. After applying, it confirms with `pkcheck` that each action is authorized and that restarting a different unit still is not. Run it before §F on a fresh Pi:
+The same script enables `Linger=yes` for `liam` (no longer required since Beszel was removed, and harmless) and ensures `video` and `render` membership. It changes only what differs, backs up any rule it replaces to `/var/backups/optic-hardening/`, and needs no service restart because `polkitd` reloads its rules on change. After applying, it confirms with `pkcheck` that each action is authorized and that restarting a different unit still is not. Run it before §F on a fresh Pi:
 
 ```bash
 scp /Users/admin/Documents/projects/optic/scripts/setup-phase-08-daemon-host-access.sh liam@optic.local:/home/liam/.local/bin/optic-setup-phase-08-daemon-host-access

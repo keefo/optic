@@ -70,7 +70,7 @@ RAM-upper mechanism in §1 with no Option B.
 | `/var/backups/optic-hardening/`, `/etc/...` drop-ins, `/boot/firmware/config.txt` | setup scripts | Changes lost at reboot | Run setup scripts only with the overlay off (§4) |
 | `/var/lib/systemd/linger/liam`, `/etc/polkit-1/rules.d/6*-optic-*` | setup scripts, once | Read-only at runtime: fine | No change |
 | `~/.ssh/optic_capture_known_hosts`, `~/.ssh/optic_capture_ed25519` | read by sync with `StrictHostKeyChecking=yes`, so never written | Fine | No change |
-| `~/.local/share/beszel-agent/` (`DATA_DIR`); `~/.config/beszel/{key,token}` | beszel-agent user service. `DATA_DIR` does not exist yet (checked 2026-09-20); key and token are read at start | If the agent later creates `DATA_DIR`, its contents are lost at reboot; key and token are fine | Accept (monitoring only); recheck before Stage 3 |
+| ~~`~/.local/share/beszel-agent/`; `~/.config/beszel/`~~ | Removed with Beszel on 2026-10-07 (`worklogs/2026-10-07-remove-beszel.md`) | n/a | n/a |
 | OS churn: DHCP leases, `/var/lib/systemd/random-seed`, timer stamps, shell history, `/var/tmp` | OS | Lost at reboot; small RAM use | Accept |
 
 `OPTIC_CAPTURE_LOG_DB` and `OPTIC_WEB_ASSETS_DIR` could move these paths

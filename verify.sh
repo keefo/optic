@@ -7,18 +7,6 @@ set -uo pipefail
 export LC_ALL=C
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-EXPECTED_BESZEL_VERSION="0.19.0"
-# Must stay an IP, never a hostname — confirmed directly (2026-09-20):
-# beszel-agent is a statically linked Go binary whose resolver only issues
-# plain unicast DNS queries to the router, never mDNS multicast, so
-# "imac.local" fails outright ("no such host") regardless of network
-# state. This is not a transient/fixable-later issue; it structurally
-# cannot resolve for this binary. See
-# worklogs/2026-09-20-stale-iMac-ip-beszel-and-sync.md. `EXPECTED_CAPTURE_HOST`
-# below is different and correctly a hostname: it feeds `optic_sync`'s SSH
-# connection, which shells out to the real `ssh` binary and resolves
-# `.local` names fine via the Pi's normal system resolver.
-EXPECTED_HUB_URL="http://192.168.0.231:8090"
 EXPECTED_CAPTURE_HOST="imac.local"
 EXPECTED_CAPTURE_USER="admin"
 EXPECTED_CAPTURE_PORT="2222"
@@ -34,7 +22,7 @@ Usage: verify.sh [--phase PHASE] [--strict] [--color|--no-color] [--help]
 
 Runs read-only checks for the Project Optic hardening plan.
 
-  --phase      Report only: 1-9, baseline, monitoring, or all (default).
+  --phase      Report only: 1-9, baseline, or all (default).
   --strict     Return exit code 2 when warnings exist and no checks fail.
   --color      Always use ANSI colors (useful when streaming through SSH).
   --no-color   Disable ANSI colors.
@@ -63,7 +51,7 @@ while (($#)); do
 done
 
 case "$SELECTED_PHASE" in
-    all|baseline|monitoring|1|2|3|4|5|6|7|8|9) ;;
+    all|baseline|1|2|3|4|5|6|7|8|9) ;;
     *)
         printf 'Invalid phase: %s\n' "$SELECTED_PHASE" >&2
         usage >&2
@@ -116,7 +104,6 @@ section() {
     local title=$1 phase
     case "$title" in
         "Prerequisites and hardware baseline") phase="baseline" ;;
-        "Monitoring baseline: Beszel") phase="monitoring" ;;
         [1-9].*) phase=${title%%.*} ;;
         *) phase="unknown" ;;
     esac
@@ -300,86 +287,6 @@ if [[ "$failed_units" == "0" ]]; then
 else
     fail "Systemd has failed services" "count=$failed_units"
 fi
-
-section "Monitoring baseline: Beszel"
-
-agent_active=$(systemctl --user is-active beszel-agent.service 2>/dev/null || true)
-agent_enabled=$(systemctl --user is-enabled beszel-agent.service 2>/dev/null || true)
-if [[ "$agent_active" == "active" && "$agent_enabled" == "enabled" ]]; then
-    pass "Beszel Agent service is active and enabled"
-else
-    fail "Beszel Agent service is not persistent and healthy" \
-        "active=${agent_active:-unknown}, enabled=${agent_enabled:-unknown}"
-fi
-
-linger=$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || true)
-if [[ "$linger" == "yes" ]]; then
-    pass "User lingering keeps the Agent running after logout"
-else
-    fail "User lingering is disabled" "Linger=${linger:-unknown}"
-fi
-
-agent_environment=$(systemctl --user show beszel-agent.service -p Environment --value 2>/dev/null || true)
-hub_url=$(environment_value "$agent_environment" HUB_URL)
-listen_address=$(environment_value "$agent_environment" LISTEN)
-primary_sensor=$(environment_value "$agent_environment" PRIMARY_SENSOR)
-extra_filesystems=$(environment_value "$agent_environment" EXTRA_FILESYSTEMS)
-
-if [[ "$hub_url" == "$EXPECTED_HUB_URL" ]]; then
-    pass "Beszel Hub URL" "$hub_url"
-else
-    fail "Beszel Hub URL differs from the deployment plan" \
-        "expected=$EXPECTED_HUB_URL, actual=${hub_url:-missing}"
-fi
-
-if [[ "$listen_address" == 127.0.0.1:* ]]; then
-    pass "Beszel fallback SSH listener is loopback-only" "$listen_address"
-else
-    fail "Beszel fallback SSH listener is not loopback-only" "LISTEN=${listen_address:-missing}"
-fi
-
-if [[ "$primary_sensor" == "cpu_thermal" ]]; then
-    pass "Beszel primary temperature sensor" "$primary_sensor"
-else
-    fail "Beszel primary temperature sensor differs from the plan" \
-        "PRIMARY_SENSOR=${primary_sensor:-missing}"
-fi
-
-agent_health=$("$HOME/.local/bin/beszel-agent" health 2>/dev/null || true)
-if [[ "$agent_health" == "ok" ]]; then
-    pass "Beszel Agent health check"
-else
-    fail "Beszel Agent health check failed" "result=${agent_health:-unavailable}"
-fi
-
-agent_version=$("$HOME/.local/bin/beszel-agent" --version 2>/dev/null | awk '{print $NF}' || true)
-if [[ "$agent_version" == "$EXPECTED_BESZEL_VERSION" ]]; then
-    pass "Beszel Agent version" "$agent_version"
-else
-    fail "Beszel Agent version differs from the plan" \
-        "expected=$EXPECTED_BESZEL_VERSION, actual=${agent_version:-unavailable}"
-fi
-
-if [[ -n "$hub_url" ]] && curl -fsS --max-time 5 "$hub_url/api/health" 2>/dev/null |
-    grep -q '"code":200'; then
-    pass "Beszel Hub is reachable from optic" "$hub_url"
-else
-    fail "Beszel Hub is not reachable from optic" "HUB_URL=${hub_url:-missing}"
-fi
-
-for secret_file in "$HOME/.config/beszel/key" "$HOME/.config/beszel/token" \
-    "$HOME/.config/systemd/user/beszel-agent.service"; do
-    if [[ -f "$secret_file" ]]; then
-        mode=$(stat -c '%a' "$secret_file" 2>/dev/null || true)
-        if [[ "$mode" == "600" ]]; then
-            pass "Protected file permissions" "$secret_file mode=600"
-        else
-            fail "Protected file permissions are too broad" "$secret_file mode=${mode:-unknown}"
-        fi
-    else
-        fail "Required protected file is missing" "$secret_file"
-    fi
-done
 
 section "1. Flash wear and RAM journaling"
 
@@ -922,13 +829,6 @@ else
         "response=${receiver_probe:-unavailable}"
 fi
 
-if [[ "$extra_filesystems" == *"/mnt/capture__Capture-RAM"* ]]; then
-    pass "Beszel exports the capture RAM stage"
-else
-    fail "Beszel does not export the capture RAM stage" \
-        "EXTRA_FILESYSTEMS=${extra_filesystems:-missing}"
-fi
-
 queued_files=$(find /mnt/capture -maxdepth 1 -type f ! -name '.*' -printf '.' 2>/dev/null |
     wc -c | tr -d ' ')
 queued_bytes=$(find /mnt/capture -maxdepth 1 -type f ! -name '.*' -printf '%s\n' 2>/dev/null |
@@ -1000,12 +900,13 @@ info "Optical validation remains manual" \
 
 # Host access for the daemon's dashboard system actions
 # (scripts/setup-phase-08-daemon-host-access.sh). optic-daemon is a system
-# service now; lingering remains for the Beszel agent's user service.
+# service, so nothing requires user lingering since the Beszel agent was
+# removed (worklogs/2026-10-07-remove-beszel.md); it is reported, not required.
 daemon_user=liam
 if [[ -e "/var/lib/systemd/linger/$daemon_user" ]]; then
-    pass "User manager lingering is enabled" "$daemon_user"
+    info "User manager lingering is enabled" "$daemon_user (no longer required)"
 else
-    fail "User manager lingering is disabled" "the Beszel agent user service will not start at boot for $daemon_user"
+    info "User manager lingering is disabled" "$daemon_user (not required)"
 fi
 
 # optic-daemon runs as a system service owned by liam

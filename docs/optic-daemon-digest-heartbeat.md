@@ -45,7 +45,7 @@ unwritable state file) is logged and never affects capture or transfer.
 
 Rejected: healthchecks.io (new account; better recovery/history, but the
 user preferred no new service), Uptime Kuma or healthchecks on the iMac
-(shares the iMac failure domain with Beszel and the sync receiver).
+(shares the iMac failure domain with the sync receiver; Beszel was removed on 2026-10-07).
 
 ## 3. Daily Digest
 

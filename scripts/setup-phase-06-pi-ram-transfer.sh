@@ -39,7 +39,6 @@ RETIRED_FILES=(
 PRIVATE_KEY="$USER_HOME/.ssh/optic_capture_ed25519"
 PUBLIC_KEY="$PRIVATE_KEY.pub"
 KNOWN_HOSTS="$USER_HOME/.ssh/optic_capture_known_hosts"
-BESZEL_DROPIN="$USER_HOME/.config/systemd/user/beszel-agent.service.d/60-optic-capture-ram.conf"
 TEMPORARY=""
 
 usage() {
@@ -84,13 +83,6 @@ Options=mode=0750,uid=$CAPTURE_UID,gid=$CAPTURE_GID,size=256M,nosuid,nodev,noexe
 
 [Install]
 WantedBy=local-fs.target
-EOF
-)
-
-beszel_content=$(cat <<'EOF'
-# Managed by Project Optic setup-phase-06-pi-ram-transfer.sh
-[Service]
-Environment="EXTRA_FILESYSTEMS=/mnt/capture__Capture-RAM"
 EOF
 )
 
@@ -154,7 +146,6 @@ retired_present() {
 if ((DRY_RUN)); then
     printf '%s\n' 'Project Optic Phase 6 Pi dry run'
     show_file_plan "$MOUNT_UNIT" "$mount_content"
-    show_file_plan "$BESZEL_DROPIN" "$beszel_content"
     retired=$(retired_present)
     if [[ -z "$retired" ]]; then
         printf '%s\n' '[OK] The retired shell capture transfer is not installed.'
@@ -196,12 +187,9 @@ fi
 printf '%s\n' 'Configuring Project Optic Phase 6 Pi RAM stage and sync credentials'
 
 install -d -m 0700 -o "$CAPTURE_USER" -g "$CAPTURE_GROUP" "$USER_HOME/.ssh"
-install -d -m 0755 -o "$CAPTURE_USER" -g "$CAPTURE_GROUP" \
-    "$USER_HOME/.config/systemd/user/beszel-agent.service.d"
 install -d -m 0750 -o "$CAPTURE_USER" -g "$CAPTURE_GROUP" "$CAPTURE_DIR"
 
 install_managed_file "$MOUNT_UNIT" "$mount_content"
-install_managed_file "$BESZEL_DROPIN" "$beszel_content" 0644 "$CAPTURE_USER" "$CAPTURE_GROUP"
 
 if [[ ! -f "$PRIVATE_KEY" ]]; then
     sudo -u "$CAPTURE_USER" ssh-keygen -q -t ed25519 -N '' \
@@ -248,8 +236,6 @@ chmod 0750 "$CAPTURE_DIR"
 
 sudo -u "$CAPTURE_USER" XDG_RUNTIME_DIR="/run/user/$CAPTURE_UID" \
     systemctl --user daemon-reload
-sudo -u "$CAPTURE_USER" XDG_RUNTIME_DIR="/run/user/$CAPTURE_UID" \
-    systemctl --user restart beszel-agent.service
 
 for path in "${RETIRED_FILES[@]}"; do
     [[ ! -e "$path" ]]
