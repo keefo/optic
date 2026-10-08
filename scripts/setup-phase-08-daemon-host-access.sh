@@ -3,7 +3,7 @@
 # Configure the host access optic-daemon's dashboard system actions depend on:
 # the scoped PolicyKit rules behind the Power menu (Reboot, Shut down), NTP
 # Sync now, the Station timezone save, and restarting optic-daemon.service
-# (Restart daemon and deploys), plus lingering (for the Beszel agent's user
+# (Restart daemon and deploys), plus lingering (no longer required since Beszel was removed; kept for any user
 # service) and the device groups the daemon needs.
 
 set -euo pipefail

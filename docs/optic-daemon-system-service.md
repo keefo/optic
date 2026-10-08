@@ -18,7 +18,7 @@ has costs for an unattended appliance:
   NTP first reached a server at 20:31:47. A user unit cannot be ordered after
   system targets such as `time-sync.target`, so scheduled captures and event
   timestamps can use a wrong clock.
-- **Monitoring.** The Beszel agent lists only system services (its binary
+- **Monitoring** (historical; Beszel was removed 2026-10-07). The Beszel agent listed only system services (its binary
   uses go-systemd's `NewSystemConnectionContext` only), so optic-daemon is
   invisible there.
 - **Logs.** `journalctl --user -u optic-daemon` returns nothing on this Pi
@@ -66,7 +66,7 @@ has costs for an unattended appliance:
    keeps working while other devices stay blocked. The cutover verifies this
    with real captures.
 7. **Lingering stays on.** It is no longer needed for optic-daemon, but the
-   Beszel agent is still a user service.
+   Beszel agent was still a user service at the time; it has since been removed.
 
 ## 3. Cutover and Rollback
 

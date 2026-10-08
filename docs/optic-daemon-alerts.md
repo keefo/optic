@@ -23,21 +23,23 @@ It is a passive observer, like `optic_capture_log`: it never touches the
 camera, never changes scheduler/sync state, and a failure inside it (bad
 config, notification delivery failure) never affects capture or transfer.
 
-## 2. Why In-Daemon, Not Beszel
+## 2. Why In-Daemon (Beszel Removed)
 
-Beszel (`setup.md` § Monitoring Baseline) records host metrics — CPU and RP1
-temperature, root disk, the `/mnt/capture` tmpfs (via `EXTRA_FILESYSTEMS`) —
-but has no view of capture or sync health, and no Beszel alert/notification
-configuration is recorded in this repository. More importantly, the Beszel
-Hub runs on the **same iMac that receives `optic_sync` transfers**. An iMac
-outage (the most likely real failure — see
-`worklogs/2026-09-20-stale-iMac-ip-beszel-and-sync.md`) silences Beszel at
-exactly the moment the sync backlog starts growing. Alerts therefore go
-directly from the Pi to a notification service that does not depend on the
-iMac.
+Beszel recorded host metrics (CPU and RP1 temperature, fan RPM, memory,
+disk, network) but had no view of capture or sync health, and no alert
+configuration for it was ever recorded in this repository. It was **removed
+entirely on 2026-10-07** (`worklogs/2026-10-07-remove-beszel.md`): it never
+caught a real outage, and because its agent needs a literal hub IP it broke
+on every DHCP change on the Mac — four times — each time logging a failure
+every 10 s and evicting crash evidence from the bounded journal.
 
-Overlap with Beszel is limited to temperature and tmpfs usage; both are kept
-here because they are only useful if they are delivered when the iMac is down.
+That makes this module the only health reporting the station has. It also
+leaves temperature and tmpfs usage unmonitored except through these alerts,
+so both are kept here.
+
+Note the structural limit, unchanged by the removal: anything running
+**inside** the daemon reports nothing when the daemon or the host is dead.
+Only the external heartbeat (§8) covers that, and it is not built yet.
 
 ## 3. Decisions (confirmed 2026-09-20)
 
